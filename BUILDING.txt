@@ -1,0 +1,21 @@
+MALLVR - SOURCE
+======================
+A modified DOSBox-X (GNU GPL v2). The Virtuality PIX graphics cards, InsideTrak tracker
+and sound hardware are replaced by high-level emulation: the games' library calls are
+trapped and drawn with OpenGL / OpenVR.
+
+  vpix.cpp          port/memory probe for the PIX + Format cards, entry point
+  vpix_hle.cpp      hook table loader, PIX/TRK/SND/CD call emulation, scene capture
+  vpix_render.cpp   OpenGL renderer, SteamVR output, controller input
+  openvr.h          Valve OpenVR SDK header (BSD licence)
+  dosbox-x.patch    changes to upstream files (sdlmain.cpp hook-in, project file)
+  launcher\         the PowerShell launcher and game table that ship in engine\
+
+BUILD (Windows, Visual Studio 2022 Build Tools)
+  1. git clone https://github.com/joncampbell123/dosbox-x.git
+     git -C dosbox-x checkout b6abbd5980a885f5f310a4088c59a8688d1b116c
+  2. git -C dosbox-x apply dosbox-x.patch
+  3. copy the .cpp/.h files here into dosbox-x\src\hardware\
+  4. get the OpenVR SDK (github.com/ValveSoftware/openvr), fix the openvr_api.lib path
+     at the top of vpix_render.cpp, and put openvr_api.dll next to the built exe
+  5. msbuild vs\dosbox-x.vcxproj /p:Configuration=Release /p:Platform=x64

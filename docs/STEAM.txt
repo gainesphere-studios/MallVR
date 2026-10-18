@@ -1,0 +1,14 @@
+MALLVR - STEAM / STEAMVR LIBRARY
+=======================================
+
+Add each game as a "Non-Steam Game" so it shows in your Steam library and can be
+launched from inside SteamVR with the headset already on.
+
+1. In Steam: Games > Add a Non-Steam Game to My Library > Browse.
+2. Change the file filter to "All Files", go to your MallVR folder and pick
+   Play_Dactyl_Nightmare.bat. Click Add Selected Programs.
+3. Repeat for each Play_ file you want.
+4. Right-click the new entry > Properties: rename it (e.g. "Dactyl Nightmare (Virtuality)")
+   and tick "Include in VR Library" so it appears in the SteamVR dashboard.
+
+Artwork: right-click > Manage > Set custom artwork, or use the SteamGridDB website.

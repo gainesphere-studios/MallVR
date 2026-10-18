@@ -1,0 +1,43 @@
+MALLVR - LAUNCHBOX / BIGBOX
+==================================
+
+Set it up once as an emulator, then each game is just its EXE.
+
+1. ADD THE EMULATOR
+   Tools > Manage > Emulators > Add
+     Name ................. MallVR
+     Application Path ..... <your folder>\MallVR.bat
+     Default Command-Line . (leave empty)
+     Leave "Don't use quotes" UNticked. Untick "Attempt to hide console window".
+   Associated Platforms tab: add a platform named  Virtuality SU2000
+   (Tick it as the default emulator for that platform.)
+
+2. ADD THE GAMES
+   Tools > Import > ROM Files
+     Platform ............. Virtuality SU2000
+     Emulator ............. MallVR
+     Folder ............... <your folder>\games\...\  (the dump folder holding DAC, PAC ...)
+   When it lists files, keep ONLY these and untick everything else:
+     DAC\DAC.EXE    Dactyl Nightmare
+     DN2\DN2.EXE    Dactyl Nightmare 2
+     PAC\PAC.EXE    Pac-Man VR
+     MISS\MISS.EXE  Missile Command VR
+     GUN\GUN.EXE    Olin Shotgun
+     BOX\BOX.EXE    Virtuality Boxing
+     ZONE\ZONE.EXE  Zone Hunter
+     GHOST\GHOST.EXE Ghost Train
+     SFL\SFL.EXE    Shoot For Loot
+   Easier: add each one by hand (Add Game, Launching tab, Application Path = the EXE,
+   Emulation tab = MallVR) and type the title.
+   Choose "Copy" off for the files - leave them where they are.
+
+   LaunchBox's metadata scraper will not know most of these. Type the titles and use
+   the box/marquee art from the art pack if one is included, or your own.
+
+3. PLAY
+   Turn on the headset, then launch from LaunchBox or BigBox. Closing the game window
+   returns you to LaunchBox.
+
+NO EMULATOR SETUP (simplest)
+   Add Game > Launching tab > Application Path = <your folder>\Play_Dactyl_Nightmare.bat
+   (one entry per Play_ file). Works the same.

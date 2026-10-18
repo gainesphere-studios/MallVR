@@ -1,0 +1,72 @@
+MALLVR - SETUP GUIDE
+===========================
+
+1. UNZIP
+   Unzip the whole folder to a place you can write to, for example
+   C:\Games\MallVR. Avoid C:\Program Files.
+
+2. GAME FILES
+   This download has no game files. For Pac-Man VR you need:
+     - the Virtuality SU2000 HDD dump (archive.org item "su2000-hdd-files"): copy the folder
+       "VR 2000 Series Disc Image (Simon's)" into the games folder
+     - the Pac-Man VR CD image, PACMAN.CUE + PACMAN.BIN (archive.org item
+       "drive-download-20240331T000417Z-001", inside its pacman.zip), put in the games folder
+   Step by step, with links: gainesphere.com/pages/mallvr-download
+   Example:
+     games\VR 2000 Series Disc Image (Simon's)\PAC\PAC.EXE
+     games\PACMAN.CUE  (and PACMAN.BIN beside it)
+
+3. CHECK
+   Double-click Check_My_Games.bat. Every game should say READY.
+     READY      the exact version this build was made for
+     READY?     a different version of the game - it may still work
+     NEEDS CD   Pac-Man VR is there but its CD image is not
+     MISSING    the game is not in the games folder
+
+4. PLAY
+   Turn on the headset first, then double-click Play_<game>.bat. SteamVR starts on
+   its own if it is not running. The game opens in a window on the monitor (a mirror
+   of your left eye) and in the headset. Close that window to quit.
+   Stand in the middle of your play space and face forward before you start.
+
+5. YOUR SETTINGS
+   Gun aim feels high or low? Index: touch near the top / bottom edge of the LEFT
+   touchpad. Vive: LEFT touchpad up / down. Keyboard: arrow up / down. Arms too short or
+   long (Boxing, the guns)? Index: RIGHT touchpad left / right edge. Vive: LEFT touchpad
+   left / right. Keyboard: arrow left / right.
+   Both are saved per game in settings\ for next time.
+
+6. UPDATES
+   When you start a game, MallVR checks online for a newer version (it takes a second
+   or two while the launch screen shows). If there is one, it asks first:
+     Yes = install it now (about a minute), then your game starts.
+     No  = play now. It won't ask about that version again.
+   Updates never touch the games, settings or logs folders. No internet? The game
+   just starts.
+
+   To check for updates yourself at any time, run Update.bat.
+
+   To turn off the check at launch:
+     1. Open the engine folder and open version.txt in Notepad.
+     2. Change the line  check_on_launch = yes  to  check_on_launch = no
+     3. Save and close. From then on, MallVR only looks for updates when you run
+        Update.bat. To turn it back on, change the no back to yes.
+
+FIXING PROBLEMS
+   Nothing happens / a box says the game was not found
+       Run Check_My_Games.bat and fix what it reports.
+   Game opens on the monitor but not in the headset
+       Start SteamVR first and make sure the headset shows as connected (green).
+   Black screen in the headset for a few seconds
+       Normal while the game loads its models. Dactyl Nightmare takes about 5 s.
+   Windows SmartScreen warns about the .bat files
+       Click "More info" then "Run anyway". The scripts are plain text - open them in
+       Notepad to see exactly what they do.
+   Something else
+       The logs folder has <game>.calls and <game>.render after each run. Include
+       them when you report a problem.
+
+KNOWN LIMITS
+   Every game runs with free play. Dactyl Nightmare is the only game that links
+   pods for multiplayer (docs\MULTIPLAYER.txt); the others, Shoot For Loot
+   included, run single-player.

@@ -1,0 +1,55 @@
+MALLVR - WHAT'S NEW
+===================
+
+v0.10.4 (October 2026)
+
+WINDOW MODE (no headset)
+  - Your shots now land where you look. The gun used to fire well below the middle of
+    the screen, so you had to aim above everything.
+  - Ghost Train: W moves the car (the pod's top button).
+  - Missile Command: A / D move the gun left and right along its track.
+
+v0.10.3 (October 2026)
+
+NEW
+  - ONLINE PLAY: in MallVR_Launcher.bat pick a linkable game and click ONLINE, then QUICK
+    MATCH. It pairs you with another player and starts by itself. MORE OPTIONS lists who
+    is online and every open game (HOST / JOIN). Home-network PCs find each other too.
+    See docs\MULTIPLAYER.txt.
+
+v0.10.2 (October 2026) - everything since v0.10.0
+
+NEW
+  - MallVR_Launcher.bat: a game select screen in the style of the pods' own operator
+    screen. Pick the game, HEADSET or WINDOW, SOLO or linked, then START.
+  - Controller rumble: your shots and getting hit rumble the controllers, in every game.
+
+VIRTUALITY BOXING
+  - Your gloves follow your hands one to one, like the Dactyl gun.
+  - Full arms: the upper arm and glove are joined at a real elbow that bends naturally.
+  - The opponent's arms no longer vanish or float; glove and skin colours stay put.
+  - Character select: pulling your hand back no longer throws a punch.
+  - When you are knocked down you no longer sink into the mat.
+
+ZONE HUNTER
+  - Your own arm (forearm and upper arm) is drawn on the gun in first person.
+  - The corridor floor no longer turns into the red outdoor ground when a door opens.
+  - Doorways: no more sky-blue gaps or blue lines round the tunnel ends.
+  - Sliding doors fit their frames; BONUS TIME door frames no longer flicker.
+  - Bonus boxes read 1K / 5K correctly; the green pill shows its sign.
+  - The top timer keeps counting through the last-10-seconds countdown.
+  - Coin-up: straight to the 3rd-person intro, no grey sky. Logo and windows fixed.
+
+MISSILE COMMAND VR
+  - Aim fixed: shots go where the sight is, looking up, down, left or right.
+  - The skip-intro sign stays readable. Sticks left/right twist the gun along its track.
+
+SHOOT FOR LOOT
+  - The "shoot me" robot in the instructions is visible again.
+  - The compass arrow on the screen works.
+  - The route arrows on the floor no longer flicker.
+  - Character select: no more level hanging overhead.
+  - LEVEL COMPLETE, the scoreboard and the end screen show in the right order.
+
+PAC-MAN VR
+  - The alarm clock's bells sit behind the clock face.

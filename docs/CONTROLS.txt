@@ -1,0 +1,65 @@
+MALLVR - CONTROLS
+========================
+
+The arcade pod had a headset and one hand-held joystick (the gun / hand).
+Your headset is the pod headset, your RIGHT controller is the joystick.
+MallVR uses SteamVR Input, so every button can be remapped in
+SteamVR > Settings > Controllers > Manage Controller Bindings > MallVR.
+
+VALVE INDEX (tested)
+   Look around ............ move your head
+   Aim / punch ............ RIGHT controller
+   Fire / punch ........... RIGHT trigger
+   Coin + start ........... RIGHT A, or LEFT A or B
+   Walk forward / back .... RIGHT or LEFT stick up / down
+   Turn ................... RIGHT stick left / right (smooth turn, pivots on your head)
+   Strafe left / right .... LEFT stick left / right
+   Gun aim up / down ...... touch near the top / bottom edge of the LEFT touchpad
+   Arm reach in / out ..... touch near the left / right edge of the RIGHT touchpad
+   Crouch ................. hold the RIGHT B button (Dactyl Nightmare 1 + 2)
+   Credits ................ free play, no coins needed
+   Aim and reach are saved per game, for next time.
+
+HTC VIVE WANDS
+   Fire ................... RIGHT trigger
+   Walk / back / turn ..... RIGHT touchpad up / down / left / right (click = walk)
+   Snap turn .............. grips (30 degrees)
+   Gun aim / arm reach .... LEFT touchpad up-down / left-right
+   Coin + start ........... RIGHT menu button
+   Crouch ................. hold the LEFT menu button (Dactyl Nightmare 1 + 2)
+
+Quest and other controllers: SteamVR picks the closest layout; remap there if needed.
+
+NO HEADSET / WINDOW MODE (Play_<Game>_NoVR.bat, or WINDOW in MallVR_Launcher.bat)
+   Every game also runs in a normal window with keyboard and mouse.
+
+   THE MOUSE (read this first)
+   - Click inside the game window once. From then on the mouse turns your view and the
+     pointer is held in the window (that's normal: it's how you look around).
+   - TAB (or a middle click) = let go of the mouse, so you can use other windows.
+     Press TAB again (or middle click) to lock it back in for looking around.
+   - Hold ALT = the mouse is free only while you hold it.
+   - To switch to another program: press TAB first, then click the other window
+     (or use Alt+Tab). Click back into the game window to play again.
+   - ESC CLOSES THE GAME straight away. Don't press it to "get the mouse back": use TAB.
+   - The game only listens while its window is the active one. Two windows on one PC
+     (linked play): click the window you want to control.
+
+   KEYS
+   Coin ................... 5
+   Start .................. 1
+   Walk forward ........... W (or hold the right mouse button)
+   Step back / strafe ..... S / A and D
+   Turn / look ............ move the mouse (or J / L left-right, I / K up-down)
+   Aim the gun / punch .... arrow keys (R = gun back to centre)
+   Fire ................... left mouse button or Space
+   Crouch ................. hold C (Dactyl Nightmare 1 + 2)
+   Quit ................... Esc, or close the window
+   Ghost Train ............ W moves the car (the pod's top button)
+   Missile Command ........ A / D move the gun left and right along its track
+   Virtuality Boxing ...... punch with EITHER controller: the hand you push out toward
+                            the opponent throws that glove (guard = hands up in front, nothing
+                            extends). Face the opponent. You move by LEANING, like the arcade pod:
+                            stand where you want to box, then press coin / start (that spot becomes
+                            the centre). Lean forward / back / to the sides to step, or hold a stick
+                            to lean. Play standing. (Your own gloves are not drawn in first person yet.)
