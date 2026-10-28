@@ -1,0 +1,128 @@
+{
+  "default_bindings": [
+    {
+      "controller_type": "knuckles",
+      "binding_url": "mallvr_bindings_knuckles.json"
+    },
+    {
+      "controller_type": "vive_controller",
+      "binding_url": "mallvr_bindings_vive.json"
+    },
+    {
+      "controller_type": "oculus_touch",
+      "binding_url": "mallvr_bindings_oculus_touch.json"
+    }
+  ],
+  "actions": [
+    {
+      "name": "/actions/main/in/fire",
+      "type": "boolean"
+    },
+    {
+      "name": "/actions/main/in/menu",
+      "type": "boolean"
+    },
+    {
+      "name": "/actions/main/in/walk",
+      "type": "boolean"
+    },
+    {
+      "name": "/actions/main/in/move_right",
+      "type": "vector2"
+    },
+    {
+      "name": "/actions/main/in/move_left",
+      "type": "vector2"
+    },
+    {
+      "name": "/actions/main/in/trim_pad",
+      "type": "vector2"
+    },
+    {
+      "name": "/actions/main/in/trim_press",
+      "type": "boolean"
+    },
+    {
+      "name": "/actions/main/in/turn_left",
+      "type": "boolean"
+    },
+    {
+      "name": "/actions/main/in/turn_right",
+      "type": "boolean"
+    },
+    {
+      "name": "/actions/main/in/aim_pad",
+      "type": "vector2"
+    },
+    {
+      "name": "/actions/main/in/aim_press",
+      "type": "boolean"
+    },
+    {
+      "name": "/actions/main/in/reach_pad",
+      "type": "vector2"
+    },
+    {
+      "name": "/actions/main/in/reach_press",
+      "type": "boolean"
+    },
+    {
+      "name": "/actions/main/in/top",
+      "type": "boolean"
+    },
+    {
+      "name": "/actions/main/in/crouch",
+      "type": "boolean"
+    },
+    {
+      "name": "/actions/main/in/mode",
+      "type": "boolean"
+    },
+    {
+      "name": "/actions/main/in/throttle",
+      "type": "vector1"
+    },
+    {
+      "name": "/actions/main/in/brake",
+      "type": "vector1"
+    },
+    {
+      "name": "/actions/main/out/haptic",
+      "type": "vibration"
+    },
+    {
+      "name": "/actions/main/in/voice_mute",
+      "type": "boolean"
+    }
+  ],
+  "action_sets": [
+    {
+      "name": "/actions/main",
+      "usage": "leftright"
+    }
+  ],
+  "localization": [
+    {
+      "language_tag": "en_US",
+      "/actions/main": "MallVR",
+      "/actions/main/in/fire": "Fire",
+      "/actions/main/in/menu": "Coin / Start",
+      "/actions/main/in/walk": "Walk forward",
+      "/actions/main/in/move_right": "Move + turn (up walk, down back, left/right smooth turn)",
+      "/actions/main/in/move_left": "Move (up walk, down back, left/right strafe)",
+      "/actions/main/in/trim_pad": "Trim position (wands: up/down aim, left/right arm reach)",
+      "/actions/main/in/trim_press": "Trim press",
+      "/actions/main/in/turn_left": "Snap turn left",
+      "/actions/main/in/turn_right": "Snap turn right",
+      "/actions/main/in/aim_pad": "Aim trim position (up/down)",
+      "/actions/main/in/aim_press": "Aim trim touch",
+      "/actions/main/in/reach_pad": "Arm reach position (right/up further, left/down closer)",
+      "/actions/main/in/reach_press": "Arm reach touch",
+      "/actions/main/in/top": "Top button (Ghost Train: move)",
+      "/actions/main/in/crouch": "Game button (Index A / Vive left menu): Dactyl crouch, Buggy Ball turbo, Boxing special move",
+      "/actions/main/out/haptic": "Rumble (shots, hits)",
+      "/actions/main/in/mode": "Aim mode / extra button",
+      "/actions/main/in/voice_mute": "Voice chat mute on / off (every game)"
+    }
+  ]
+}

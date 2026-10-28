@@ -1,0 +1,27 @@
+site_name: MallVR developer docs
+site_description: How MallVR plays the 1990s Virtuality arcade VR games - engine, launcher, Quest port
+repo_url: https://github.com/gainesphere-studios/MallVR
+docs_dir: docs/dev
+theme:
+  name: material
+  palette:
+    scheme: slate
+    primary: indigo
+    accent: yellow
+  features:
+    - navigation.sections
+    - content.code.copy
+markdown_extensions:
+  - admonition
+  - tables
+  - toc:
+      permalink: true
+nav:
+  - Home: index.md
+  - How it works: architecture.md
+  - Source file guide: files.md
+  - Building (PC): building.md
+  - Adding a game: adding-a-game.md
+  - Launcher, online and updates: launcher.md
+  - Meta Quest port: quest.md
+  - Contributing: contributing.md

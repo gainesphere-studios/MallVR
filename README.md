@@ -18,6 +18,10 @@ MallVR is a modified [DOSBox-X](https://github.com/joncampbell123/dosbox-x). The
 
 **MallVR ships no game files.** Bring your own copy of the SU2000 software.
 
+## For developers
+
+**Developer docs: [gainesphere-studios.github.io/MallVR](https://gainesphere-studios.github.io/MallVR/)** (source in [`docs/dev`](docs/dev)): how the emulation works, what each file does, building, adding a game, the launcher and online play, and the Quest port.
+
 ## Meta Quest
 
 [`quest/`](quest/) holds the source of **MallVR Quest**, the first DOSBox-X running on Meta Quest: the same engine built for Android with OpenXR, a headset launcher, play notes and REPORT A PROBLEM. Build steps are in `quest/README_SOURCE.txt`. The APK and install guide are on the [download page](https://gainesphere.com/pages/mallvr-download#quest).

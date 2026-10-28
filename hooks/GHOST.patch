@@ -1,0 +1,9 @@
+# Ghost Train byte patches (applied by vpix_hle.cpp after the hooks arm; static addresses in GHOST.EXE).
+# Operator screen: it counts down 180 s ("In Operator Screen" on the DOS window) before the game starts,
+# with a black headset. The pods' attendants sat through it; MallVR skips it (0.5 s): mov [ebp-0x2c], 180.0 -> 0.5
+poke 00043B2E c745d400003443 c745d40000003f
+# Link play (2026-10-19): "network link allowed" word 0x10C846 is never written in this build (always 0), so a pod whose player
+# pressed start never sends the link request (net cmd 3) and never runs "Establishing network link" -> each pod rides alone.
+# Point both checks at 0x10C844 (LASTSETS line 2 = network on) instead: cmp word ptr [0x10c846],0 -> [0x10c844] (opcode + low address byte only: the data object is relocated).
+poke 0003CF4F 66833d46 66833d44
+poke 0004C16D 66833d46 66833d44

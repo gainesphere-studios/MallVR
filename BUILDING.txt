@@ -15,7 +15,7 @@ BUILD (Windows, Visual Studio 2022 Build Tools)
   1. git clone https://github.com/joncampbell123/dosbox-x.git
      git -C dosbox-x checkout b6abbd5980a885f5f310a4088c59a8688d1b116c
   2. git -C dosbox-x apply dosbox-x.patch
-  3. copy the .cpp/.h files here into dosbox-x\src\hardware\
+  3. copy the .cpp/.h files here into dosbox-x\src\hardware\ and the su2000\ folder to dosbox-x\src\hardware\su2000\
   4. get the OpenVR SDK (github.com/ValveSoftware/openvr), fix the openvr_api.lib path
      at the top of vpix_render.cpp, and put openvr_api.dll next to the built exe
   5. msbuild vs\dosbox-x.vcxproj /p:Configuration=Release /p:Platform=x64

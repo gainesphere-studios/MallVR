@@ -1,0 +1,20 @@
+# Hand-written hooks for Zero Hour (static ZERO.EXE addresses). regen_hooks.sh never touches this file.
+# Sound: Zero's AWE module loads every sample at start (AWE_LoadSamples, RUNFILES\SOUND.DBS -> runfiles\english.snd) and drives
+# C3DA emitters; vpix_hle replaces LoadSamples / Play / Stop / Fade / release_emitter (see hle_awe, 'soundview' branch).
+global soundview 0012669C
+global em_used 00126498
+hook AWE_LoadSamples R 00014FAC 53515256575581ec9400000031d26689 0 0
+hook AWE_Fade R 00017278 5183ec0488142489d90fbfd885db7c36 0 0
+hook AWE_release_emitter R 000171E4 535152565789c60fbfd085d27c688b1c 0 0
+# Sky dome (PLAYER_create_sky: model 4 sky.3ds, re-centred on the camera every frame): obj+0xE = its model slot -> drawn as a backdrop
+global sky 00214F08
+# player object (PLAYER_process plays the hurt sound on it -> hit rumble in both hands)
+global player 0021523C
+# player hit (PLAYER_process -> PLAYER_do_blood(al player, edx hits); edx 0 = none) -> rumble both hands (vpix_hle hle_log)
+hook PLAYER_do_blood L 0004B9E8 535156575583ec088844240431f685d2 0 0
+# high-score entry: HI_process shoots along gunModel (obj; +0xE = model slot) but draws no laser -> our aim beam
+global gunModel 002052BC
+hook HI_process L 00031688 5156575589e581ec5802000083e4f889 0 0
+# free play: report a credit mode outside bits 2|4 -> PROCESS_credits sets credit -1 (FREEPLAY), no endless credits
+hook EXP_GetCreditMode R 00069BC8 8b4424048b542408e8270000008b0485 0 0
+cdecl 00069BC8 EXP_GetCreditMode
