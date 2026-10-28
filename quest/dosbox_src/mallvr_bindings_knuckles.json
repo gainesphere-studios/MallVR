@@ -1,0 +1,139 @@
+{
+  "action_manifest_version": 0,
+  "controller_type": "knuckles",
+  "name": "MallVR - Valve Index",
+  "description": "Right stick: up walk, down back, left/right smooth turn. Left stick: up walk, down back, left/right strafe. Left touchpad: touch near top/bottom edge = aim trim. Right touchpad: touch near an edge = arm reach (right/top further, left/bottom closer). Keyboard arrows also trim. Right trigger fire, hold the RIGHT B button to crouch (Dactyl Nightmare 1 + 2), right A or left A/B coin + start. Left stick click: voice chat mute on / off.",
+  "bindings": {
+    "/actions/main": {
+      "sources": [
+        {
+          "path": "/user/hand/right/input/trigger",
+          "mode": "trigger",
+          "inputs": {
+            "click": {
+              "output": "/actions/main/in/fire"
+            },
+            "pull": {
+              "output": "/actions/main/in/throttle"
+            }
+          }
+        },
+        {
+          "path": "/user/hand/right/input/thumbstick",
+          "mode": "joystick",
+          "inputs": {
+            "position": {
+              "output": "/actions/main/in/move_right"
+            },
+            "click": {
+              "output": "/actions/main/in/mode"
+            }
+          }
+        },
+        {
+          "path": "/user/hand/left/input/thumbstick",
+          "mode": "joystick",
+          "inputs": {
+            "position": {
+              "output": "/actions/main/in/move_left"
+            },
+            "click": {
+              "output": "/actions/main/in/voice_mute"
+            }
+          }
+        },
+        {
+          "path": "/user/hand/left/input/trackpad",
+          "mode": "trackpad",
+          "inputs": {
+            "position": {
+              "output": "/actions/main/in/aim_pad"
+            },
+            "touch": {
+              "output": "/actions/main/in/aim_press"
+            }
+          }
+        },
+        {
+          "path": "/user/hand/right/input/trackpad",
+          "mode": "trackpad",
+          "inputs": {
+            "position": {
+              "output": "/actions/main/in/reach_pad"
+            },
+            "touch": {
+              "output": "/actions/main/in/reach_press"
+            }
+          }
+        },
+        {
+          "path": "/user/hand/right/input/a",
+          "mode": "button",
+          "inputs": {
+            "click": {
+              "output": "/actions/main/in/crouch"
+            }
+          }
+        },
+        {
+          "path": "/user/hand/right/input/b",
+          "mode": "button",
+          "inputs": {
+            "click": {
+              "output": "/actions/main/in/menu"
+            }
+          }
+        },
+        {
+          "path": "/user/hand/left/input/a",
+          "mode": "button",
+          "inputs": {
+            "click": {
+              "output": "/actions/main/in/crouch"
+            }
+          }
+        },
+        {
+          "path": "/user/hand/left/input/b",
+          "mode": "button",
+          "inputs": {
+            "click": {
+              "output": "/actions/main/in/menu"
+            }
+          }
+        },
+        {
+          "path": "/user/hand/right/input/grip",
+          "mode": "button",
+          "inputs": {
+            "click": {
+              "output": "/actions/main/in/top"
+            }
+          }
+        },
+        {
+          "path": "/user/hand/left/input/trigger",
+          "mode": "trigger",
+          "inputs": {
+            "click": {
+              "output": "/actions/main/in/mode"
+            },
+            "pull": {
+              "output": "/actions/main/in/brake"
+            }
+          }
+        }
+      ],
+      "haptics": [
+        {
+          "output": "/actions/main/out/haptic",
+          "path": "/user/hand/right/output/haptic"
+        },
+        {
+          "output": "/actions/main/out/haptic",
+          "path": "/user/hand/left/output/haptic"
+        }
+      ]
+    }
+  }
+}

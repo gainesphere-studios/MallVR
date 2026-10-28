@@ -3,7 +3,8 @@
 # games\, settings\ or logs\ (your game files, gun trim and high scores stay put).
 #   update.ps1          check and ask before installing
 #   update.ps1 -Auto    install without asking (the launcher uses this after you said yes)
-#   update.ps1 <zip>    install a Loader zip you downloaded yourself (drag it onto Update.bat)
+#   update.ps1 <zip>    install a Loader zip you downloaded yourself (drag it onto Update.bat); its .sig must be
+#                       next to it, or you type YES (security review 2026-10-26: only signed releases install by themselves)
 param([string]$Zip, [switch]$Auto)
 $ErrorActionPreference = 'Stop'
 $Engine = $PSScriptRoot
@@ -18,7 +19,10 @@ if (-not $Zip) {
     Write-Host '  Checking for a newer version...'
     try { $latest = Get-MVLatest $cfg 15 }
     catch { Write-Host "  Could not check for updates: $($_.Exception.Message)" -ForegroundColor Yellow; Done 1 }
-    if (-not $latest) { Write-Host '  No update source set in engine\version.txt.'; Done 0 }
+    if (-not $latest) {      # With-games / partner copies ship with url, drive and repo = none on purpose (make_package.py)
+        Write-Host '  This copy does not update itself (private With-games / partner edition).'
+        Write-Host '  For a newer version, get a new copy from Gainesphere: https://gainesphere.com'; Done 0
+    }
     if ((Get-MVVersion $latest.Version) -le (Get-MVVersion $cfg.version)) {
         Write-Host "  You have the latest version ($($cfg.version))." -ForegroundColor Green; Done 0
     }
@@ -33,17 +37,39 @@ if (Get-Process dosbox-x -ErrorAction SilentlyContinue | Where-Object { $_.Path 
 $tmp = Join-Path $env:TEMP "MallVR_update_$([guid]::NewGuid().ToString('N'))"
 New-Item -ItemType Directory $tmp | Out-Null
 try {
-    if ($Zip) { $zip = (Resolve-Path -LiteralPath $Zip).Path; $tag = [IO.Path]::GetFileNameWithoutExtension($zip) }
+    $signedVer = ''
+    if ($Zip) {
+        $zip = (Resolve-Path -LiteralPath $Zip).Path; $tag = [IO.Path]::GetFileNameWithoutExtension($zip)
+        # a zip you downloaded yourself: its <zip>.sig (same folder) must be Gainesphere's, or you type YES to install it anyway
+        $why = ''
+        try {
+            if (-not (Test-Path -LiteralPath "$zip.sig")) { throw "there is no $([IO.Path]::GetFileName($zip)).sig next to it" }
+            $sd = Read-MVSig (Get-Content -LiteralPath "$zip.sig" -Raw)
+            Test-MVSignature $zip $sd.version $sd.sig
+            $signedVer = $sd.version
+            Write-Host "  Signed by Gainesphere: $signedVer" -ForegroundColor Green
+        } catch { $why = $_.Exception.Message }
+        if ($why) {
+            Write-Host "  WARNING: this zip is not signed by Gainesphere ($why)." -ForegroundColor Red
+            Write-Host '  Only install it if you made it yourself or got it straight from Gainesphere.' -ForegroundColor Red
+            if ($Auto -or (Read-Host '  Type YES to install it anyway') -cne 'YES') { throw 'not signed - not installed' }
+        }
+    }
     else {
         $zip = Join-Path $tmp ($latest.Name -replace '[^\w.\-]', '_'); $tag = $latest.Version
         if ($zip -notlike '*.zip') { $zip += '.zip' }
         $mb = if ($latest.Size) { " ($([math]::Round($latest.Size / 1MB, 1)) MB)" } else { '' }
         Write-Host "  Downloading $($latest.Name)$mb..."
-        Save-MVRelease $latest $zip
+        Save-MVRelease $latest $zip      # throws unless it carries Gainesphere's signature
+        $signedVer = $latest.Version
     }
     Expand-Archive -LiteralPath $zip -DestinationPath (Join-Path $tmp 'x')
     $new = Get-ChildItem -LiteralPath (Join-Path $tmp 'x') -Directory | Select-Object -First 1 -ExpandProperty FullName
     if (-not $new -or -not (Test-Path (Join-Path $new 'engine\dosbox-x.exe'))) { throw 'download does not look like a MallVR package' }
+    if ($signedVer) {      # the version the signature names must be the one inside the zip
+        $nv = (Get-Content -LiteralPath (Join-Path $new 'engine\version.txt') -ErrorAction SilentlyContinue | ConvertFrom-StringData).version
+        if ($nv -ne $signedVer) { throw "the zip holds $nv but its signature is for $signedVer - not installed" }
+    }
     # this script lives in engine\ - copy everything else first, engine last
     foreach ($d in 'docs', 'source') {
         if (Test-Path (Join-Path $Root $d)) { Remove-Item -Recurse -Force (Join-Path $Root $d) }

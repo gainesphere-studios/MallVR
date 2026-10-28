@@ -1,0 +1,11 @@
+# MallVR GET GAMES list (MallGetGames.cs). One item per line, fields split by |:
+#   id | title | what it gives | archive.org item | file in that item | size in bytes | SHA-1 | how to unpack
+# how to unpack: 7z  /  7z-keep:<folder name part> (only that folder)  /  zip  /  zip-cd (only .CUE + .BIN, flat)  /
+#   zip-cd-inner:<inner zip> (the CUE + BIN from a zip inside the zip)
+# Files come only from https://archive.org/download/<item>/<file>. A newer copy of this list on the website
+# (downloads.gainesphere.com/mallvr/getgames.txt) is used only when it carries Gainesphere's signature (getgames.txt.sig,
+# package/sign_release.ps1 -List getgames.txt). Sizes + SHA-1 from archive.org/metadata/<item>/files.
+su2000|SU2000 HDD DUMP|DACTYL NIGHTMARE 1+2, ZONE HUNTER, GHOST TRAIN + 5 MORE|su2000-hdd-files|Virtuality SU2000 HDD Dump.7z|181544884|f038d6241d06e9e2570d485e09c29dc649c6c5cd|7z-keep:(Simon's)
+pacman|PAC-MAN VR CD|PAC-MAN VR (NEEDS THE SU2000 DUMP TOO)|drive-download-20240331T000417Z-001|drive-download-20240331T000417Z-001.zip|131982809|47e735476fa4ef96d6db20e9bd86370e34c8bb28|zip-cd-inner:pacman.zip
+su3000|SU3000 HDD DUMP|TOTAL RECOIL, ZERO HOUR, ZENECA MIGRAINE|su3000|su3000.zip|227862673|3e8ab069f32d3d15e5c6e92e873dd383206a4d7a|zip
+buggy|BUGGY BALL DATA|BUGGY BALL|buggy.-7z|Buggy.7z|10707383|921112674a92997eb0d66c0e1fff359a7560d4f6|7z-keep:BALL

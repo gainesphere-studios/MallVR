@@ -1,0 +1,7 @@
+# Hand-written hooks for ZENECA (static ZENECA.EXE addresses, from its Watcom debug symbols). regen_hooks.sh never touches this file.
+# Sound: SND layer runs natively; soundEffect[15] (SND_HANDLER, stride 0x30) is polled every frame by vpix_hle zeneca_sound,
+# AWE32_loadWAV (in ZENECA3K.hooks) is turned into our WAV loader returning the length in seconds.
+global soundEffect 00146694
+# Fades: fadeVal (float, black fade for SET_FADE IN/OUT), whiteFadeVal (long, SET_WHITE_FADE 1..255)
+global fadeVal 000A60EC
+global whiteFadeVal 000F5768

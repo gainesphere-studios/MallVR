@@ -1,0 +1,5 @@
+# PEARL byte patches (applied by vpix_hle.cpp after the hooks arm; static addresses in PEARL.EXE).
+# PEARL always runs its operator settings screen (SETTINGS_handle, a ~2.5 minute joystick-pointer menu we never draw, so the window stayed
+# black / plain blue) before its demo; it has no /d switch like Dactyl. SETTINGS_handle's done flag [ebp-8] starts 0: start it at 1
+# (mov dword ptr [ebp-8], 0 -> 1) and the loop exits at once, the saved SETTINGS.PRL values are still loaded by SETTINGS_setup.
+poke 00053C42 c745f800000000 c745f801000000

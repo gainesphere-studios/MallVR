@@ -1,0 +1,3 @@
+# Hand-written hooks on Virtuality Boxing's own code (static BOX.EXE addresses). Dev diagnosis only.
+# 0x32F03 = the lean-to-move routine (head x beyond +-110 mm sidesteps, y beyond +-110 mm steps in/out)
+hook BOX_Lean L 00032F03 6894000000e8572b0200535152565755 0 0

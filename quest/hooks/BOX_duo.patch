@@ -1,0 +1,11 @@
+# Virtuality Boxing DUO (two boxers on one pod PC = the game's own 2-player mode, 'BOXER, a game for one or two players').
+# The game counts its tracker boards (TRK_GetConfig -> [0xF7E1D]) and control boards (CTRL_GetConfig -> [0xFA1C1]) at start-up
+# (0x10EC7 / 0x1105A) and runs two players when it finds two of each. Dev test only (VPIX_PATCH_EXTRA), 2026-10-20.
+# (data addresses as relocated at run time: data delta +0x168000)
+# 1 tracker board found: mov dword ptr [0xf7de0], 2 -> 0 (the '2 tracker boards' setting)
+poke 00010EE6 c705e0fd250002000000 c705e0fd250000000000
+# control boards: mov ebp, [0xfa1c1] -> mov ebp, 2 ; nop
+poke 0001105A 8b2dc1212600 bd0200000090
+# video channels: [0xf7db9] = bits set in pixConfig present (our HLE card has 1) -> seat 2 never got a credit or a start;
+# call 0x3d23c -> mov eax, 2 ('2 video channels active, 1 and 2 used', render mask 0x11187c = 3)
+poke 0003D495 e8a2fdffff b802000000

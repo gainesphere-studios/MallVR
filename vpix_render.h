@@ -12,9 +12,10 @@ struct VPIX_Instance {
     uint8_t own_hand = 0;     /* VPIX_HOLD_VIEW games: the player's own gun (1) / gun forearm (2), moved by the controller while the game camera is frozen;
                                  3 = rest of the own body, 4 = own shot: all of them hidden while the view is held */
     int32_t prio = 0;         /* model slot +0x54: the card's draw priority */
+    uint32_t light_mask = 1;  /* model slot +0x5C: which game lights shade it (bit n = light n; DAC/DN2/Zone 1, Missile Command 3) */
     uint16_t slot = 0;        /* model slot (32 * window + index) */
     uint8_t scared = 0;       /* Pac-Man ghost eyes / mouth while the ghost is blue or flashing: drawn with the scared-face textures */
-    uint8_t near_bias = 0;    /* VPIX_NEAR_MODELS: drawn a few decal layers toward the eye (Zone's doors in their wall opening) */
+    uint8_t near_bias = 0;    /* VPIX_NEAR_MODELS: decal layers toward the eye (0 = off; Zone's doors in their wall opening) */
     bool ymove = false; float ymove_from = 0, ymove_to = 0;   /* VPIX_MOVE_Y: model-space y 'from' drawn at 'to' (Zone pill sign) */
     float ymin = -1e30f, ymax = 1e30f;      /* VPIX_CLAMP_Y models: model-space y below this is moved up to it (trims a room's end) */
     uint8_t seal = 0;         /* VPIX_SEAL models: outline pass over base polygons (fills T-junction cracks) */
@@ -22,7 +23,8 @@ struct VPIX_Instance {
     uint32_t select = 0;
     uint8_t one_sided = 0;    /* VPIX_ONE_SIDED models: type 0x22 polygons back-face culled (Zone's VR logo); 2 = every polygon; 3 = every polygon's back side drawn flat grey */
     uint8_t on_top = 0;       /* VPIX_ON_TOP: drawn last, depth test off (Missile Command skip sign over the gun housing) */
-    uint8_t headlock = 0;     /* PEARL sell messages over the fade screen (VPIX_PANEL_HEADLOCK): drawn relative to the game camera = locked to the head */
+    uint8_t backdrop = 0;     /* SU3000 cloud cards: drawn first (the HLE orders them so) with depth write off, never hide what lies behind */
+    uint8_t headlock = 0;     /* drawn relative to the game camera = locked to the head: 1 PEARL sell messages (VPIX_PANEL_HEADLOCK, full colour), 2 with a screen picture (VPIX_PICTURE_HEADLOCK, shaded) */
 };
 
 /* A tracked pose in the game's tracker space: X right, Y forward, Z up, millimetres.
@@ -45,6 +47,10 @@ struct VPIX_Blit {
     float pos[3];             /* world position (model slot T) */
     float pivot[2];           /* +0x1E/+0x22: pivot within the sprite (from its left / bottom) */
     float tint[3] = {1, 1, 1}; /* VPIX_GLYPH_COLOUR: flag 0x800 colour at +0x2C for 1 bpp glyphs (Ghost Train letters + shadows) */
+    float tint2[3] = {1, 1, 1}; bool grad = false;   /* flag 0x1000: colour pair, the card fades the glyph from tint (top row) to tint2 (+0x30, bottom row): Missile Command's
+                                                        score red -> yellow, PLEASE FOCUS white -> blue (reference pairs 10-25) */
+    float pal0[3] = {-1, -1, -1};   /* model slot palette entry 0: the colour of a 4-shade (2 bpp) bitmap on the card (DN2 egg yellow, PEARL pearls red); -1 = none */
+    bool glyph = false;       /* VPIX_GLYPH_COLOUR: tint set from the bitmap's own colour (any bitmap format, not only 1 bpp: Sea Diving's score digits) */
     int32_t prio = 0;         /* model slot +0x54: the card's draw priority (higher = in front); VPIX_BLIT_PRIORITY games use it */
     bool backdrop = false;    /* VPIX_BLIT_PRIORITY: priority below every 3D model in the view -> drawn behind the 3D scene */
     bool mid = false;         /* PEARL: a 3D model has a higher priority -> drawn between the models (those above it in front) */
@@ -55,12 +61,24 @@ struct VPIX_Frame {
     float cam_R[3][3] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}}, cam_T[3] = {0, 0, 0};
     float fov_deg = 70.f;
     uint8_t clear[3] = {0, 0, 0};
+    float fog_start = 0, fog_end = 0;   /* SU3000 view fog (linear, eye distance in game units); fog_end 0 = none */
+    uint8_t fog_col[3] = {0, 0, 0};
+    bool aim_beam = false; float aim_o[3] = {0, 0, 0}, aim_d[3] = {0, 1, 0};   /* see-through aim beam (Zero Hour high-score entry), world space */
     bool in_head = false;     /* game camera is the player's own head (tracker-driven) */
     VPIX_Pose head_fed;       /* head pose the game was given for this frame */
+    float walk_yaw = 0;       /* VPIX_WALK_TURN (Pac-Man): the fake head turn inside head_fed (strafe / back); camera-space lights undo it */
     float player_height = 0;  /* mm, calibrated by the game at the "focus visette" step (0 = not yet) */
     float crouch_mm = 0;      /* VPIX_CROUCH games: how far head_fed was lowered by the crouch button (the eye drops the same) */
     int game_mode = -1;       /* game_mode of local slot 0 when the game has the symbol (DAC: 0 play, 3 GAME OVER, 7 initials, 2 attract), else -1 */
     bool hold = false;        /* renderer only (VPIX_HOLD_VIEW): game camera frozen, head_fed = the pose that built it */
+    uint32_t static_tex = 0;  /* PIX_DrawStatic this frame: texture handle filling the view as TV static (0 = none) */
+    uint16_t static_w = 0, static_h = 0, static_rx = 0, static_ry = 0;   /* texel window size + the call's two random words (offset) */
+    /* the game's light table (PIX_SetLightSource: 4 lights x 0x38, the card gets ambient +0, diffuse +8, world direction +0x10;
+       card command 7). n = 0: the game set none (Ghost Train, SU3000) -> the renderer's old fixed light */
+    struct Light { float amb, diff, dir[3]; };
+    Light lights[4]; int n_lights = 0;
+    struct Line { float x0, y0, x1, y1; uint8_t rgb[3]; };
+    std::vector<Line> lines;  /* PIX_DrawLine this frame, screen pixels (Sea Diving's air-dial needle) */
     std::vector<VPIX_Instance> inst;
     std::vector<VPIX_Blit> blits;
 };
@@ -78,17 +96,35 @@ struct VPIX_Input {
     float gun_pitch = -20.f;  /* degrees added to the gun's pitch (Vive wand vs pod joystick); left pad up/down adjusts */
     float hand_zr = 0.f;      /* Boxing: mm the RIGHT hand is fed lower (left pad up/down adjusts, hand_zr_BOX in the settings) */
     float hand_reach = 1.f;   /* this game's multiplier on the hand's distance from the head; left pad left/right adjusts */
+    float punch_gain = 1.f, spread_mm = 0.f;   /* Boxing keyboard adjusters (left/right, [ / ]): ring punch gain multiplier, extra glove spread per side */
     float loco[2] = {0, 0};   /* stick movement (back/strafe), mm in tracker space, added to head and hand positions */
     float walk_yaw = 0;       /* VPIX_WALK_TURN games (Pac-Man): radians the fed head is turned while back/strafe is held */
     float joy[2] = {0, 0};    /* VPIX_JOYAXES games: the pod joystick's x / y (-1..1) from the thumbsticks */
     float crouch_mm = 0;      /* VPIX_CROUCH games: crouch button held -> head and hand fed this many mm lower */
+    float gun_dx = 0, gun_dz = 0, gun_dy = 0;   /* gun_dy: mm forward (left touchpad left/right) */
+    float throttle = 0, brake = 0;   /* analog triggers 0..1 (right / left, /actions/main/in/throttle + brake): Buggy Ball gas + brake */
+    bool top = false, b2 = false;   /* right grip (top) / B buttons (crouch action), raw: Buggy Ball turbo */
+    bool voice_mute = false;  /* voice chat mute button held (Index left stick click / window M); vpix_voice.h toggles on the press */
+    int aim_mode = 0;         /* VPIX_AIM_MODES: 0 = free (snap on the sights only), 1 = assisted (the old way); left trigger toggles */   /* VPIX_GUN_NUDGE: mm the fed gun is moved right of the facing / up (right touchpad, saved per game) */
 };
 
 bool VPIX_Render_AddModel(uint32_t handle, const uint8_t *data, size_t len);
+/* SU3000 (PIX v1.37+): a model built by the HLE from the library's PIXOBJECT in PowerPC memory. Polygon flags use the
+   SU2000 encoding the renderer knows (0x20RRGGBB flat colour; 0x40 Gouraud with vcol = 0x20RRGGBB per vertex). */
+struct VPIX_MeshPoly { uint8_t n = 0; uint32_t idx[16]; uint32_t flags = 0; uint32_t vcol[16]; float nx = 0, ny = 0, nz = 1;
+                       uint32_t tex = 0; float uv[16][2]; };   /* tex != 0: renderer texture handle, drawn with the per-corner uv (0..1) */
+bool VPIX_Render_AddMesh(uint32_t handle, const std::vector<float> &verts, const std::vector<VPIX_MeshPoly> &polys);
+/* SU3000: a texture decoded by the HLE (GiGi memory), RGBA bytes in GL order */
+bool VPIX_Render_AddTextureRGBA(uint32_t handle, int w, int h, const uint32_t *rgba);
 /* model file name, as loaded by PIX_LoadModel (used by dev-only tooling; no-op otherwise) */
 void VPIX_Render_ModelName(uint32_t handle, const char *file);
 bool VPIX_Render_AddTexture(uint32_t handle, const uint8_t *data, size_t len);     /* .TEX file */
 bool VPIX_Render_AddBitmap(uint32_t handle, const uint8_t *data, size_t len);      /* .VST (TGA) file */
+bool VPIX_Render_UpdateTextureRGBA(uint32_t handle, int w, int h, const uint32_t *rgba);   /* SU3000 video frame, same size, in place */
+void *VPIX_PipeOpen(const char *cmd);                 /* hidden child process, stdout piped (ffmpeg) */
+size_t VPIX_PipeRead(void *p, void *buf, size_t n);
+void VPIX_PipeClose(void *p);
+bool VPIX_Render_AddBitmapRGBA(uint32_t handle, int w, int h, const uint32_t *rgba);   /* SU3000: a Targa texture used as a 2D bitmap (rows bottom-up) */
 /* PIX_SetTexture: texture number n (polygon flags low bits) -> handle + planar projection.
    flags 0x20000 = XY plane, 0x40000 = XZ, 0x80000 = YZ; u = (a - o) * su, v = (b - o) * sv in texels.
    tflags/mask = PIXTEXTURE +0x20 flags and +0x24 maskcolor (PIXCOL red, green, blue, flags). */

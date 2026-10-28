@@ -39,12 +39,17 @@
 #include <string>
 #include <vector>
 #include <map>
+#include <mutex>
 #include <set>
 #include <array>
 #include <chrono>
 #include <thread>
+#include <atomic>
+#include "../libs/decoders/dr_mp3.h"   /* the decoder itself is compiled in DOSBox-X's cdrom_image (CD-audio tracks as MP3) */
 #include <algorithm>
 
+uint8_t *VPIX_Pix3K_Mem(uint32_t phys, uint32_t len);   /* vpix.cpp: host view of the SU3000 PIX2000E board memory */
+static std::string log_base;
 struct VHook {
     std::string name;
     char mode;                 /* 'R' replace, 'L' log + run natively */
@@ -53,12 +58,32 @@ struct VHook {
     uint32_t retpop;           /* bytes of stack args the callee pops */
     uint32_t imm;              /* the push imm32 we overwrite */
     uint32_t retval;           /* return value for plain stubs */
+    bool cdecl_args = false;   /* hooks file "cdecl": stack args (caller pops), loaded into eax/edx/ebx/ecx for the stub */
     unsigned long calls;
 };
+/* the callback overwrites the first 5 bytes: an L/O hook can run natively only when those bytes are a push imm32 or the
+   instructions the L path re-runs (push r32, mov r32,r32, sub esp,imm8/imm32) */
+static bool prologue_replayable(const uint8_t *p) {
+    if (p[0] == 0x68) return true;
+    int i = 0;
+    while (i < 5) {
+        uint8_t op = p[i];
+        if (op >= 0x50 && op <= 0x57) i += 1;
+        else if ((op == 0x89 || op == 0x8B) && p[i + 1] >= 0xC0) i += 2;
+        else if (op == 0x83 && p[i + 1] == 0xEC) i += 3;
+        else if (op == 0x81 && p[i + 1] == 0xEC) i += 6;
+        else if (op >= 0xB8 && op <= 0xBF) i += 5;   /* mov r32, imm32 */
+        else if (op == 0xE8) return true;     /* call rel32 (SFL / Olin Shotgun PIX_Render*: push edx; call ...) */
+        else return false;
+    }
+    return true;
+}
 struct VRegion { std::string name; uint32_t st, size; };
 struct VWatch { std::string name; uint32_t st; };      /* float globals printed in the frame log */
 static std::vector<VWatch> watches;
+static uint32_t dataobj_base = 0;
 static std::map<std::string, uint32_t> globals;      /* game globals by name (static address) */
+static std::map<std::string, uint32_t> globalrefs;   /* SU3000: name -> static code address of an imm32 that holds the global's runtime address */
 
 static std::vector<VHook> hooks;
 static std::vector<VRegion> regions;
@@ -74,6 +99,18 @@ static unsigned long log_lines = 0;
 static unsigned long CALL_LOG_MAX = 400000;      /* VPIX_PLAY: 20000 (startup is what bug reports need) */
 static unsigned long frame = 0, snaps = 0, snap_every = 10, snap_max = 300;
 static uint32_t next_handle = 1;
+/* VPIX_REF=1 (reference mode): LeonG-ZA's emulated PIX 1000 ([su2000] enable=true) gets the game's real graphics calls and draws
+   the card's own picture, while we keep reading the same library tables and draw ours = the same frame twice. The PIX_* / EXPI_*
+   hooks become 'O' (observe: our side effects, then the native function runs); input, sound, CD and tracker stubs stay ours.
+   The PIX_Load* handles are the card's: the call returns into a trap (PIX_RunDebugger's entry, never called by the games),
+   where we load the file under the handle the native call returned. */
+static const bool ref_mode = getenv("VPIX_REF") && atoi(getenv("VPIX_REF"));
+static uint32_t ref_trap = 0;                  /* linear address of the return trap (0 = none: loads keep our own handles) */
+struct RefLoad { std::string name; uint32_t fn, ra; };
+static std::vector<RefLoad> ref_loads;
+static uint32_t forced_handle = 0;             /* set while the trap loads a file under the card's handle */
+/* the card numbers models, bitmaps and textures from 0, which our tables use as 'none': our copies are filed one higher */
+static inline uint32_t ref_h(uint32_t h) { return ref_mode ? h + 1 : h; }
 static long fps_limit = 0;                 /* 0 = off; the game's logic is clock-driven */
 static auto host_t0 = std::chrono::steady_clock::now();
 static double time_scale = 1.0;
@@ -95,6 +132,7 @@ static bool parse_hex(const char *s, uint8_t *out, size_t n) {
    every field after it 0x20 earlier: bitmap pointer +0x80, flags +0x88). Set by the hook table line 'modelstride 8C' (re/gen_hooks.py reads
    PIX_SetModel's flags test); PEARL also by the table name; VPIX_MODEL_STRIDE overrides. */
 static uint32_t model_stride = 0xAC, model_shift = 0;
+static uint32_t person_stride = 0xEB1, person_pos = 0x45;   /* linked-pod bots: person[] record size, x/y/z offset (hooks lines "personstride", "personpos"; DN2 ECF / 5B) */
 static bool load_hooks(const char *path) {
     FILE *f = fopen(path, "r");
     if (!f) { lg("HLE: cannot open hook table %s", path); return false; }
@@ -109,19 +147,45 @@ static bool load_hooks(const char *path) {
             dataref_code[ndataref] = (uint32_t)strtoul(a, NULL, 16); dataref_target[ndataref] = (uint32_t)strtoul(b, NULL, 16); ndataref++;
         } else if (!strcmp(kw, "global") && n >= 3) {
             globals[a] = (uint32_t)strtoul(b, NULL, 16);
+        } else if (!strcmp(kw, "dataobj") && n >= 2) {     /* SU3000: LE object base of dataref 0's target (fixup check) */
+            dataobj_base = (uint32_t)strtoul(a, NULL, 16);
+        } else if (!strcmp(kw, "globalref") && n >= 3) {
+            globalrefs[a] = (uint32_t)strtoul(b, NULL, 16);
         } else if (!strcmp(kw, "code") && n >= 3) {     /* named code location (static address) */
             codes[a] = (uint32_t)strtoul(b, NULL, 16);
+        } else if (!strcmp(kw, "cdecl") && n >= 2) {    /* ZERO/ZENECA: CTRL/EXP/TRK/CD built caller-pops (push args; call; add esp,N) */
+            uint32_t st = (uint32_t)strtoul(a, NULL, 16);
+            for (auto &hk : hooks) if (hk.st == st) hk.cdecl_args = true;
         } else if (!strcmp(kw, "watch") && n >= 3) {
             watches.push_back({a, (uint32_t)strtoul(b, NULL, 16)});
         } else if (!strcmp(kw, "region") && n >= 4) {
             regions.push_back({a, (uint32_t)strtoul(b, NULL, 16), (uint32_t)strtoul(c, NULL, 16)});
+        } else if (!strcmp(kw, "personstride") && n >= 2) {   /* linked-pod bots: person[] record size (DAC 0xEB1, DN2 0xECF) */
+            person_stride = (uint32_t)strtoul(a, NULL, 16);
+        } else if (!strcmp(kw, "personpos") && n >= 2) {
+            person_pos = (uint32_t)strtoul(a, NULL, 16);
         } else if (!strcmp(kw, "modelstride") && n >= 2) {   /* gen_hooks.py: older PIX lib record size (0x8C) */
             model_stride = (uint32_t)strtoul(a, NULL, 16); model_shift = 0xAC - model_stride;
         } else if (!strcmp(kw, "hook") && n >= 6) {
             /* VPIX_NET: the emulated card is there, so the game's own NET library runs (no stubs) */
             if (VPIX_NET_Enabled() && (!strncmp(a, "NET_", 4) || !strncmp(a, "NETI_", 5))) { lg("HLE: %s left native (network on)", a); continue; }
+            /* VPIX_CD_NATIVE=1 (games.ps1 CdImage games, Zone Hunter): a disc image is mounted, so the game's own CD library
+               plays its CD-audio music through DOSBox's MSCDEX (the stubs only returned 0: no music) */
+            static const bool cdn = getenv("VPIX_CD_NATIVE") && atoi(getenv("VPIX_CD_NATIVE"));
+            const bool cd_fn = cdn && (!strncmp(a, "CD_", 3) || !strncmp(a, "CDI_", 4));
             VHook h; h.name = a; h.mode = b[0]; h.st = (uint32_t)strtoul(c, NULL, 16);
             parse_hex(d, h.pro, 16); h.retpop = e; h.calls = 0; h.retval = (uint32_t)rv;
+            if (h.name == "AWE32_loadWAV") h.mode = 'F';   /* ZENECA: returns the sample length (float, x87) -> our loader (zeneca_load_wav) */
+            if (cd_fn) {   /* run natively; with a push imm32 prologue keep it as an L hook so the calls (track numbers) are logged */
+                if (h.pro[0] != 0x68) { lg("HLE: %s left native (CD image)", a); continue; }
+                h.mode = 'L'; lg("HLE: %s native + logged (CD image)", a);
+            }
+            /* movies (PIX_*FLIC*) stay OURS in reference mode: on the emulated card SFL / Olin Shotgun's attract films took minutes each and
+               the games never reached their 3D (Bobby 10-25: "just black"); our player shows them at full speed, the card is not needed */
+            if (ref_mode && (!strncmp(a, "PIX", 3) || !strncmp(a, "EXPI_", 5)) && strcmp(a, "PIX_RunDebugger") && h.mode != 'L' && !(strstr(a, "FLIC") && strcmp(a, "PIX_SyncRenderFLIC"))) {   /* SyncRenderFLIC = Olin Shotgun's frame render: the card's */
+                if (!prologue_replayable(h.pro)) { lg("HLE: %s left native (reference card; prologue not replayable)", a); continue; }
+                h.mode = 'O';
+            }
             h.imm = (uint32_t)h.pro[1] | ((uint32_t)h.pro[2] << 8) | ((uint32_t)h.pro[3] << 16) | ((uint32_t)h.pro[4] << 24);
             hooks.push_back(h);
         }
@@ -159,6 +223,8 @@ static bool read_dos_file(const std::string &name, std::vector<uint8_t> &out) {
 static std::string net_state();
 static void net_bots();
 static uint32_t global_rt(const char *name) {
+    auto gr = globalrefs.find(name);
+    if (gr != globalrefs.end()) return mem_readd(gr->second + code_delta);
     auto it = globals.find(name);
     return it == globals.end() ? 0 : it->second + data_delta;
 }
@@ -172,15 +238,23 @@ static uint32_t global_rt(const char *name) {
    so feeding x/y * 1.85/1.5 makes walking 1:1 in VR. VPIX_WORLD_SCALE / VPIX_HAND_XY override. */
 static float world_scale = 1.85f, head_xy = 1.85f / 1.5f, hand_xy = 1.85f / 4.f;
 static bool track_on = true, free_play = true;
+static unsigned long hi_frame = 0xFFFF0000UL;   /* last frame Zero Hour's HI_process ran (high-score entry) */
+static uint32_t start_bits = 0;   /* VPIX_START_BITS: front-panel bits a start press sets (0 = 1, or 3 with the pod net). Zero Hour: 4 */
 static VPIX_Input cur_in;              /* sampled once per game frame */
 static unsigned long long trigger_down_ms = 0; static bool trigger_held = false;
 static unsigned long long hap_ms_now() { return (unsigned long long)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }   /* VPIX_HAPTIC gun rules: when the trigger last went down */
 static VPIX_Pose head_fed;             /* last head pose handed to the game (renderer needs it) */
+static float walk_yaw_fed = 0;         /* the walk-turn yaw inside head_fed (Pac-Man strafe / back) */
 static float crouch_fed = 0;           /* VPIX_CROUCH: mm head_fed was lowered by the crouch button */
 static float hand_fed[3] = {0, 0, 0};  /* last hand position handed to the game, tracker mm (VPIX_GLOVELOG) */
 static uint32_t black_backdrop_handle = 0;   /* VPIX_BLACK_BACKDROP=<file fragment>: a picture shown under the 3D scene whenever the game's clear colour is black */
 static bool box_ring_view = false;     /* Boxing: the ring model is in the scene (pan + fight); false at character select */
 static bool two_hand_trigger = false;  /* VPIX_TWO_HANDS: the left controller is punching -> joystick trigger held */
+/* remote seat (vpix_seat.h): seat 2 of a Duo game played from another MallVR copy */
+static VPIX_Input seat2_in;            /* the seat PC's input, copied in once per game frame */
+static VPIX_Pose seat2_head_fed;       /* seat 2's head as handed to the game (its frame's head_fed) */
+static bool seat2_two_hand_trigger = false;
+static bool seat2_live();              /* a seat PC is connected and sending */
 static std::map<uint32_t, std::string> model_files;   /* PIX_LoadModel handle -> file (diagnosis) */
 static int coins_used = 0;
 static unsigned long trk_calls = 0;
@@ -196,6 +270,8 @@ static void pose_to_trkrec(const VPIX_Pose &P, const float pos[3], uint32_t at, 
 
 static uint8_t clear_col[3] = {0, 0, 0};       /* PIX_SetBufferClearMode */
 static float rd_f(uint32_t a);
+static int32_t mod_prio[512], last_p54[512]; static bool mod_prio_set[512];   /* PIX_ModifyModelPriority per model slot */
+static float depth_cue = 0.f;                    /* PIX_SetDepthCue distance (0 = off) */
 /* 4x4 sensor matrix (TRK_GetTrackerData / GetTrackerMat): rows = local axes (right, forward,
    up) rebuilt from the record's az/el/roll with the MAT4_azeltw_matrix formula, row 3 = position */
 static void trkrec_to_mat(uint32_t rec, uint32_t m) {
@@ -227,12 +303,17 @@ static uint32_t hle_trk_record(uint32_t mask, uint32_t rec, uint32_t mats = 0) {
        pod's centre (Boxing: past +-110 mm = step), so the spot the player stands on is its 0,0. Taken at
        the first read and again at every coin / start press. */
     static const bool centre_on = getenv("VPIX_HEAD_CENTRE") && atoi(getenv("VPIX_HEAD_CENTRE"));
-    static float cen[2] = {0, 0}; static bool have_cen = false, last_start = false; static int last_coins = 0;
-    if (centre_on && (!have_cen || cur_in.coins != last_coins || (cur_in.start && !last_start)) && cur_in.head.valid) {
-        cen[0] = cur_in.head.p[0]; cen[1] = cur_in.head.p[1]; have_cen = true;
-        lg("TRK head centre = (%.0f %.0f) mm", cen[0], cen[1]);
+    /* per seat: seat 2 (Duo, sensors 3/4) has its own centre when a remote seat drives it (vpix_seat.h) */
+    static float cens[2][2] = {{0, 0}, {0, 0}}; static bool have_cen[2] = {false, false}, last_start[2] = {false, false}; static int last_coins[2] = {0, 0};
+    for (int st = 0; st < 2; st++) {
+        const VPIX_Input &ci = st ? seat2_in : cur_in;
+        if (st && !seat2_live()) break;
+        if (centre_on && (!have_cen[st] || ci.coins != last_coins[st] || (ci.start && !last_start[st])) && ci.head.valid) {
+            cens[st][0] = ci.head.p[0]; cens[st][1] = ci.head.p[1]; have_cen[st] = true;
+            lg("TRK seat %d head centre = (%.0f %.0f) mm", st + 1, cens[st][0], cens[st][1]);
+        }
+        last_coins[st] = ci.coins; last_start[st] = ci.start;
     }
-    last_coins = cur_in.coins; last_start = cur_in.start;
     /* VPIX_CROUCH (games.ps1 Crouch, DAC/DN2): while the crouch button is held the head AND hand are fed
        crouch_mm lower, exactly as if the player squatted. The games' move_players puts the player in the
        crouch pose when head z < player_height - 200 (deepest frame at -375 mm). */
@@ -241,23 +322,30 @@ static uint32_t hle_trk_record(uint32_t mask, uint32_t rec, uint32_t mats = 0) {
         if (crouch != last_crouch) { lg("TRK crouch %s: head z fed %.0f mm (real %.0f)", crouch > 0 ? "ON" : "off", cur_in.head.p[2] - crouch, cur_in.head.p[2]); last_crouch = crouch; } }
     for (int s = 0; s < 32; s++) {
         if (!(mask >> s & 1)) continue;
+        const int seat = (s >= 2 && seat2_live()) ? 1 : 0;   /* remote seat 2: its own input, centre, hand state */
+        const VPIX_Input &ci = seat ? seat2_in : cur_in;
+        const float *cen = cens[seat];
+        const float crouch = ci.crouch_mm;
         bool is_head = (s % 2) == 0;                       /* sensors 1,4 = heads; 2,8 = hands */
         float pos[3];
         if (is_head) {
-            VPIX_Pose h = cur_in.head;
+            VPIX_Pose h = ci.head;
             /* Pac-Man walks where the head faces: back/strafe turn the head the game sees (the renderer
                gets the same turned pose, so the view stays on the real head) */
-            if (cur_in.walk_yaw != 0) for (int r = 0; r < 3; r++) {
-                float c = cosf(cur_in.walk_yaw), sn = sinf(cur_in.walk_yaw), x = h.R[r][0], y = h.R[r][1];
+            if (ci.walk_yaw != 0) for (int r = 0; r < 3; r++) {
+                float c = cosf(ci.walk_yaw), sn = sinf(ci.walk_yaw), x = h.R[r][0], y = h.R[r][1];
                 h.R[r][0] = x * c - y * sn; h.R[r][1] = x * sn + y * c;
             }
-            pos[0] = (h.p[0] - cen[0] + cur_in.loco[0]) * head_xy; pos[1] = (h.p[1] - cen[1] + cur_in.loco[1]) * head_xy; pos[2] = h.p[2] - crouch;
-            if (aim_head) pose_to_trkrec(pitched(h, cur_in.gun_pitch), pos, rec);   /* the aim trim tilts the head */
+            pos[0] = (h.p[0] - cen[0] + ci.loco[0]) * head_xy; pos[1] = (h.p[1] - cen[1] + ci.loco[1]) * head_xy; pos[2] = h.p[2] - crouch;
+            if (aim_head) pose_to_trkrec(pitched(h, ci.gun_pitch), pos, rec);   /* the aim trim tilts the head */
             else pose_to_trkrec(h, pos, rec);
-            head_fed = h;                                  /* real (unscaled) pose: the renderer works 1:1 */
+            if (seat) { seat2_head_fed = h; seat2_head_fed.p[2] -= crouch; }   /* seat 2's frame carries its own fed head */
+            else {
+            head_fed = h; walk_yaw_fed = ci.walk_yaw;      /* real (unscaled) pose: the renderer works 1:1 */
             head_fed.p[2] -= crouch; crouch_fed = crouch;  /* the renderer lowers the eye by the same amount */
+            }
         } else {
-            const VPIX_Pose &hd = cur_in.head;
+            const VPIX_Pose &hd = ci.head;
             /* VPIX_TWO_HANDS (games.ps1 TwoHands, Boxing): the pod had ONE joystick; you punched with it and held the
                trigger to throw the left glove instead of the right ("To change from right to left hand, hold down the
                trigger while punching" - its help). The game reads the hand record only as a position relative to the
@@ -266,31 +354,47 @@ static uint32_t hle_trk_record(uint32_t mask, uint32_t rec, uint32_t mats = 0) {
                (60 mm hysteresis) and hold the trigger while the LEFT one is out past 340 mm: both real hands box. */
             static const bool two_hands = getenv("VPIX_TWO_HANDS") && atoi(getenv("VPIX_TWO_HANDS"));
             bool use_left = false;
-            if (two_hands && cur_in.hand2.valid && cur_in.hand.valid) {
-                static bool left = false;
-                float fr = cur_in.hand.p[1] - hd.p[1], fl = cur_in.hand2.p[1] - hd.p[1];
+            if (two_hands && ci.hand2.valid && ci.hand.valid) {
+                static bool lefts[2] = {false, false}; bool &left = lefts[seat];
+                float fr = ci.hand.p[1] - hd.p[1], fl = ci.hand2.p[1] - hd.p[1];
                 if (!left && fl > fr + 60.f) left = true;
                 else if (left && fr > fl + 60.f) left = false;
                 use_left = left;
             }
-            const VPIX_Pose &h = use_left ? cur_in.hand2 : cur_in.hand;
+            const VPIX_Pose &h = use_left ? ci.hand2 : ci.hand;
+            /* VPIX_BOX_PUNCH_REL="guard,gain" (Boxing, in the ring): a punch is measured from where YOUR fist rests, not from the head.
+               Bobby's VR jabs (10-20 log) went 250 -> 400 mm in front of the eyes, the game's punch line is 408 mm: nothing landed.
+               Each hand's guard = its slowest-rising low point (drops at once, creeps up over ~5 s); the game gets guard mm +
+               (distance past your guard) * gain, so ~7 cm forward from your guard crosses the line at any arm length. */
+            static float pr_guard = 0.f, pr_gain = 0.f; static bool pr_read = false;
+            if (!pr_read) { pr_read = true; const char *e = getenv("VPIX_BOX_PUNCH_REL"); if (e && *e) sscanf(e, "%f,%f", &pr_guard, &pr_gain); }
+            const float raw_fwd = (h.p[1] - hd.p[1]) * hand_xy * ci.hand_reach;
+            const bool punch_rel = pr_gain > 0.f && box_ring_view && two_hands;
+            float rel_fwd = raw_fwd;
+            if (punch_rel) {
+                static float gbase[2][2]; static bool ghave[2][2] = {{false, false}, {false, false}};
+                float &gb = gbase[seat][use_left ? 1 : 0]; bool &gh = ghave[seat][use_left ? 1 : 0];
+                if (!gh || raw_fwd < gb) { gb = raw_fwd; gh = true; } else gb += (raw_fwd - gb) * 0.002f;
+                rel_fwd = pr_guard + (raw_fwd - gb) * pr_gain * ci.punch_gain;   /* punch_gain: player's keyboard adjuster (left / right) */
+            }
             if (two_hands) {
-                float fwd = (h.p[1] - hd.p[1]) * hand_xy * cur_in.hand_reach;
+                float fwd = punch_rel ? rel_fwd : raw_fwd;
                 bool trig = use_left && fwd > 340.f;
-                static bool last_left = false, last_trig = false; static int nlog = 0;
+                static bool last_lefts[2] = {false, false}, last_trigs[2] = {false, false}; static int nlog = 0;
+                bool &last_left = last_lefts[seat], &last_trig = last_trigs[seat];
                 if ((use_left != last_left || trig != last_trig) && nlog < 2000) {
-                    lg("BOX_HANDS %s hand fed fwd %.0f mm (game %.0f, punch above 600)%s", use_left ? "LEFT" : "right", fwd, fwd / 0.68f, trig ? " + trigger" : "");
+                    lg("BOX_HANDS seat %d %s hand fed fwd %.0f mm (game %.0f, punch above 600)%s", seat + 1, use_left ? "LEFT" : "right", fwd, fwd / 0.68f, trig ? " + trigger" : "");
                     nlog++;
                 }
-                last_left = use_left; last_trig = trig; two_hand_trigger = trig;
+                last_left = use_left; last_trig = trig; (seat ? seat2_two_hand_trigger : two_hand_trigger) = trig;
             }
             /* VPIX_HAND_X_SPREAD="scale,mm" (Boxing, ring only): the single-vector arm IK pulls both fists to the centre line when
                extended (Bobby 10-11: 'shoulders in, fists meet like an arm cross'): hand x offset * scale, plus mm outward per side */
             static float xs_sc = 1.f, xs_mm = 0.f; static bool xs_read = false;
             if (!xs_read) { xs_read = true; const char *e = getenv("VPIX_HAND_X_SPREAD"); if (e) sscanf(e, "%f,%f", &xs_sc, &xs_mm); }
-            float hx = (h.p[0] - hd.p[0]) * hand_xy * cur_in.hand_reach;
-            if (box_ring_view && two_hands) hx = hx * xs_sc + (use_left ? -xs_mm : xs_mm);
-            pos[0] = (hd.p[0] - cen[0] + cur_in.loco[0]) * head_xy + hx;
+            float hx = (h.p[0] - hd.p[0]) * hand_xy * ci.hand_reach;
+            if (box_ring_view && two_hands) hx = hx * xs_sc + (use_left ? -(xs_mm + ci.spread_mm) : xs_mm + ci.spread_mm);   /* + keyboard [ / ] */
+            pos[0] = (hd.p[0] - cen[0] + ci.loco[0]) * head_xy + hx;
             /* VPIX_HAND_FWD_OFF=<mm> (games.ps1 HandFwdOff, Boxing): the fed hand's forward distance is shifted back by this much.
                Boxing counts a hand more than 600 game units (408 mm) in front of the head as an extended punch and a
                punch STARTS on the retracted -> extended edge (character select, the fight). A VR player's guard rides ~700 mm
@@ -305,10 +409,11 @@ static uint32_t hle_trk_record(uint32_t mask, uint32_t rec, uint32_t mats = 0) {
             /* VPIX_MENU_FWD_FLIP (Boxing, character select only): the menu punch fires on the hand moving BACK (Bobby 10-11: 'elbow back made
                it punch', 'forward / backward punch reversed'): feed the forward distance mirrored there so a forward jab is the punch */
             static const bool menu_flip = getenv("VPIX_MENU_FWD_FLIP") && atoi(getenv("VPIX_MENU_FWD_FLIP"));
-            float fwd_delta = (h.p[1] - hd.p[1]) * hand_xy * cur_in.hand_reach * fight_reach;
+            float fwd_delta = (h.p[1] - hd.p[1]) * hand_xy * ci.hand_reach * fight_reach;
             if (menu_flip && !box_ring_view) fwd_delta = -fwd_delta;
+            if (punch_rel) fwd_delta = rel_fwd;
             const float fwd_off = (fwd_off_cfg != 0.f && !box_ring_view && !menu_flip) ? fwd_off_cfg : 0.f;
-            pos[1] = (hd.p[1] - cen[1] + cur_in.loco[1]) * head_xy + fwd_delta - fwd_off;
+            pos[1] = (hd.p[1] - cen[1] + ci.loco[1]) * head_xy + fwd_delta - fwd_off;
             pos[2] = h.p[2] - crouch;                      /* crouch button: the hand goes down with the body */
             /* VPIX_HAND_Z="scale,offset_mm" (games.ps1 HandZ, Boxing): hand height fed as head z + (hand - head + offset) * scale.
                Boxing's arm IK takes the glove target height as (hand z - head z) * 1.4 / 0.68 (about 2x) below the neck and
@@ -321,14 +426,19 @@ static uint32_t hle_trk_record(uint32_t mask, uint32_t rec, uint32_t mats = 0) {
                             if (e && *e && sscanf(e, "%f,%f", &hz_sc, &hz_off) >= 1 && hz_sc > 0) { hz_on = true; lg("TRK hand z = head z + (hand z - head z + %.0f) * %.2f", hz_off, hz_sc); } }
             if (hz_on) pos[2] = hd.p[2] + (h.p[2] - hd.p[2] + hz_off) * hz_sc - crouch;
             /* VPIX_HAND_Z_RIGHT=<mm> (Boxing): the right glove rides high (Bobby 10-11): feed the right hand this much lower (the arm IK doubles it) */
-            if (two_hands && !use_left) pos[2] -= cur_in.hand_zr;
+            if (two_hands && !use_left) pos[2] -= ci.hand_zr;
             /* the gun: tilt the wand's pointing axis by gun_pitch about its right axis (the wand's
                barrel axis points higher than the pod joystick's did); the game's gun roll runs the
                other way to the head's (tested by Bobby 2026-10-04) - except Shoot For Loot's, which runs
                the same way (VPIX_HAND_ROLL=1, games.ps1 HandRoll; Bobby 2026-10-05) */
             static const float hand_roll = getenv("VPIX_HAND_ROLL") && atof(getenv("VPIX_HAND_ROLL")) > 0 ? 1.f : -1.f;
-            pose_to_trkrec(pitched(h, aim_head ? -20.f : cur_in.gun_pitch), pos, rec, hand_roll);
-            memcpy(hand_fed, pos, sizeof(hand_fed));
+            if (ci.gun_dx != 0 || ci.gun_dz != 0 || ci.gun_dy != 0) {   /* VPIX_GUN_NUDGE: touchpad fine tuning, mm right / forward of the head's facing, up */
+                float fx = hd.R[1][0], fy = hd.R[1][1], fl = sqrtf(fx * fx + fy * fy);
+                if (fl > 1e-3f) { pos[0] += (fy * ci.gun_dx + fx * ci.gun_dy) / fl; pos[1] += (-fx * ci.gun_dx + fy * ci.gun_dy) / fl; }
+                pos[2] += ci.gun_dz;
+            }
+            pose_to_trkrec(pitched(h, aim_head ? -20.f : ci.gun_pitch), pos, rec, hand_roll);
+            if (!seat) memcpy(hand_fed, pos, sizeof(hand_fed));
         }
         if (mats) { trkrec_to_mat(rec, mats); mats += 0x40; }
         rec += 0x18;
@@ -371,9 +481,25 @@ static bool parse_wav(const std::vector<uint8_t> &d, VSound &out) {
     return false;
 }
 
+/* CD audio (VPIX_CD_DIR, Zone Hunter): the game's CD_PlayTrack(drive, track) plays <dir>\TRACKnn.WAV (44.1 kHz 16-bit stereo,
+   the disc's audio tracks ripped and named by their real track number) through this mixer; Stop / Quiet / Reset stop it,
+   Pause / Resume hold it. The CD library stays stubbed (DOSBox's MSCDEX path hung in CD_ChannelControl). */
+static std::mutex cd_mtx;
+static std::vector<int16_t> cd_pcm;                 /* interleaved L R */
+static size_t cd_pos = 0;
+static bool cd_play = false;
+static float cd_gain = 0.6f;                        /* VPIX_CD_GAIN */
+static uint32_t cd_track = 0;
+
 static void snd_mix(Bitu len) {
     static std::vector<int16_t> buf;
     buf.assign(len * 2, 0);
+    {   std::lock_guard<std::mutex> lk(cd_mtx);
+        if (cd_play) for (Bitu i = 0; i < len && cd_pos + 1 < cd_pcm.size(); i++, cd_pos += 2) {
+            buf[2 * i] = (int16_t)(cd_pcm[cd_pos] * cd_gain); buf[2 * i + 1] = (int16_t)(cd_pcm[cd_pos + 1] * cd_gain);
+        }
+        if (cd_play && cd_pos + 1 >= cd_pcm.size()) cd_play = false;
+    }
     for (VVoice &v : voices) {
         if (!v.on || !v.s) continue;
         double step = (double)v.s->rate / SND_RATE * pow(2.0, (v.semis + v.bend / 32.0) / 12.0);
@@ -407,6 +533,265 @@ static void snd_mix(Bitu len) {
     }
 }
 
+/* ---- Total Recoil (SU3000) sound: the game's AWE_ module drove an AWE32 through Creative's 3D audio library (C3DA*); DOSBox has
+   no EMU8000. The module's by-name wrappers run natively (AWE_FindEm / AWE_FindID on the game's sample_list, filled from
+   RUNFILES\SOUND.DBS by DBS_get_sfx) and funnel into these:
+   AWE_LoadWAV(file, looped) -> sample id;  AWE_Play(emitter, sample, float *pos or 0 = at the listener);  AWE_Stop(emitter).
+   One voice per emitter (the DBS 'em' column), volume = sample_list +0x58 (0..255), pan from the position in the view's frame
+   (global view: rows +0/+0x10/+0x20, listener position +0x30). snd_flg = -1 makes every AWE_ call a no-op: AWE_Open sets 0. */
+static void haptic_for_sound(std::string fn);
+static uint32_t hle_awe(const std::string &n, VHook &h) {
+    static uint32_t next_id = 0;
+    if (n == "AWE_Open") {
+        if (!snd_chan && sound_on) { snd_chan = MIXER_AddChannel(snd_mix, SND_RATE, "VPIXSND"); snd_chan->Enable(true); }
+        if (uint32_t sf = global_rt("snd_flg")) mem_writed(sf, 0);
+        uint32_t r = global_rt("soundview") ? 1 : 0;   /* Zero Hour's main_: non-zero = opened (then snd_flg 0 -> AWE_LoadSamples); 0 = 'load error', sound off */
+        lg("AWE_Open -> %u (HLE mixer %s)", r, snd_chan ? "on" : "off");
+        return r;
+    }
+    /* Zero Hour's AWE module (aweOpen stays 0, so its native C3DA paths are skipped): AWE_LoadSamples reads RUNFILES\SOUND.DBS ->
+       the language list (runfiles\english.snd: 'SOUND <n> <wav> <Y=loop> <name>'); AWE_Play(eax emitter, dx sound n, ebx object
+       (position +0x62) or ecx float *pos, stack byte gain 0..255); emitters come from the native AWE_grab_emitter (em_used[64]);
+       AWE_Stop / AWE_Fade / AWE_release_emitter (eax emitter) stop the voice and free the emitter. Listener = *soundview +0x30. */
+    if (uint32_t svp = global_rt("soundview")) {
+        auto free_em = [](uint32_t em) { if (uint32_t eu = global_rt("em_used")) if (em < 64) mem_writed(eu + 4 * em, 0); };
+        if (n == "AWE_LoadSamples") {
+            std::vector<uint8_t> d; int nload = 0;
+            if (!read_dos_file("runfiles\\sound.dbs", d)) { lg("AWE_LoadSamples: no runfiles\\sound.dbs"); return 0; }
+            std::string list(d.begin(), d.end()), lf;
+            for (char c : list) { if (isspace((unsigned char)c)) { if (!lf.empty()) break; continue; } if (c == '\\' && !lf.empty() && lf.back() == '\\') continue; lf += c; }
+            d.clear();
+            if (!read_dos_file(lf, d)) { lg("AWE_LoadSamples: can't read %s", lf.c_str()); return 0; }
+            std::string txt(d.begin(), d.end()), line; txt += '\n';
+            for (char c : txt) {
+                if (c != '\n') { line += c; continue; }
+                char kw[16], file[128], loop[8], name[64];
+                int id; if (sscanf(line.c_str(), "%15s %d %127s %7s %63s", kw, &id, file, loop, name) >= 4 && !strcmp(kw, "SOUND") && id >= 0 && id < 64) {
+                    VSound s; std::vector<uint8_t> w;
+                    if (read_dos_file(file, w) && parse_wav(w, s)) {
+                        s.loop = toupper((unsigned char)loop[0]) == 'Y';
+                        sounds[0x50000u | id] = std::move(s); sound_names[0x50000u | id] = file; nload++;
+                    } else lg("AWE_LoadSamples: %d \"%s\" FAILED", id, file);
+                }
+                line.clear();
+            }
+            lg("AWE_LoadSamples: %d sounds from %s", nload, lf.c_str());
+            return 0;
+        }
+        if (n == "AWE_Play") {
+            uint32_t em = reg_eax & 0xFFFF, smp = reg_edx & 0xFFFF, obj = reg_ebx, pos = obj ? obj + 0x62 : reg_ecx;
+            int gain = mem_readb(SegPhys(ss) + reg_esp + 4);
+            auto it = sounds.find(0x50000u | smp);
+            if (it == sounds.end() || em >= 64) return 0;
+            int pan = 0; uint32_t vw = mem_readd(svp);
+            if (pos && vw) {
+                float rel[3], px = 0, py = 0;
+                for (int c = 0; c < 3; c++) rel[c] = rd_f(pos + 4 * c) - rd_f(vw + 0x30 + 4 * c);
+                for (int c = 0; c < 3; c++) { px += rel[c] * rd_f(vw + 4 * c); py += rel[c] * rd_f(vw + 0x10 + 4 * c); }
+                float a = atan2f(px, fabsf(py) + 1e-3f) / 1.5708f;
+                pan = (int)(a * 63.f); if (pan > 63) pan = 63; if (pan < -64) pan = -64;
+            }
+            haptic_for_sound(sound_names[0x50000u | smp]);
+            /* a sound played ON the player object = the player getting hit (PLAYER_process: sound 6) -> both hands (Bobby 10-18) */
+            { uint32_t pl = global_rt("player"); if (pl && obj == pl) VPIX_Haptic(2, 0.25f, 1.f); }
+            VVoice &v = voices[em & 31];
+            v.s = &it->second; v.sound = smp; v.pos = 0; v.on = true; v.bend = 0; v.semis = 0; v.loop = it->second.loop; v.vol = gain * 127 / 255; v.pan = pan;
+            static const bool sndlog = getenv("VPIX_SNDLOG") != NULL;
+            if (sndlog || h.calls < 100) lg("AWE_Play f=%lu emitter %u sound %u %s gain %d pan %d", frame, em, smp, sound_names[0x50000u | smp].c_str(), gain, pan);
+            return 0;
+        }
+        if (n == "AWE_Stop" || n == "AWE_Fade" || n == "AWE_release_emitter") {
+            uint32_t em = reg_eax & 0xFFFF;
+            if (em < 64) { voices[em & 31].on = false; if (n != "AWE_Stop") free_em(em); }
+            return 0;
+        }
+        if (n == "AWE_StopAll" || n == "AWE_Close") { for (auto &v : voices) v.on = false; return 0; }
+        return 0;
+    }
+    if (n == "AWE_LoadWAV") {
+        std::string fn = rd_str(reg_eax); uint32_t id = next_id++;
+        std::vector<uint8_t> d; VSound s;
+        if (!read_dos_file(fn, d) || !parse_wav(d, s)) { lg("AWE_LoadWAV \"%s\" FAILED", fn.c_str()); return id; }
+        s.loop = reg_edx != 0;
+        sounds[0x50000u | id] = std::move(s); sound_names[0x50000u | id] = fn;
+        if (h.calls < 300) lg("AWE_LoadWAV %u \"%s\" %s", id, fn.c_str(), reg_edx ? "looped" : "");
+        return id;
+    }
+    if (n == "AWE_Play") {
+        uint32_t em = reg_eax, smp = reg_edx & 0xFFFF, pos = reg_ebx;
+        auto it = sounds.find(0x50000u | smp);
+        if (it == sounds.end() || em > 0xFFFF) return 0;
+        int vol = 127;
+        uint32_t sl = global_rt("sample_list"), sc = global_rt("sample_count");
+        if (sl && sc) {
+            uint32_t cnt = mem_readd(sc);
+            for (uint32_t k = 0; k < cnt && k < 255; k++) if (mem_readd(sl + 0x5A * k) == smp) { vol = (int)(mem_readw(sl + 0x5A * k + 0x58) & 0xFF) * 127 / 255; break; }
+        }
+        int pan = 0;
+        uint32_t vw = global_rt("view");
+        if (pos && vw) {
+            float rel[3], px = 0, py = 0;
+            for (int c = 0; c < 3; c++) rel[c] = rd_f(pos + 4 * c) - rd_f(vw + 0x30 + 4 * c);
+            for (int c = 0; c < 3; c++) { px += rel[c] * rd_f(vw + 4 * c); py += rel[c] * rd_f(vw + 0x10 + 4 * c); }
+            float a = atan2f(px, fabsf(py) + 1e-3f) / 1.5708f;
+            pan = (int)(a * 63.f); if (pan > 63) pan = 63; if (pan < -64) pan = -64;
+        }
+        haptic_for_sound(sound_names[0x50000u | smp]);   /* Total Recoil: rumble on its own shot sounds (games.ps1 Haptic) */
+        VVoice &v = voices[em & 31];
+        v.s = &it->second; v.sound = smp; v.pos = 0; v.on = true; v.bend = 0; v.semis = 0; v.loop = it->second.loop; v.vol = vol; v.pan = pan;
+        static const bool sndlog = getenv("VPIX_SNDLOG") != NULL;
+        if (sndlog || h.calls < 100) lg("AWE_Play f=%lu emitter %u sample %u %s vol %d pan %d", frame, em, smp, sound_names[0x50000u | smp].c_str(), vol, pan);
+        return 0;
+    }
+    if (n == "AWE_Stop") { voices[reg_eax & 31].on = false; return 0; }
+    if (n == "AWE_StopAll" || n == "AWE_Close") { for (auto &v : voices) v.on = false; return 0; }
+    return 0;                                         /* Handle, CreateEmitter, LoadSamples_*: nothing to do */
+}
+
+/* ---- SU3000 MPEG movies (Total Recoil: Winchester promo, attract, the instructor JWTALK clips) ----------------------------
+   The MMC card's CL480 decoded MPEG-1 into the PIX board's video capture input, which wrote the picture into a video texture
+   (PIX_AllocateVideoTexture; PIX_SetVideoCapture(input, descriptor) picks which). We stream the same .MPG files through ffmpeg
+   (VPIX_FFMPEG, default ffmpeg on PATH; files under VPIX_MPEG_DIR = the game folder): video at 25 fps scaled to the texture
+   into the renderer (VPIX_Render_UpdateTextureRGBA), the soundtrack into the mixer's CD-audio stream (the attract music). */
+static uint32_t video_target = 0;                     /* last PIX_SetVideoCapture descriptor */
+static std::thread mp_thr; static std::atomic<bool> mp_stop_flag(false), mp_busy(false);
+static void mpeg_stop() {
+    if (mp_thr.joinable()) { mp_stop_flag = true; mp_thr.join(); }
+    mp_busy = false;
+    std::lock_guard<std::mutex> lk(cd_mtx); cd_play = false;
+}
+static bool mpeg_running() { return mp_busy; }
+static uint32_t tex3k_by_name(const char *want) {
+    uint32_t tt = global_rt("textureTable"), tab = tt ? mem_readd(tt) : 0;
+    for (uint32_t k = 0; tab && k < 1024 && mem_readd(tab + 0x14 * k); k++)
+        if (rd_str(mem_readd(tab + 0x14 * k)) == want) return mem_readd(tab + 0x14 * k + 8) & 0xFFFFFF;
+    return 0;
+}
+static bool build_tex3k(uint32_t d);
+static uint32_t ppc_rd(uint32_t a);
+static bool mpeg_start(const std::string &dosname) {
+    static const char *dir = getenv("VPIX_MPEG_DIR");
+    if (!dir) return false;
+    uint32_t d = video_target ? video_target : tex3k_by_name("MPEG");
+    if (!d) { lg("MPEG: no video texture for %s", dosname.c_str()); return false; }
+    build_tex3k(d);
+    uint32_t w = ppc_rd(d) & 0xFFFF, h = ppc_rd(d + 4) >> 16;
+    if (!w || !h || w > 1024 || h > 1024) return false;
+    mpeg_stop();
+    if (!snd_chan && sound_on) { snd_chan = MIXER_AddChannel(snd_mix, SND_RATE, "VPIXSND"); snd_chan->Enable(true); }
+    std::string path = std::string(dir) + "\\" + dosname;
+    static const char *ff = getenv("VPIX_FFMPEG") ? getenv("VPIX_FFMPEG") : "ffmpeg";
+    lg("MPEG play %s -> texture %06X %ux%u", path.c_str(), d, w, h);
+    mp_stop_flag = false; mp_busy = true;
+    mp_thr = std::thread([path, d, w, h]() {
+        char cmd[2048];
+        snprintf(cmd, sizeof(cmd), "\"%s\" -v quiet -i \"%s\" -vn -f s16le -ac 2 -ar 44100 -", ff, path.c_str());
+        if (void *pa = VPIX_PipeOpen(cmd)) {                 /* soundtrack: whole file into memory (a 2-minute movie = 21 MB) */
+            std::vector<int16_t> pcm, chunk(65536); size_t r;
+            while (!mp_stop_flag && (r = VPIX_PipeRead(pa, chunk.data(), chunk.size() * 2)) > 0) pcm.insert(pcm.end(), chunk.begin(), chunk.begin() + r / 2);
+            VPIX_PipeClose(pa);
+            lg("MPEG audio %s: %.1f s", path.c_str(), pcm.size() / 2.0 / 44100.0);
+            std::lock_guard<std::mutex> lk(cd_mtx); cd_pcm.swap(pcm); cd_pos = 0; cd_play = !cd_pcm.empty();
+        }
+        snprintf(cmd, sizeof(cmd), "\"%s\" -v quiet -i \"%s\" -an -f rawvideo -pix_fmt rgba -vf scale=%u:%u -r 25 -", ff, path.c_str(), w, h);
+        if (void *pv = VPIX_PipeOpen(cmd)) {
+            std::vector<uint32_t> fr((size_t)w * h);
+            auto t0 = std::chrono::steady_clock::now(); unsigned long n = 0;
+            while (!mp_stop_flag && VPIX_PipeRead(pv, fr.data(), fr.size() * 4) == fr.size() * 4) {
+                VPIX_Render_UpdateTextureRGBA(0x80000000u | d, (int)w, (int)h, fr.data());
+                std::this_thread::sleep_until(t0 + std::chrono::milliseconds(40 * ++n));
+            }
+            VPIX_PipeClose(pv);
+        }
+        mp_busy = false;
+    });
+    return true;
+}
+
+static uint32_t hle_cd(const std::string &n) {
+    static const char *dir = getenv("VPIX_CD_DIR");
+    static bool init = false;
+    if (!init) { init = true; if (getenv("VPIX_CD_GAIN")) cd_gain = (float)atof(getenv("VPIX_CD_GAIN")); }
+    if (n == "CD_PlayTrack") {
+        uint32_t t = reg_edx;
+        char fn[1024]; snprintf(fn, sizeof(fn), "%s\\TRACK%02u.WAV", dir, t);
+        std::vector<int16_t> pcm;
+        /* TRACKnn.MP3 first (what the release ships: ~10x smaller), else the WAV rip; decoded whole at play, 44.1 kHz stereo */
+        char fm[1024]; snprintf(fm, sizeof(fm), "%s\\TRACK%02u.MP3", dir, t);
+        {   drmp3_config cfg; drmp3_uint64 nf = 0;
+            if (drmp3_int16 *s16 = drmp3_open_file_and_read_pcm_frames_s16(fm, &cfg, &nf, NULL)) {
+                if (cfg.channels == 2 && cfg.sampleRate == 44100) { pcm.assign(s16, s16 + nf * 2); strcpy(fn, fm); }
+                else lg("CD_PlayTrack %s: %u ch %u Hz, need 2 ch 44100 Hz", fm, cfg.channels, cfg.sampleRate);
+                drmp3_free(s16, NULL);
+            } }
+        if (pcm.empty()) if (FILE *f = fopen(fn, "rb")) {
+            std::vector<uint8_t> d; uint8_t b[65536]; size_t r;
+            while ((r = fread(b, 1, sizeof(b), f)) > 0) d.insert(d.end(), b, b + r);
+            fclose(f);
+            for (size_t p = 12; p + 8 <= d.size();) {     /* RIFF chunks: take 'data' as 16-bit stereo */
+                uint32_t sz; memcpy(&sz, d.data() + p + 4, 4);
+                if (!memcmp(d.data() + p, "data", 4)) { size_t m = (std::min)((size_t)sz, d.size() - p - 8) / 2;
+                    pcm.resize(m); memcpy(pcm.data(), d.data() + p + 8, m * 2); break; }
+                p += 8 + sz + (sz & 1);
+            }
+        }
+        if (!snd_chan && sound_on) { snd_chan = MIXER_AddChannel(snd_mix, SND_RATE, "VPIXSND"); snd_chan->Enable(true); }
+        lg("CD_PlayTrack drive=%u track=%u -> %s (%.1f s)", reg_eax, t, pcm.empty() ? "NO FILE" : fn, pcm.size() / 2.0 / 44100.0);
+        std::lock_guard<std::mutex> lk(cd_mtx);
+        cd_pcm.swap(pcm); cd_pos = 0; cd_play = !cd_pcm.empty(); cd_track = t;
+        return 0;
+    }
+    std::lock_guard<std::mutex> lk(cd_mtx);
+    if (n == "CD_Stop" || n == "CD_Quiet" || n == "CD_Reset") { if (cd_play) lg("%s: CD track %u stopped", n.c_str(), cd_track); cd_play = false; }
+    else if (n == "CD_Pause") cd_play = false;
+    else if (n == "CD_Resume") cd_play = cd_pos + 1 < cd_pcm.size();
+    return 0;
+}
+
+/* VPIX_HAPTIC (games.ps1 Haptic): controller rumble on the game's own sound events, so it matches the moment the game fires
+   or you are hit. "part=hand:ms:amp,..." - part = piece of the WAV file name (case ignored), hand r / l / b (both) / g (gun:
+   right hand, only while YOUR trigger is held or went down in the last 250 ms - other players' shots play the same sound on your pod). */
+static void haptic_for_sound(std::string fn) {
+    struct Rule { std::string part; int hand; float secs, amp; };
+    static std::vector<Rule> rules; static bool rd = false;
+    if (!rd) { rd = true; const char *e = getenv("VPIX_HAPTIC");
+        if (e) { std::string s(e); size_t p = 0;
+            while (p < s.size()) { size_t q = s.find(',', p); if (q == std::string::npos) q = s.size();
+                std::string it = s.substr(p, q - p); p = q + 1;
+                char part[64] = {0}, hd = 'r'; float ms = 60, amp = 0.8f;
+                if (sscanf(it.c_str(), "%63[^=]=%c:%f:%f", part, &hd, &ms, &amp) >= 1 && part[0]) {
+                    std::string lo(part); std::transform(lo.begin(), lo.end(), lo.begin(), ::tolower);
+                    rules.push_back({lo, hd == 'l' ? 1 : hd == 'b' ? 2 : hd == 'g' ? 3 : 0, ms / 1000.f, amp});
+                    lg("HAPTIC rule: sound *%s* -> %s hand %.0f ms amp %.2f", lo.c_str(), hd == 'l' ? "left" : hd == 'b' ? "both" : hd == 'g' ? "gun (own shots)" : "right", ms, amp); } } } }
+    if (rules.empty()) return;
+    std::transform(fn.begin(), fn.end(), fn.begin(), ::tolower);
+    for (const Rule &r : rules) if (fn.find(r.part) != std::string::npos) {
+        if (r.hand == 3) { if (trigger_held || hap_ms_now() - trigger_down_ms < 250) VPIX_Haptic(0, r.secs, r.amp); }
+        else VPIX_Haptic(r.hand, r.secs, r.amp);
+        break; }
+}
+
+/* VPIX_MUZZLE="model=sound:ms" (games.ps1 Muzzle, Zone Hunter 'kickw\gun.bin=pulse1:120'): the first gun's muzzle flash polygons
+   (select word 1) never show - the game leaves PIXMODEL +0x50 at 0 even while firing. The promo footage (zonehunter_isdn.mp4) shows
+   a short orange-white burst at the pistol per shot: light them for <ms> after each of our own shot sounds (trigger just pulled). */
+static unsigned long long muzzle_until = 0;
+static std::string muzzle_model;
+static void muzzle_for_sound(std::string fn) {
+    static std::string snd; static float ms = 90; static bool rd = false;
+    if (!rd) { rd = true; const char *e = getenv("VPIX_MUZZLE");
+        if (e && *e) { char m[128] = {0}, s[64] = {0};
+            if (sscanf(e, "%127[^=]=%63[^:]:%f", m, s, &ms) >= 2) { muzzle_model = m; snd = s;
+                std::transform(muzzle_model.begin(), muzzle_model.end(), muzzle_model.begin(), ::tolower); std::transform(snd.begin(), snd.end(), snd.begin(), ::tolower);
+                lg("MUZZLE: %s flashes %.0f ms on own *%s* sounds", muzzle_model.c_str(), ms, snd.c_str()); } } }
+    if (snd.empty()) return;
+    std::transform(fn.begin(), fn.end(), fn.begin(), ::tolower);
+    if (fn.find(snd) != std::string::npos && (trigger_held || hap_ms_now() - trigger_down_ms < 250)) muzzle_until = hap_ms_now() + (unsigned long long)ms;
+}
+
+static void snd_apply(int op, uint32_t ch, uint32_t edx, uint32_t ebx, int semis);
+static bool seat_sound_local_off();                                                        /* vpix_seat.h */
+static bool seat_client_on();                                                              /* vpix_seat.h: this PC is a remote seat */
+static void seat_sound_event(int op, uint32_t ch, uint32_t edx, uint32_t ebx, int semis);  /* vpix_seat.h */
 static uint32_t hle_sound(const std::string &n, VHook &h) {
     uint32_t card;
     if (n == "SND_Open") {
@@ -437,45 +822,39 @@ static uint32_t hle_sound(const std::string &n, VHook &h) {
     card = (n == "SND_StartPitchedSound" || n == "SND_StopPitchedSound") ? mem_readd(SegPhys(ss) + reg_esp + 4) & 0xFF : reg_ecx & 0xFF;
     if (n == "SND_SetChannelVolume" || n == "SND_SetChannelPan" || n == "SND_SetChannelPitch") card = reg_ebx & 0xFF;
     if (card != 1 || ch >= 32) return 0;          /* only player 1's pod is ours */
+    int op = n == "SND_StartSound" || n == "SND_StartPitchedSound" ? 1 : n == "SND_StopSound" || n == "SND_StopPitchedSound" ? 2
+           : n == "SND_SetChannelVolume" ? 3 : n == "SND_SetChannelPan" ? 4 : n == "SND_SetChannelPitch" ? 5 : 0;
+    if (!op) return 0;
+    int semis = n == "SND_StartPitchedSound" ? (int)(int8_t)(reg_ecx & 0xFF) : 0;
+    if (seat_sound_local_off()) return 0;          /* remote seat PC: its own idle game stays silent, the host's sounds play */
+    seat_sound_event(op, ch, reg_edx, reg_ebx, semis);   /* remote seat host: the seat PC hears the same sounds */
+    if (op == 1 && h.calls < 200) lg("%s ch=%u sound=%u flags=%X semis=%d", n.c_str(), ch, reg_edx, reg_ebx & 0xFF, semis);
+    snd_apply(op, ch, reg_edx, reg_ebx, semis);
+    return 0;
+}
+/* one sound command on player 1's card: 1 start (sound edx, volume ebx), 2 stop, 3 volume, 4 pan, 5 pitch bend */
+static void snd_apply(int op, uint32_t ch, uint32_t edx, uint32_t ebx, int semis) {
+    if (ch >= 32) return;
     VVoice &v = voices[ch];
-    if (n == "SND_StartSound" || n == "SND_StartPitchedSound") {   /* (channel, sound, volume, [semitones,] card) */
-        auto it = sounds.find(1u << 16 | reg_edx);
-        if (it == sounds.end()) return 0;
-        v.s = &it->second; v.sound = reg_edx; v.pos = 0; v.on = true; v.bend = 0;
-        v.loop = it->second.loop; v.vol = (int)(reg_ebx & 0x7F);
-        v.semis = n == "SND_StartPitchedSound" ? (int)(int8_t)(reg_ecx & 0xFF) : 0;
+    if (op == 1) {
+        auto it = sounds.find(1u << 16 | edx);
+        if (it == sounds.end()) return;
+        v.s = &it->second; v.sound = edx; v.pos = 0; v.on = true; v.bend = 0;
+        v.loop = it->second.loop; v.vol = (int)(ebx & 0x7F);
+        v.semis = semis;
         static const bool sndlog = getenv("VPIX_SNDLOG") != NULL;    /* every start with frame + file: which sound plays at which scene */
-        if (sndlog) lg("SNDSTART f=%lu ch=%u sound=%u %s", frame, ch, reg_edx, sound_names[1u << 16 | reg_edx].c_str());
+        if (sndlog) lg("SNDSTART f=%lu ch=%u sound=%u %s", frame, ch, edx, sound_names[1u << 16 | edx].c_str());
         /* VPIX_HAPTIC (games.ps1 Haptic): controller rumble on the game's own sound events, so it matches the moment the game fires
            or you are hit. "part=hand:ms:amp,..." - part = piece of the WAV file name (case ignored), hand r / l / b (both) / g (gun:
            right hand, only while YOUR trigger is held or went down in the last 250 ms - other players' shots play the same sound on your pod). */
-        {   struct Rule { std::string part; int hand; float secs, amp; };
-            static std::vector<Rule> rules; static bool rd = false;
-            if (!rd) { rd = true; const char *e = getenv("VPIX_HAPTIC");
-                if (e) { std::string s(e); size_t p = 0;
-                    while (p < s.size()) { size_t q = s.find(',', p); if (q == std::string::npos) q = s.size();
-                        std::string it = s.substr(p, q - p); p = q + 1;
-                        char part[64] = {0}, hd = 'r'; float ms = 60, amp = 0.8f;
-                        if (sscanf(it.c_str(), "%63[^=]=%c:%f:%f", part, &hd, &ms, &amp) >= 1 && part[0]) {
-                            std::string lo(part); std::transform(lo.begin(), lo.end(), lo.begin(), ::tolower);
-                            rules.push_back({lo, hd == 'l' ? 1 : hd == 'b' ? 2 : hd == 'g' ? 3 : 0, ms / 1000.f, amp});
-                            lg("HAPTIC rule: sound *%s* -> %s hand %.0f ms amp %.2f", lo.c_str(), hd == 'l' ? "left" : hd == 'b' ? "both" : hd == 'g' ? "gun (own shots)" : "right", ms, amp); } } } }
-            if (!rules.empty()) {
-                std::string fn = sound_names[1u << 16 | reg_edx]; std::transform(fn.begin(), fn.end(), fn.begin(), ::tolower);
-                for (const Rule &r : rules) if (fn.find(r.part) != std::string::npos) {
-                    if (r.hand == 3) { if (trigger_held || hap_ms_now() - trigger_down_ms < 250) VPIX_Haptic(0, r.secs, r.amp); }
-                    else VPIX_Haptic(r.hand, r.secs, r.amp);
-                    break; }
-            }
-        }
-        if (h.calls < 200) lg("%s ch=%u sound=%u flags=%X semis=%d", n.c_str(), ch, reg_edx, reg_ebx & 0xFF, v.semis);
-        return 0;
+        haptic_for_sound(sound_names[1u << 16 | edx]);
+        muzzle_for_sound(sound_names[1u << 16 | edx]);
+        return;
     }
-    if (n == "SND_StopSound" || n == "SND_StopPitchedSound") { v.on = false; return 0; }
-    if (n == "SND_SetChannelVolume") { v.vol = (int)(reg_edx & 0xFF); return 0; }
-    if (n == "SND_SetChannelPan") { v.pan = (int)(int8_t)(reg_edx & 0xFF); return 0; }
-    if (n == "SND_SetChannelPitch") { v.bend = (int)(int16_t)(reg_edx & 0xFFFF); return 0; }
-    return 0;
+    if (op == 2) v.on = false;
+    else if (op == 3) v.vol = (int)(edx & 0xFF);
+    else if (op == 4) v.pan = (int)(int8_t)(edx & 0xFF);
+    else if (op == 5) v.bend = (int)(int16_t)(edx & 0xFFFF);
 }
 
 static void submit_frame();
@@ -622,6 +1001,7 @@ static void poll_textures() {
     static uint32_t seen[256][2];
     for (uint32_t n = 0; n < 256; n++) {
         uint32_t e = tt + n * 0x31, fl = mem_readd(e), hd = mem_readd(e + 4);
+        if (ref_mode) { if (!fl && !hd) continue; hd = ref_h(hd); }
         if (!hd || (seen[n][0] == fl && seen[n][1] == hd)) continue;
         seen[n][0] = fl; seen[n][1] = hd;
         float o[3] = {rd_f(e + 8), rd_f(e + 12), rd_f(e + 16)};
@@ -654,15 +1034,18 @@ static void poll_textures() {
 /* VPIX_BOX_GLOVE_TRACK: the card slots force_box_gloves put your own gloves in this frame, and their same-kind biceps;
    submit_frame tags them (own_hand 5 / 6) so the renderer can draw the gloves at the controllers, like Dactyl's gun */
 static std::vector<uint32_t> own_glove_slots, own_arm_slots;
+/* the same per view (Duo / remote seat: each seat's view has its own boxer's gloves; one list for both put the opponent's gloves
+   on your controllers, Bobby 10-20 'our arms are swapping'); submit_frame takes the shown view's lists */
+static std::map<uint32_t, std::vector<uint32_t>> own_glove_by_view, own_arm_by_view;
 static std::set<uint32_t> blit_under;   /* VPIX_BLIT_UNDER bitmap handles */
-struct ClampY { std::string name; float ymin, ymax; std::string anchor; };
+struct ClampY { std::string name; float ymin, ymax; std::string anchor; float yscale = 1.f; };   /* yscale: 'name:*k' form */
 static std::vector<ClampY> clamp_y;   /* VPIX_CLAMP_Y entries */
 /* VPIX_ARM_TO_GUN: the intro forearm and its place in the gun's frame (drawn on your gun in play) */
 static VPIX_Instance arm_tmpl; static bool arm_have = false; static float arm_rel_T[3], arm_rel_R[3][3];
 static VPIX_Instance up_tmpl; static bool up_have = false; static float up_len = 0;   /* the intro's right upper arm (larm.bin) + shoulder->elbow length */
 static void force_box_gloves() {
     static const bool on = getenv("VPIX_BOX_FORCEGLOVE") && atoi(getenv("VPIX_BOX_FORCEGLOVE"));
-    own_glove_slots.clear(); own_arm_slots.clear();
+    own_glove_slots.clear(); own_arm_slots.clear(); own_glove_by_view.clear(); own_arm_by_view.clear();
     if (!on) return;
     uint32_t vw = region_rt("view"), md = region_rt("model");
     if (!vw || !md) return;
@@ -748,6 +1131,9 @@ static void force_box_gloves() {
         mem_writed(va + 0x40 + 4 * (slot >> 5), mem_readd(va + 0x40 + 4 * (slot >> 5)) | (1u << (slot & 31)));
         if (std::find(own_glove_slots.begin(), own_glove_slots.end(), slot) == own_glove_slots.end()) own_glove_slots.push_back(slot);
         if (std::find(own_arm_slots.begin(), own_arm_slots.end(), c.as) == own_arm_slots.end()) own_arm_slots.push_back(c.as);
+        auto &gv = own_glove_by_view[va], &av = own_arm_by_view[va];
+        if (std::find(gv.begin(), gv.end(), slot) == gv.end()) gv.push_back(slot);
+        if (std::find(av.begin(), av.end(), c.as) == av.end()) av.push_back(c.as);
     }
     static unsigned long nl = 0;
     if (nl++ % 150 == 0) {
@@ -759,9 +1145,550 @@ static void force_box_gloves() {
 }
 
 /* Build the frame window 0 shows from the PIX library's own tables. */
+/* ---- SU3000 / 2000E (PIX v1.37+) -------------------------------------------------------------------------
+   The library runs natively against the RAM-backed board (vpix.cpp). Per frame we read its own tables:
+   iview[32] stride 0xBC (rotation rows +0/+0x10/+0x20, position +0x30, 512-bit model mask +0x40),
+   imodel[512] stride 0x20C (handle +0, rotation COLUMNS +4/+0x14/+0x24, position +0x34, scale +0x84, palette +0xA0 x16).
+   A 3D handle = PowerPC address of its PIXOBJECT | 0x1000000; the object sits in PowerPC 0's window of BAR0 as
+   big-endian dwords: +4 vertex count, +8 vertices (xyz floats), +0x14 polygon count, +0x18 polygons (0x40 bytes:
+   +0 flags (1 = untextured), +8 colour 0xRRGGBB, +0x18 texture handle, +0x1C face normal, +0x28 corner count,
+   +0x2C corner vertex indices, +0x30 corner colours, +0x34 corner normals, +0x38 corner UVs). */
+static std::set<uint32_t> meshes3k;
+/* backdrop models (every textured polygon wears a CLOUD* / BIGCLD* / SKY* texture): their textures carry a solid sky-coloured background,
+   so drawn in depth order they cut sky-coloured holes in the hills behind them (Bobby 10-18). Drawn first, depth write off. */
+static std::set<uint32_t> backdrop3k;
+static uint32_t ppc_rd(uint32_t a) {
+    const uint8_t *p = VPIX_Pix3K_Mem(0xC0000000u + a, 4);
+    return p ? ((uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3]) : 0;
+}
+static float ppc_rdf(uint32_t a) { uint32_t u = ppc_rd(a); float f; memcpy(&f, &u, 4); return f; }
+
+/* GiGi texture memory. PIXI_LoadTargaTexture converts the Targa on the host, then per chunk copies it to PowerPC 0's
+   staging buffer (window +0x19000) and queues a command in the ring at window +0x11000..+0x19000 (wraps to +0x11000):
+   [2][GiGi address][byte count] (big-endian dwords; with our stubbed start-up the ring starts at window +0), sets the ring write offset (PPCDEVICE +0xC, PPCDEVICE = pixConfig
+   +0x1DA, its +0 = the window's address) and waits in PIX_GetModuleStatus. That status read (vpix.cpp) lands here:
+   with no PowerPC firmware we run the copy ourselves into gigi[]. The texture handle is the PowerPC address of a
+   0x18-byte descriptor: +0 format, +2 width, +4 height (big-endian words), +6/+7 log2 sizes, +0xC GiGi address. */
+static std::vector<uint8_t> gigi;
+static uint32_t gigi_rd = 0;   /* the ring offset starts at 0 here (no PowerPC firmware sets it up), wraps to +0x11000 */
+void VPIX_Pix3K_Service(void) {
+    uint32_t pc = global_rt("pixConfig");
+    if (!pc) return;
+    uint32_t dev = mem_readd(pc + 0x1DA);
+    if (!dev) return;
+    uint32_t win = mem_readd(dev) - 0xC0000000u, wr = mem_readd(dev + 0xC);
+    static int nl = 0, ns = 0;
+    if (ns < 8 && wr != gigi_rd) { ns++; lg("PIX3K service: pixConfig %08X dev %08X window %08X ring +%05X (ours +%05X)", pc, dev, win, wr, gigi_rd); }
+    if (win >= 0x4000000 || wr >= 0x19000 || wr == gigi_rd) return;
+    while (gigi_rd != wr) {
+        uint32_t cmd = ppc_rd(win + gigi_rd);
+        auto next = [&]() { gigi_rd += 4; if (gigi_rd >= 0x19000) gigi_rd = 0x11000; };
+        if (cmd != 2) { if (nl++ < 40) lg("PIX3K ring: unknown command %08X at +%05X, skipped to +%05X", cmd, gigi_rd, wr); gigi_rd = wr; break; }
+        next(); uint32_t dst = ppc_rd(win + gigi_rd);
+        next(); uint32_t len = ppc_rd(win + gigi_rd);
+        next();
+        if (len > 0x8000 || dst > 0x4000000) { if (nl++ < 40) lg("PIX3K ring: bad copy dst %08X len %X", dst, len); continue; }
+        if (gigi.size() < dst + len) gigi.resize(((size_t)dst + len + 0xFFFFF) & ~(size_t)0xFFFFF);
+        const uint8_t *src = VPIX_Pix3K_Mem(0xC0000000u + win + 0x19000, len);
+        if (src) memcpy(&gigi[dst], src, len);
+        if (nl++ < 40) lg("PIX3K ring: GiGi upload %X bytes -> %08X", len, dst);
+    }
+}
+
+/* SU3000 texture handle -> renderer texture (key 0x80000000 | handle). Formats from PIXI_LoadTargaTexture's
+   converter: 0 = ARGB8888, 1 = ARGB1555, 2 = ARGB4444, 5 = RGB332, 9 = A1 R2 G3 B2. */
+static std::map<uint32_t, bool> tex3k;
+/* texture number (1-based index into the game's PIXTEXTUREENTRY table: +0 name, +4 file, +8 handle) -> descriptor */
+static uint32_t tex3k_index(uint32_t th) {
+    uint32_t tt = global_rt("textureTable"), tab = tt ? mem_readd(tt) : 0;
+    if (!tab || th == 0 || th > 4096) return 0;
+    static bool listed = false;
+    if (!listed) { listed = true;
+        for (uint32_t k = 0; k < 64 && mem_readd(tab + 0x14 * k); k++) {
+            char nm[40] = "", fl[80] = "";
+            for (int i = 0; i < 39; i++) { nm[i] = (char)mem_readb(mem_readd(tab + 0x14 * k) + i); if (!nm[i]) break; }
+            uint32_t fa = mem_readd(tab + 0x14 * k + 4);
+            for (int i = 0; fa && i < 79; i++) { fl[i] = (char)mem_readb(fa + i); if (!fl[i]) break; }
+            lg("SU3K textureTable[%u] '%s' file '%s' handle %08X", k + 1, nm, fl, mem_readd(tab + 0x14 * k + 8));
+        } }
+    return mem_readd(tab + 0x14 * (th - 1) + 8) & 0xFFFFFF;
+}
+/* descriptor -> texture name (GFX.DAT [TEXTURETABLE] name, e.g. CLOUD, BIGCLD1), "" when unknown */
+static std::string tex3k_name(uint32_t d) {
+    uint32_t tt = global_rt("textureTable"), tab = tt ? mem_readd(tt) : 0;
+    for (uint32_t k = 0; tab && k < 1024; k++) {
+        uint32_t na = mem_readd(tab + 0x14 * k);
+        if (!na) break;
+        if ((mem_readd(tab + 0x14 * k + 8) & 0xFFFFFF) != d) continue;
+        std::string n; for (int i = 0; i < 31; i++) { char c = (char)mem_readb(na + i); if (!c) break; n += c; }
+        return n;
+    }
+    return "";
+}
+static bool build_tex3k(uint32_t d) {    /* d = the descriptor's PowerPC address */
+    auto it = tex3k.find(d);
+    if (it != tex3k.end()) return it->second;
+    if (!d || d >= 0x2000000) { tex3k[d] = false; return false; }
+    uint32_t w0 = ppc_rd(d), w = w0 >> 0 & 0xFFFF, fmt = w0 >> 24, h = ppc_rd(d + 4) >> 16, ga = ppc_rd(d + 0xC);
+    static const int bpp[16] = {4, 2, 2, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0};
+    int bp = fmt < 16 ? bpp[fmt] : 0;
+    bool ok = bp && w && h && w <= 2048 && h <= 2048 && (size_t)ga + (size_t)w * h * bp <= gigi.size();
+    static int nl = 0;
+    if (nl++ < 200) lg("SU3K texture %06X: format %u, %ux%u, GiGi %08X%s", d, fmt, w, h, ga, ok ? "" : " ** not loaded");
+    if (ok) {
+        std::vector<uint32_t> rgba((size_t)w * h);
+        const uint8_t *s = &gigi[ga];
+        unsigned na0 = 0;
+        for (size_t i = 0; i < rgba.size(); i++) {
+            uint32_t r, g, b;
+            if (bp == 4) { const uint8_t *q = s + 4 * i; r = q[1]; g = q[2]; b = q[3]; }
+            else if (bp == 2) {
+                uint32_t v = (uint32_t)s[2 * i] << 8 | s[2 * i + 1];
+                if (fmt == 1) { r = (v >> 10 & 31) * 255 / 31; g = (v >> 5 & 31) * 255 / 31; b = (v & 31) * 255 / 31; }
+                else { r = (v >> 8 & 15) * 17; g = (v >> 4 & 15) * 17; b = (v & 15) * 17; }
+            } else {
+                uint32_t v = s[i];
+                if (fmt == 5) { r = (v >> 5) * 255 / 7; g = (v >> 2 & 7) * 255 / 7; b = (v & 3) * 85; }
+                else { r = (v >> 5 & 3) * 85; g = (v >> 2 & 7) * 255 / 7; b = (v & 3) * 85; }
+            }
+            rgba[i] = 0xFF000000u | b << 16 | g << 8 | r;
+            if (bp == 2 && fmt == 1 && !(s[2 * i] & 0x80)) na0++;
+        }
+        /* ARGB1555 mask textures (the tree cards: blue background, MASK_GROUP in GFX.DAT): alpha bit 0 = see-through. A texture
+           without a mask has the bit clear on every texel, so only one that mixes both is cut out. */
+        if (na0 && na0 < rgba.size()) {
+            for (size_t i = 0; i < rgba.size(); i++) if (!(gigi[ga + 2 * i] & 0x80)) rgba[i] = 0;   /* black, so filtering at the edge does not bleed the blue key */
+            if (nl < 200) lg("SU3K texture %06X: masked, %u of %u texels clear", d, na0, (unsigned)rgba.size());
+        }
+        ok = VPIX_Render_AddTextureRGBA(0x80000000u | d, (int)w, (int)h, rgba.data());
+    }
+    if (!ok && w && h && w <= 1024 && h <= 1024) {      /* video texture (PIX_AllocateVideoTexture): no texels yet - black, filled by MPEG playback */
+        std::vector<uint32_t> blk((size_t)w * h, 0xFF000000u);
+        ok = VPIX_Render_AddTextureRGBA(0x80000000u | d, (int)w, (int)h, blk.data());
+        if (nl < 200) lg("SU3K texture %06X: %ux%u video texture placeholder", d, w, h);
+    }
+    tex3k[d] = ok;
+    return ok;
+}
+/* SU3000 2D bitmaps: the game loads each picture with PIX_LoadTargaTexture (DBS_ReadBitmap: format 2, | 0x2000000 for some), so the
+   pixels are an ordinary texture descriptor. Decoded again here with the texels' own alpha (ARGB8888 byte 0, ARGB1555 bit 15,
+   ARGB4444 top nibble; a texture whose alpha is 0 everywhere is opaque) into the renderer's bitmap table, key 0x80000000 | d. */
+static std::map<uint64_t, uint32_t> bmp3k;   /* (descriptor, colour key + 1) -> renderer bitmap handle (0 = failed) */
+static uint32_t build_bmp3k(uint32_t d, int key) {   /* key = raw 16-bit texel value drawn see-through, -1 = none */
+    uint64_t id = (uint64_t)d << 32 | (uint32_t)(key + 1);
+    auto it = bmp3k.find(id);
+    if (it != bmp3k.end()) return it->second;
+    static uint32_t next_h = 0xA0000000u;
+    uint32_t hnd = next_h++;
+    bool ok = false;
+    if (d && d < 0x2000000) {
+        uint32_t w0 = ppc_rd(d), w = w0 & 0xFFFF, fmt = w0 >> 24, h = ppc_rd(d + 4) >> 16, ga = ppc_rd(d + 0xC);
+        int bp = fmt == 0 ? 4 : fmt == 1 || fmt == 2 ? 2 : 0;
+        if (bp && w && h && w <= 2048 && h <= 2048 && (size_t)ga + (size_t)w * h * bp <= gigi.size()) {
+            std::vector<uint32_t> rgba((size_t)w * h); const uint8_t *s = &gigi[ga]; size_t nz = 0;
+            for (size_t i = 0; i < rgba.size(); i++) {
+                uint32_t a, r, g, b;
+                if (bp == 4) { const uint8_t *q = s + 4 * i; a = q[0]; r = q[1]; g = q[2]; b = q[3]; }
+                else {
+                    uint32_t v = (uint32_t)s[2 * i] << 8 | s[2 * i + 1];
+                    if (key >= 0 && (v & 0x7FFF) == (uint32_t)key) { rgba[i] = 0; continue; }   /* colour key (alpha bit ignored) */
+                    if (fmt == 1) { a = v & 0x8000 ? 255 : 0; r = (v >> 10 & 31) * 255 / 31; g = (v >> 5 & 31) * 255 / 31; b = (v & 31) * 255 / 31; }
+                    else { a = (v >> 12) * 17; r = (v >> 8 & 15) * 17; g = (v >> 4 & 15) * 17; b = (v & 15) * 17; }
+                }
+                nz += a != 0;
+                rgba[i] = a << 24 | b << 16 | g << 8 | r;
+            }
+            if (!nz) for (size_t i = 0; i < rgba.size(); i++) if (rgba[i] || key < 0) rgba[i] |= 0xFF000000u;   /* no alpha in the texels: opaque except keyed */
+            /* Screen-door transparency: Total Recoil's STATION card veils the range with a dither of key + dark-red texels, which the
+               pod's 320x240 Visette blurred into a see-through shade; drawn sharp and big it is speckle (Bobby 10-18 'these look wrong').
+               Where keyed and solid texels mix in a 3x3 block, average them (premultiplied) into partial alpha. */
+            /* only for real screen-door art: many lone solid texels with all 4 neighbours keyed. Zero Hour's anti-aliased font
+               (grey edges on a black key) got averaged into half-transparent fringes = a ghost copy with vertical stripes (Bobby 10-18) */
+            size_t lone = 0, solid = 0;
+            if (key >= 0) for (int y = 1; y + 1 < (int)h; y++) for (int x = 1; x + 1 < (int)w; x++) {
+                if (!(rgba[(size_t)y * w + x] >> 24)) continue;
+                solid++;
+                if (!(rgba[(size_t)y * w + x - 1] >> 24) && !(rgba[(size_t)y * w + x + 1] >> 24) && !(rgba[(size_t)(y - 1) * w + x] >> 24) && !(rgba[(size_t)(y + 1) * w + x] >> 24)) lone++;
+            }
+            if (key >= 0 && lone * 20 > solid) {
+                std::vector<uint32_t> o(rgba);
+                for (int y = 0; y < (int)h; y++) for (int x = 0; x < (int)w; x++) {
+                    unsigned na = 0, n = 0; float r = 0, g = 0, bl = 0, al = 0;
+                    for (int dy = -1; dy <= 1; dy++) for (int dx = -1; dx <= 1; dx++) {
+                        int xx = x + dx, yy = y + dy;
+                        if (xx < 0 || yy < 0 || xx >= (int)w || yy >= (int)h) continue;
+                        uint32_t c = rgba[(size_t)yy * w + xx]; float a = (c >> 24) / 255.f;
+                        n++; na += c >> 24 ? 1 : 0; al += a; r += (c & 0xFF) * a; g += (c >> 8 & 0xFF) * a; bl += (c >> 16 & 0xFF) * a;
+                    }
+                    if (na == 0 || na == n) continue;            /* all solid or all see-through: unchanged */
+                    uint32_t A = (uint32_t)(al / n * 255.f + .5f);
+                    o[(size_t)y * w + x] = A << 24 | (uint32_t)(bl / al) << 16 | (uint32_t)(g / al) << 8 | (uint32_t)(r / al);
+                }
+                rgba.swap(o);
+            }
+            if (const char *bd = getenv("VPIX_BMPDUMP")) {   /* dev: raw RGBA (bottom-up rows) -> <dir>\<desc>_<w>x<h>_k<key>.rgba */
+                char fn[600]; snprintf(fn, sizeof(fn), "%s/%06X_%ux%u_k%X.rgba", bd, d, w, h, key < 0 ? 0xFFFF : key);
+                if (FILE *fo = fopen(fn, "wb")) { fwrite(rgba.data(), 4, rgba.size(), fo); fclose(fo); }
+            }
+            ok = VPIX_Render_AddBitmapRGBA(hnd, (int)w, (int)h, rgba.data());
+            static int nl = 0;
+            if (nl++ < 200) lg("SU3K bitmap %06X key %X: format %u, %ux%u, %u of %u texels with alpha", d, key, fmt, w, h, (unsigned)nz, (unsigned)rgba.size());
+        }
+    }
+    bmp3k[id] = ok ? hnd : 0;
+    return ok ? hnd : 0;
+}
+/* imodel slot with handle 0x10000000 = a screen bitmap. PIX_SetModel copies the game's PIXBITMAP (0x31 bytes) into imodel:
+   +1A0 bmp+0, +1A4 texture descriptor (bmp+4), +1A8/+1AC source x/y, +1B0/+1B4 width/height, +1B8/+1BC screen x/y,
+   +1C0/+1C4 drawn width/height (floats bmp+14/+18 rounded), +1D8 bmp+24 flags, +1DC RGB bmp+28, +1E0 RGB bmp+2C, +1E4 bmp+30. */
+static int64_t prio3k_key(int32_t p) { return p >= 0 ? -(int64_t)p : (int64_t)1000000000 + p; }   /* draw order key, low first */
+/* direct = ZENECA PIX_DrawBitmap: ma = the PIXBITMAP record - 0x1A0 (the same 0x31 bytes PIX_SetModel copies to imodel +1A0);
+   no slot priority, drawn on top */
+static void blit3k(VPIX_Frame &f, uint32_t ma, uint32_t slot, bool direct = false) {
+    uint32_t d = mem_readd(ma + 0x1A4) & 0xFFFFFF;
+    if (getenv("VPIX_VIEWLOG")) {
+        static std::set<uint64_t> seen;
+        if (seen.insert((uint64_t)slot << 32 | d).second && seen.size() < 400) {
+            std::string fs; for (int o = 0x1A0; o < 0x1E8; o += 4) { char t[12]; snprintf(t, sizeof(t), " %X", mem_readd(ma + o)); fs += t; }
+            lg("SU3K blit f=%lu slot %u tex %06X '%s' prio %d +1A0:%s", frame, slot, d, tex3k_name(d).c_str(), (int32_t)mem_readd(ma + 0x94), fs.c_str());
+        }
+    }
+    /* +1A0 flags 0x3000 (Total Recoil's crosshair, Zero Hour's font) = colour key on: key = +1D8 low word as a raw ARGB1555 texel
+       (crosshair 0x001F = pure blue, font 0 = black) */
+    uint32_t fl = mem_readd(ma + 0x1A0);
+    int key = fl & 0x1000 ? (int)(mem_readd(ma + 0x1D8) & 0x7FFF) : -1;   /* 0x1000 = colour key */
+    uint32_t hnd = build_bmp3k(d, key);
+    if (!hnd) return;
+    VPIX_Blit b; b.handle = hnd;
+    b.sx = (int)mem_readd(ma + 0x1A8); b.sy = (int)mem_readd(ma + 0x1AC); b.sw = (int)mem_readd(ma + 0x1B0); b.sh = (int)mem_readd(ma + 0x1B4);
+    b.x = (int)mem_readd(ma + 0x1B8); b.y = (int)mem_readd(ma + 0x1BC);
+    int dw = (int)mem_readd(ma + 0x1C0), dh = (int)mem_readd(ma + 0x1C4);
+    b.dw = (float)dw; b.dh = (float)dh;                  /* drawn size 0 = nothing (Total Recoil's spaces: width 0) */
+    b.key = -1; b.alpha = 1.f; b.world = false;
+    /* +1DC = tint RGB (bmp+28..2A): Total Recoil draws each letter twice, shadow 0x000064 one pixel down-right of 0x0032FF.
+       Zero Hour leaves bmp+24..30 uninitialised (+1D8 = 0x62090000, text bytes): tint only when +1D8's high word is clear.
+       Tint 0 = none (the VRi / Winchester logos, unselected menu words stay white; the selected one is red). */
+    /* +1A0 flag 0x2000 = tint on (letters 0x3000); the STATION cards (0x1000 = key only) carry stale letter colours in +1DC
+       and went red (Bobby 10-18 'station picture went red again') */
+    if ((fl & 0x2000) && !(mem_readd(ma + 0x1D8) >> 16) && (mem_readd(ma + 0x1DC) & 0xFFFFFF)) {
+        uint32_t c = mem_readd(ma + 0x1DC);
+        b.tint[0] = (c & 0xFF) / 255.f; b.tint[1] = (c >> 8 & 0xFF) / 255.f; b.tint[2] = (c >> 16 & 0xFF) / 255.f;
+    }
+    if (b.sw <= 0 || b.sh <= 0 || dw <= 0 || dh <= 0) return;
+    /* imodel +0x94 = PIXMODEL +0x54 = draw priority (game obj +0x82; Zero Hour HUD: hud_back/hud/hud_front_priority). VPIX_BLIT3K_PRIO
+       (run_su3k.sh zero): two layers. Positive = background pictures, higher further back (start-up grid+CYBERMIND 1002, CYBERMIND
+       1001, ZERO HOUR photo 1000 over them); negative = the HUD on top, more negative further back (ammo clip box -1001 under the
+       bullets / letters -1000 under the counter -999; Bobby 10-18: the clip covered the counter). Equal ones keep slot order. */
+    b.prio = direct ? -100000 : (int32_t)mem_readd(ma + 0x94);
+    /* positive = the background pictures: under the 3D scene (pre-game 'Shoot target' / choose-level models sit in front of the grid;
+       drawn over them the target was hidden and the game could not go on - Bobby 10-18) */
+    static const bool by_prio_bd = getenv("VPIX_BLIT3K_PRIO") && atoi(getenv("VPIX_BLIT3K_PRIO"));
+    if (by_prio_bd && b.prio >= 0 && !direct) b.backdrop = true;
+    static const bool by_prio = getenv("VPIX_BLIT3K_PRIO") && atoi(getenv("VPIX_BLIT3K_PRIO"));
+    if (by_prio) f.blits.insert(std::upper_bound(f.blits.begin(), f.blits.end(), b, [](const VPIX_Blit &x, const VPIX_Blit &y) { return prio3k_key(x.prio) < prio3k_key(y.prio); }), b);
+    else f.blits.push_back(b);
+}
+static bool build_mesh3k(uint32_t h) {
+    uint32_t ob = h & 0xFFFFFF;
+    uint32_t nv = ppc_rd(ob + 4), va = ppc_rd(ob + 8), np = ppc_rd(ob + 0x14), pa = ppc_rd(ob + 0x18);
+    if (nv == 0 || nv > 100000 || np == 0 || np > 100000 || va >= 0x2000000 || pa >= 0x2000000) { lg("SU3K mesh %08X: bad header nv=%u np=%u", h, nv, np); return false; }
+    std::vector<float> v(3 * nv);
+    for (uint32_t i = 0; i < 3 * nv; i++) v[i] = ppc_rdf(va + 4 * i);
+    std::vector<VPIX_MeshPoly> ps; ps.reserve(np);
+    unsigned ntex = 0, ncloud = 0; std::string tnames;
+    if (getenv("VPIX_POLYDUMP") && np >= 100) {          /* dev: raw polygon words of the big models */
+        for (uint32_t k = 0; k < 4; k++) { std::string s; for (int w = 0; w < 16; w++) { char b[12]; snprintf(b, sizeof(b), " %08X", ppc_rd(pa + k * 0x40 + 4 * w)); s += b; }
+            lg("POLYDUMP %08X #%u:%s", h, k, s.c_str()); }
+        std::map<uint32_t, int> hist; for (uint32_t k = 0; k < np; k++) hist[ppc_rd(pa + k * 0x40)]++;
+        std::string s; for (auto &e : hist) { char b[24]; snprintf(b, sizeof(b), " %X:%d", e.first, e.second); s += b; }
+        lg("POLYDUMP %08X flags%s", h, s.c_str());
+    }
+    for (uint32_t k = 0; k < np; k++) {
+        uint32_t q = pa + k * 0x40, fl = ppc_rd(q), col = ppc_rd(q + 8) & 0xFFFFFF, tex = ppc_rd(q + 0x18), n = ppc_rd(q + 0x28), ix = ppc_rd(q + 0x2C);
+        /* more than 16 corners (a building roof): split below into fan pieces of up to 16 that all share corner 0 */
+        if (n < 3 || n > 1024 || ix >= 0x2000000) continue;
+        if (n > 16) { static int nb = 0; if (nb++ < 50) lg("SU3K mesh %08X poly %u: %u corners (> 16, split into fan pieces)", h, k, n); }
+        std::vector<uint32_t> ci(n); std::vector<float> cuv(2 * n, 0.f);
+        for (uint32_t i = 0; i < n; i++) ci[i] = ppc_rd(ix + 4 * i);
+        VPIX_MeshPoly p;
+        p.nx = ppc_rdf(q + 0x1C); p.ny = ppc_rdf(q + 0x20); p.nz = ppc_rdf(q + 0x24);
+        /* textured (flags 0x10): +0xC = the texture descriptor's PowerPC address; the video screens (0x815) leave it 0 and
+           give the texture number at +0x18 instead */
+        uint32_t td = (fl & 0x10) ? ppc_rd(q + 0xC) & 0xFFFFFF : 0;
+        if ((fl & 0x10) && !td && tex) td = tex3k_index(tex);
+        if (fl & 0x10) {
+            ntex++;
+            uint32_t ua = ppc_rd(q + 0x38);
+            { std::string tn = tex3k_name(td);
+              if (tn.compare(0, 5, "CLOUD") == 0 || tn.compare(0, 6, "BIGCLD") == 0 || tn.compare(0, 3, "SKY") == 0) ncloud++;
+              if (tnames.find(tn) == std::string::npos && tnames.size() < 120) tnames += " " + tn; }
+            if (build_tex3k(td) && ua && ua < 0x2000000) {
+                p.tex = 0x80000000u | td; col = 0xFFFFFF;
+                for (uint32_t i = 0; i < n; i++) { cuv[2 * i] = ppc_rdf(ua + 8 * i); cuv[2 * i + 1] = ppc_rdf(ua + 8 * i + 4); }
+                static int nu = 0;
+                if (nu++ < 12) lg("SU3K poly flags %08X tex %06X uv (%.3f %.3f) (%.3f %.3f) (%.3f %.3f)", fl, td, cuv[0], cuv[1], cuv[2], cuv[3], cuv[4], cuv[5]);
+            } else col = 0xB0B0B0;                       /* texture not found: light grey */
+        }
+        if (!(fl & 0x10)) { char cb[12]; snprintf(cb, sizeof(cb), " c%06X", col); if (tnames.find(cb) == std::string::npos && tnames.size() < 200) tnames += cb; }
+        p.flags = 0x20000000u | col;
+        (void)fl;
+        /* corners 0, s .. s+14: consecutive pieces share an edge so the fan has no gaps */
+        for (uint32_t s = 1; s + 1 < n; s += 14) {
+            uint32_t m = (std::min)(n - s, 15u);
+            VPIX_MeshPoly q2 = p; q2.n = (uint8_t)(m + 1);
+            for (uint32_t i = 0; i <= m; i++) { uint32_t c = i ? s + i - 1 : 0; q2.idx[i] = ci[c]; q2.uv[i][0] = cuv[2 * c]; q2.uv[i][1] = cuv[2 * c + 1]; }
+            ps.push_back(q2);
+        }
+    }
+    bool ok = VPIX_Render_AddMesh(h, v, ps);
+    if (ntex && ncloud == ntex) backdrop3k.insert(h);
+    static int nl = 0;
+    float bb[6] = {1e30f, 1e30f, 1e30f, -1e30f, -1e30f, -1e30f};
+    for (uint32_t i = 0; i < nv; i++) for (int c = 0; c < 3; c++) { bb[c] = (std::min)(bb[c], v[3 * i + c]); bb[3 + c] = (std::max)(bb[3 + c], v[3 * i + c]); }
+    if (nl++ < 300) lg("SU3K mesh %08X: %u vertices, %u polygons (%u textured)%s%s bbox (%.0f %.0f %.0f)-(%.0f %.0f %.0f)", h, nv, np, ntex, ok ? "" : " ** rejected", backdrop3k.count(h) ? " [sky/cloud backdrop]" : "",
+                       bb[0], bb[1], bb[2], bb[3], bb[4], bb[5]);
+    if (!tnames.empty() && nl < 300) lg("SU3K mesh %08X textures:%s", h, tnames.c_str());
+    return ok;
+}
+static VPIX_Frame drawbmp3k;   /* PIX_DrawBitmap calls since the last frame (ZENECA: BITMAP_update every frame) */
+
+/* ---- ZENECA sound. The game's SND layer runs natively: FILE_LoadSamples reads RUNFILES\SAMPLES.FIL (sample n = n-th line: SWITCH,
+   CLOCK, PHONE, DOGBARK, KIDS, BRAIN, OPTIC, HEART) and calls AWE32_loadWAV(file, looped) for each; SND_createEffect / SND_processSounds
+   keep soundEffect[15] (stride 0x30: +0/+4/+8 position, +0xC sample (-1 = free), +0x10 looped, +0x20 seconds left, +0x2C gain) and
+   drive Creative's C3DA emitters (no EMU8000 in DOSBox). We load the WAVs at AWE32_loadWAV (returning their length in seconds, which
+   the game counts down) and poll the table every frame: one voice per effect slot, pan from the position in the camera's frame. */
+static uint32_t zen_samples = 0;
+static float zeneca_load_wav() {
+    std::string fn = rd_str(reg_eax); std::vector<uint8_t> d; VSound s;
+    const uint32_t id = zen_samples++;
+    if (!snd_chan && sound_on) { snd_chan = MIXER_AddChannel(snd_mix, SND_RATE, "VPIXSND"); snd_chan->Enable(true); }
+    if (!read_dos_file(fn, d) || !parse_wav(d, s) || s.pcm.empty()) { lg("ZENECA sample %u \"%s\" FAILED", id, fn.c_str()); return 1.f; }
+    s.loop = reg_edx != 0;
+    const float secs = (float)s.pcm.size() / (float)(s.rate ? s.rate : 22050);
+    lg("ZENECA sample %u \"%s\" %.2f s%s", id, fn.c_str(), secs, s.loop ? " looped" : "");
+    sounds[0x60000u | id] = std::move(s); sound_names[0x60000u | id] = fn;
+    return secs;
+}
+static void zeneca_sound(const VPIX_Frame &f) {
+    if (getenv("VPIX_FADELOG") && frame % 30 == 0) {   /* dev: ZENECA fade globals */
+        uint32_t fv = global_rt("fadeVal"), wf = global_rt("whiteFadeVal");
+        if (fv || wf) lg("ZENFADE f=%lu fadeVal %.3f whiteFadeVal %d", frame, fv ? rd_f(fv) : -1.f, wf ? (int)mem_readd(wf) : -1);
+    }
+    const uint32_t se = global_rt("soundEffect");
+    if (!se || !snd_chan) return;
+    static int32_t last[15]; static bool init = false;
+    if (!init) { init = true; for (int32_t &x : last) x = -1; }
+    static const float gain_div = getenv("VPIX_ZEN_GAIN_DIV") ? (float)atof(getenv("VPIX_ZEN_GAIN_DIV")) : 0.f;   /* dev: gain scale (0 = auto) */
+    for (int k = 0; k < 15; k++) {
+        const uint32_t e = se + 0x30 * k;
+        const int32_t smp = (int32_t)mem_readd(e + 0xC);
+        VVoice &v = voices[16 + k];
+        if (smp < 0) { if (last[k] >= 0) v.on = false; last[k] = -1; continue; }
+        auto it = sounds.find(0x60000u | (uint32_t)smp);
+        if (it == sounds.end()) { last[k] = smp; continue; }
+        if (smp != last[k] || !v.on) {
+            if (smp != last[k]) { v.s = &it->second; v.sound = (uint32_t)smp; v.pos = 0; v.semis = 0; v.bend = 0;
+                                  v.loop = mem_readd(e + 0x10) != 0 || it->second.loop; v.on = true;
+                                  static int nl = 0; if (nl++ < 200) lg("ZENECA f=%lu effect %d -> sample %d %s gain %d pos (%.0f %.0f %.0f)", frame, k, smp,
+                                      sound_names[0x60000u | (uint32_t)smp].c_str(), (int)mem_readd(e + 0x2C), rd_f(e), rd_f(e + 4), rd_f(e + 8)); }
+        }
+        last[k] = smp;
+        /* gain: C3DA emitter gain 0..255 (log: optic noise 201; the room's PLAY_SAMPLE TICKING -35 -> 61, PHONE -45 -> 51, i.e. 96 + the
+           script value); FADE_OUT_SOUNDS counts it down. Linear against the loudest (200 = full) */
+        const int32_t g = (int32_t)mem_readd(e + 0x2C);
+        float lin = (float)g / (gain_div > 0.f ? gain_div : 200.f);
+        if (lin > 1.f) lin = 1.f; if (lin < 0.f) lin = 0.f;
+        v.vol = (int)(127.f * lin);
+        /* pan: the effect's position is a small offset round the listener (room noises at (2 0 0), (-5 -6 0)): turned into the camera
+           frame (cam_R rows = right, forward, up) */
+        float rel[3] = {rd_f(e), rd_f(e + 4), rd_f(e + 8)};
+        float px = rel[0] * f.cam_R[0][0] + rel[1] * f.cam_R[0][1] + rel[2] * f.cam_R[0][2];
+        float py = rel[0] * f.cam_R[1][0] + rel[1] * f.cam_R[1][1] + rel[2] * f.cam_R[1][2];
+        int pan = (fabsf(px) + fabsf(py) < 1.f) ? 0 : (int)(atan2f(px, fabsf(py) + 1e-3f) / 1.5708f * 63.f);
+        v.pan = (std::max)(-64, (std::min)(63, pan));
+    }
+}
+
+static void submit_frame_su3k(uint32_t iv, uint32_t im) {
+    int best = -1, v = -1;
+    for (int k = 0; k < 32; k++) {
+        uint32_t va = iv + k * 0xBC; int n = 0;
+        for (int w = 0; w < 16; w++) { uint32_t b = mem_readd(va + 0x40 + 4 * w); while (b) { n += b & 1; b >>= 1; } }
+        float fy = rd_f(va + 0x10), fyy = rd_f(va + 0x14), fz = rd_f(va + 0x18);
+        if (getenv("VPIX_VIEWLOG") && frame % 300 == 0 && (n || fy * fy + fyy * fyy + fz * fz >= 0.5f))   /* dev: every live view, camera set or not */
+            lg("SU3K f=%lu raw view %d: %d models, fwd=(%.2f %.2f %.2f) T=(%.0f %.0f %.0f) fog +80 %g %g +88 %g %g %g col %06X flags+9C %X", frame, k, n, fy, fyy, fz, rd_f(va + 0x30), rd_f(va + 0x34), rd_f(va + 0x38),
+               rd_f(va + 0x80), rd_f(va + 0x84), rd_f(va + 0x88), rd_f(va + 0x8C), rd_f(va + 0x90), mem_readd(va + 0x94) & 0xFFFFFF, mem_readd(va + 0x9C));
+        if (fy * fy + fyy * fyy + fz * fz < 0.5f) continue;
+        if (n > best) { best = n; v = k; }
+    }
+    VPIX_Frame f; f.frame = frame;
+    f.blits.swap(drawbmp3k.blits); drawbmp3k.blits.clear();   /* this frame's PIX_DrawBitmap pictures (ZENECA title screen) */
+    if (v < 0) { zeneca_sound(f); VPIX_Render_Submit(f); return; }
+    uint32_t va = iv + v * 0xBC;
+    rd_mat(va, f.cam_R, f.cam_T);
+    for (int c = 0; c < 3; c++) f.clear[c] = clear_col[c];
+    /* window 0 (iwindow, stride ?): +0xC background colour 0x00BBGGRR (Total Recoil's sky 0x947B6B), +0x20/+0x24 screen
+       width/height - 1 (319, 239), +0x50 focal length in pixels (343.1 = 50 deg across 320) */
+    if (uint32_t iw = region_rt("iwindow")) {
+        uint32_t bg = mem_readd(iw + 0xC);
+        if (bg == 0xFF0000FFu) bg = 0;                 /* 0xFF0000FF = the library's unset value before the game picks its sky: black, not red (Bobby 10-18) */
+        bg &= 0xFFFFFF;                                /* Zero Hour in play: 0xFFAA8282 = its fog colour (was cleared to black) */
+        f.clear[0] = bg & 0xFF; f.clear[1] = bg >> 8 & 0xFF; f.clear[2] = bg >> 16 & 0xFF;
+        float foc = rd_f(iw + 0x50); uint32_t sw = mem_readd(iw + 0x20) + 1;
+        if (foc > 10.f && sw > 16 && sw < 4096) f.fov_deg = 2.f * atanf(0.5f * sw / foc) * 57.29578f;
+    }
+    /* the game camera follows the fed head (Total Recoil: view = gun axis = tracked head): the renderer must only late-correct it.
+       in_head = false made it add the whole eye rotation ON TOP (free look), so the view turned ~2x the gun and the aim drifted off
+       to the side (Bobby 10-18: 'to aim center I have to look all the way right'). The renderer's own pitch test still falls back
+       to free look while the camera doesn't follow (attract, menus). */
+    f.in_head = track_on; f.head_fed = head_fed; f.crouch_mm = crouch_fed;
+    if (getenv("VPIX_VIEWLOG") && frame % 600 == 0) {   /* dev: Total Recoil's sight object, wherever it is */
+        uint32_t cg = global_rt("cross"), co = cg ? mem_readd(cg) : 0;
+        if (co) {
+            uint32_t h = mem_readd(co + 0x1A), slot = mem_readd(co + 0xC); std::string vs;
+            for (int k = 0; k < 32 && slot < 512; k++) if (mem_readd(iv + k * 0xBC + 0x40 + 4 * (slot >> 5)) >> (slot & 31) & 1) { char t[8]; snprintf(t, sizeof(t), " %d", k); vs += t; }
+            uint32_t ma = slot < 512 ? im + slot * 0x20C : 0;
+            lg("CROSSOBJ f=%lu obj %08X slot %u h=%08X (imodel h=%08X) views:%s pos=(%.0f %.0f %.0f) S=(%.2f %.2f %.2f) obj+76=%08X", frame, co, slot, h, ma ? mem_readd(ma) : 0, vs.c_str(),
+               rd_f(co + 0x4E), rd_f(co + 0x52), rd_f(co + 0x56), ma ? rd_f(ma + 0x84) : 0.f, ma ? rd_f(ma + 0x88) : 0.f, ma ? rd_f(ma + 0x8C) : 0.f, mem_readd(co + 0x76));
+        } else lg("CROSSOBJ f=%lu none", frame);
+    }
+    /* VPIX_FOG3K (run_su3k.sh zero): iview +0x88 fog mode (1 = linear), +0x8C start, +0x90 end, +0x94 colour bytes R,G,B (Zero Hour in play:
+       10000 -> 50000 = its far clip, 0xAA8282 = blue-grey haze like the promo video; we drew none, Bobby 10-18) */
+    { static const bool fog3k = getenv("VPIX_FOG3K") && atoi(getenv("VPIX_FOG3K"));
+      float fs = rd_f(va + 0x8C), fe = rd_f(va + 0x90);
+      if (fog3k && mem_readd(va + 0x88) && fe > fs && fe > 0) {
+          uint32_t c = mem_readd(va + 0x94);
+          f.fog_start = fs; f.fog_end = fe; f.fog_col[0] = c & 0xFF; f.fog_col[1] = c >> 8 & 0xFF; f.fog_col[2] = c >> 16 & 0xFF;
+      } }
+    /* Zero Hour's high-score entry (HI_process) shoots along gunModel but draws no laser (Bobby 10-18: 'hard to shoot, add the
+       transparent laser'): a see-through beam from the gun model along its barrel (PIXMODEL row 1 = imodel column 1).
+       VPIX_AIMBEAM_TEST=1 (dev): draw it in play too, to line it up with the game's own laser */
+    { static const bool beam_test = getenv("VPIX_AIMBEAM_TEST") && atoi(getenv("VPIX_AIMBEAM_TEST"));
+      uint32_t gm = global_rt("gunModel"), slot = gm ? mem_readd(gm + 0xE) : 0xFFFFFFFF;
+      if ((frame - hi_frame < 4 || beam_test) && slot < 512) {
+          uint32_t ma = im + slot * 0x20C;
+          for (int c = 0; c < 3; c++) { f.aim_o[c] = rd_f(ma + 0x34 + 4 * c); f.aim_d[c] = rd_f(ma + 4 + 0x10 + 4 * c); }
+          float L2 = sqrtf(f.aim_d[0] * f.aim_d[0] + f.aim_d[1] * f.aim_d[1] + f.aim_d[2] * f.aim_d[2]);
+          if (L2 > 1e-3f) { for (float &d : f.aim_d) d /= L2; f.aim_beam = true; }
+      } }
+    /* VPIX_MULTIVIEW3K (run_su3k.sh zeneca): the scene is split over views with the same camera (view 0 = the 17-part glove
+       hand, view 3 = the map objects); draw the models of every view whose camera matches the chosen one, not just the busiest */
+    static const bool multiview = getenv("VPIX_MULTIVIEW3K") && atoi(getenv("VPIX_MULTIVIEW3K"));
+    uint32_t vbits[16];
+    for (int w = 0; w < 16; w++) vbits[w] = mem_readd(va + 0x40 + 4 * w);
+    if (multiview)
+        for (int k = 0; k < 32; k++) {
+            uint32_t vk = iv + k * 0xBC; bool same = k != v;
+            for (int o = 0; same && o < 0x3C; o += 4) same = fabsf(rd_f(vk + o) - rd_f(va + o)) < 1.f;
+            if (same) for (int w = 0; w < 16; w++) vbits[w] |= mem_readd(vk + 0x40 + 4 * w);
+        }
+    for (int w = 0; w < 16; w++) {
+        uint32_t bits = vbits[w];
+        for (int k = 0; bits && k < 32; k++) {
+            if (!(bits >> k & 1)) continue;
+            uint32_t slot = 32 * w + k, ma = im + slot * 0x20C;
+            VPIX_Instance in; in.handle = mem_readd(ma); in.slot = (uint16_t)slot;
+            if (getenv("VPIX_VIEWLOG") && frame % 300 == 0) lg("SU3K f=%lu view %d slot %u handle %08X T=(%.0f %.0f %.0f)", frame, v, slot, in.handle, rd_f(ma + 0x34), rd_f(ma + 0x38), rd_f(ma + 0x3C));
+            if (in.handle == 0x10000000u) { blit3k(f, ma, slot); continue; }   /* screen bitmap */
+            if (!in.handle || in.handle >= 0x10000000u || !(in.handle & 0x1000000)) {   /* 0x20000000 (3D-placed bitmap): TODO */
+                static std::set<uint32_t> seen2d;
+                if (getenv("VPIX_VIEWLOG") && in.handle && seen2d.insert(in.handle).second && seen2d.size() < 80)
+                    lg("SU3K 2D object slot %u handle %08X T=(%.0f %.0f %.0f) S=(%.2f %.2f %.2f)", slot, in.handle, rd_f(ma + 0x34), rd_f(ma + 0x38), rd_f(ma + 0x3C), rd_f(ma + 0x84), rd_f(ma + 0x88), rd_f(ma + 0x8C));
+                continue;
+            }
+            if (!meshes3k.count(in.handle)) { meshes3k.insert(in.handle); build_mesh3k(in.handle); }
+            if (getenv("VPIX_RAYLOG") && frame % 600 == 0) {   /* dev: models along the view ray (Bobby's 'invisible ring' in the clouds) */
+                float d[3] = {rd_f(ma + 0x34) - f.cam_T[0], rd_f(ma + 0x38) - f.cam_T[1], rd_f(ma + 0x3C) - f.cam_T[2]};
+                float L2 = sqrtf(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]), c = L2 > 1 ? (d[0] * f.cam_R[1][0] + d[1] * f.cam_R[1][1] + d[2] * f.cam_R[1][2]) / L2 : 0;
+                if (c > 0.97f || L2 < 3000) lg("RAY f=%lu slot %u h=%08X dist %.0f cos %.3f S=(%.2f %.2f %.2f) flags+1EC=%08X pal0=%08X", frame, slot, in.handle, L2, c, rd_f(ma + 0x84), rd_f(ma + 0x88), rd_f(ma + 0x8C), mem_readd(ma + 0x1EC), mem_readd(ma + 0xA0));
+            }
+            if (getenv("VPIX_VIEWLOG")) {   /* dev: Total Recoil's sight (CROSS_process: the gun matrix at ray_edge) */
+                uint32_t cg = global_rt("cross"), co = cg ? mem_readd(cg) : 0;
+                static unsigned long ncl = 0;
+                if (co && mem_readd(co + 0x1A) == in.handle && ncl++ % 600 == 0) {
+                    std::string ps; for (int c = 0; c < 4; c++) { char t[12]; snprintf(t, sizeof(t), " %08X", mem_readd(ma + 0xA0 + 16 * c)); ps += t; }
+                    lg("CROSS f=%lu slot %u h=%08X T=(%.0f %.0f %.0f) S=(%.2f %.2f %.2f) cam=(%.0f %.0f %.0f) pal%s", frame, slot, in.handle,
+                       rd_f(ma + 0x34), rd_f(ma + 0x38), rd_f(ma + 0x3C), rd_f(ma + 0x84), rd_f(ma + 0x88), rd_f(ma + 0x8C), f.cam_T[0], f.cam_T[1], f.cam_T[2], ps.c_str());
+                }
+            }
+            for (int r = 0; r < 3; r++) for (int c = 0; c < 3; c++) in.R[r][c] = rd_f(ma + 4 + 0x10 * c + 4 * r);
+            for (int c = 0; c < 3; c++) { in.T[c] = rd_f(ma + 0x34 + 4 * c); in.S[c] = rd_f(ma + 0x84 + 4 * c); }
+            for (int c = 0; c < 16; c++) { uint32_t pc = mem_readd(ma + 0xA0 + 16 * c); in.pal[c] = pc & 0xFFFFFF; in.palw[c] = pc; }
+            in.backdrop = backdrop3k.count(in.handle) ? 1 : 0;
+            /* Zero Hour's sky dome (hooks ZERO3K.game 'sky' = player 0's sky object, +0xE = model slot): a low dome re-centred on the
+               camera; drawn with depth it cut off characters above the second storey (Bobby 10-18) -> backdrop (first, no depth write) */
+            { const uint32_t sky_g = global_rt("sky"); if (sky_g && slot == mem_readd(sky_g + 0xE) && mem_readd(sky_g)) in.backdrop = 1; }
+            if (in.backdrop && getenv("VPIX_VIEWLOG") && frame % 1500 == 0) {   /* dev: how far the cloud cards sit (far plane 400000) */
+                float dx = in.T[0] - f.cam_T[0], dy = in.T[1] - f.cam_T[1], dz = in.T[2] - f.cam_T[2];
+                lg("SU3K f=%lu backdrop slot %u h=%08X dist %.0f S=(%.2f %.2f %.2f)", frame, slot, in.handle, sqrtf(dx * dx + dy * dy + dz * dz), in.S[0], in.S[1], in.S[2]);
+            }
+            if (getenv("VPIX_INSTLOG") && frame % 300 == 0 && fabsf(in.T[0] - f.cam_T[0]) + fabsf(in.T[1] - f.cam_T[1]) + fabsf(in.T[2] - f.cam_T[2]) < 1500)
+                lg("INST f=%lu slot %u h=%08X T=(%.0f %.0f %.0f) S=(%.2f %.2f %.2f) R=(%.2f %.2f %.2f / %.2f %.2f %.2f / %.2f %.2f %.2f)", frame, slot, in.handle, in.T[0], in.T[1], in.T[2], in.S[0], in.S[1], in.S[2], in.R[0][0], in.R[0][1], in.R[0][2], in.R[1][0], in.R[1][1], in.R[1][2], in.R[2][0], in.R[2][1], in.R[2][2]);
+            f.inst.push_back(in);
+        }
+    }
+    {   /* dev: the game's own head object (HUMAN_process places it at the tracked head every frame) */
+        static unsigned long hl = 0; uint32_t ho = global_rt("head_obj");
+        if (ho && getenv("VPIX_INSTLOG") && hl++ % 600 == 0) { uint32_t o = mem_readd(ho);
+            if (o) lg("HEADOBJ f=%lu obj %08X +0:%08X +4:%08X +8:%08X +C:%08X +10:%08X +14:%08X", frame, o, mem_readd(o), mem_readd(o + 4), mem_readd(o + 8), mem_readd(o + 0xC), mem_readd(o + 0x10), mem_readd(o + 0x14)); }
+    }
+    std::stable_partition(f.inst.begin(), f.inst.end(), [](const VPIX_Instance &x) { return x.backdrop != 0; });   /* cloud backdrops first */
+    if (const char *cc = getenv("VPIX_CLEAR3K")) {   /* dev (Bobby 10-18): a test sky colour, e.g. FFFFFF, shows black / unlit models as silhouettes */
+        uint32_t c = (uint32_t)strtoul(cc, NULL, 16); f.clear[0] = c >> 16 & 0xFF; f.clear[1] = c >> 8 & 0xFF; f.clear[2] = c & 0xFF;
+    } else if (f.inst.empty()) f.clear[0] = f.clear[1] = f.clear[2] = 0;   /* no 3D scene (menus, movies, loading): black, not a sky-grey void (Bobby 10-18) */
+    if (getenv("VPIX_VIEWLOG") && frame % 1500 == 0) {   /* window 0's record */
+        uint32_t iw = region_rt("iwindow"); std::string ws;
+        for (int o = 0; iw && o < 0x80; o += 4) { char t[12]; snprintf(t, sizeof(t), " %08X", mem_readd(iw + o)); ws += t; }
+        lg("SU3K f=%lu iwindow[0]:%s", frame, ws.c_str());
+    }
+    if (getenv("VPIX_VIEWLOG") && frame % 1500 == 0)   /* every view that has models: its count, camera and fog words */
+        for (int k = 0; k < 32; k++) {
+            uint32_t vk = iv + k * 0xBC; int n = 0;
+            for (int w = 0; w < 16; w++) { uint32_t b = mem_readd(vk + 0x40 + 4 * w); while (b) { n += b & 1; b >>= 1; } }
+            if (!n) continue;
+            std::string fs; for (int o = 0x80; o < 0xBC; o += 4) { char t[12]; snprintf(t, sizeof(t), " %08X", mem_readd(vk + o)); fs += t; }
+            lg("SU3K f=%lu  view %d: %d models, T=(%.0f %.0f %.0f) +80:%s", frame, k, n, rd_f(vk + 0x30), rd_f(vk + 0x34), rd_f(vk + 0x38), fs.c_str());
+        }
+    if (getenv("VPIX_VIEWLOG") && frame % 300 == 0)
+        lg("SU3K f=%lu view %d: %u models, cam T=(%.0f %.0f %.0f) fwd=(%.2f %.2f %.2f) right=(%.2f %.2f %.2f) up=(%.2f %.2f %.2f) fov %.1f", frame, v, (unsigned)f.inst.size(), f.cam_T[0], f.cam_T[1], f.cam_T[2], f.cam_R[1][0], f.cam_R[1][1], f.cam_R[1][2], f.cam_R[0][0], f.cam_R[0][1], f.cam_R[0][2], f.cam_R[2][0], f.cam_R[2][1], f.cam_R[2][2], f.fov_deg);
+    zeneca_sound(f);
+    VPIX_Render_Submit(f);
+}
+
+/* submit_frame normally hands the frame to the renderer; the remote seat (vpix_seat.h) builds seat 2's frame through it
+   too: frame_force_win picks that window, frame_capture takes the frame instead of drawing it */
+static int frame_force_win = -1;
+static VPIX_Frame *frame_capture = NULL;
+static void seat_tick();
+static void voice_tick();                         /* vpix_voice.h */
+static void voice_rx(int src, const uint8_t *ulaw, size_t n);
+static void seat_client_replace(VPIX_Frame &f);   /* remote seat PC: draw the host's frame instead of our own */
+/* PIX_DrawStatic(mask al, texture handle edx, w ebx, h ecx): the library sends card command 0x39 with the texture, the w x h window
+   and two rand() words - TV static from a noise texture, a new random offset each frame. Dactyl Nightmare 2 shows it (elect.tex,
+   128 x 128) for its whole ~20 s load; stubbed, the headset stayed black and players pressed buttons blind (Bobby 10-24). */
+static uint32_t static_tex = 0; static uint16_t static_w = 0, static_h = 0; static unsigned long static_frame = 0;
+/* PIX_SetPenColor(PIXCOL *: bytes R,G,B) + PIX_DrawLine(x0 ax, y0 dx, x1 bx, y1 cx): card commands 0x1F / 0x18, a line on this
+   frame's 2D layer. Sea Diving's air dial needle (GAME_update_pointer, every frame of play): from (30, BLIT_MAX_Y-40), 20 px long,
+   angle game_time/GAMETIME * pi, red. Its x is in card pixels of PIX_SetPixelSize width (edx 0x200 = 2.0 in 8.8): x doubles. */
+static uint8_t pen_rgb[3] = {255, 255, 255}; static float pix_xsize = 1.f, pix_ysize = 1.f;
+static std::vector<VPIX_Frame::Line> lines_now;
+static void frame_deliver(VPIX_Frame &f) {
+    f.lines.swap(lines_now); lines_now.clear();
+    if (static_tex && f.frame <= static_frame + 1) {   /* the call comes once per frame while it shows */
+        f.static_tex = static_tex; f.static_w = static_w; f.static_h = static_h; f.static_rx = (uint16_t)rand(); f.static_ry = (uint16_t)rand();
+    }
+    {   /* dev VPIX_CLEAR_TEST=RRGGBB: force the background colour (Bobby 10-24: white behind Sea Diving's blue shows anything drawn in it) */
+        static const char *ct = getenv("VPIX_CLEAR_TEST");
+        if (ct && *ct) { unsigned long c = strtoul(ct, NULL, 16); f.clear[0] = (uint8_t)(c >> 16); f.clear[1] = (uint8_t)(c >> 8); f.clear[2] = (uint8_t)c; }
+    }
+    if (frame_capture) { *frame_capture = f; return; }
+    seat_client_replace(f);
+    VPIX_Render_Submit(f);
+}
 static void submit_frame() {
-    force_box_gloves();
-    if (frame % 32 == 0) poll_textures();
+    {   uint32_t iv = region_rt("iview"), im = region_rt("imodel");
+        if (iv && im) { submit_frame_su3k(iv, im); return; } }
+    if (!frame_capture) { force_box_gloves(); if (frame % 32 == 0) poll_textures(); }
     uint32_t vw = region_rt("view"), md = region_rt("model"), sw = region_rt("windowSwitch"), wn = region_rt("window");
     if (!vw || !md) return;                              /* sw may be unknown (GHOST): then every view is a candidate */
     /* which view to show: games use different windows (PEARL draws through window 1). Pick the
@@ -779,9 +1706,14 @@ static void submit_frame() {
         for (int k = 0; k < 16; k++) { uint32_t bits = mem_readd(va_ + 0x40 + 4 * k); while (bits) { n += bits & 1; bits >>= 1; } }
         if (getenv("VPIX_VIEWLOG") && frame % 300 == 0) {    /* which views a game draws through (dev diagnosis) */
             float T[3] = {rd_f(va_ + 0x24), rd_f(va_ + 0x28), rd_f(va_ + 0x2C)};
-            lg("VIEW f=%lu window %d (views mask %X) -> view %d: %d models, cam fwd=(%.2f %.2f %.2f) +24=(%.0f %.0f %.0f)", frame, w, vm, vv, n, fy, fyy, fz, T[0], T[1], T[2]);
+            lg("VIEW f=%lu window %d (views mask %X) -> view %d: %d models, cam fwd=(%.2f %.2f %.2f) +24=(%.0f %.0f %.0f) pos=(%.0f %.0f %.0f)", frame, w, vm, vv, n, fy, fyy, fz, T[0], T[1], T[2], rd_f(va_ + 0x30), rd_f(va_ + 0x34), rd_f(va_ + 0x38));
         }
         if (n > best) { best = n; v = vv; }
+        /* VPIX_SEAT_VIEW=2 (dev, Duo games: Boxing Link Up): show seat 2's window (window 1 = PIX channel 2) instead of the busiest;
+           the remote seat (vpix_seat.h) builds seat 2's frame the same way (frame_force_win) */
+        static const int seat_view = getenv("VPIX_SEAT_VIEW") ? atoi(getenv("VPIX_SEAT_VIEW")) : 0;
+        const int want_win = frame_force_win >= 0 ? frame_force_win : seat_view - 1;
+        if (want_win >= 0 && w == want_win && n > 0) { best = 1 << 30; v = vv; }
     }
     if (getenv("VPIX_VIEWLOG") && frame % 300 == 0)          /* dev: every view's model count (windowed or not) */
         for (int vv = 0; vv < 16; vv++) {
@@ -790,17 +1722,35 @@ static void submit_frame() {
             if (n) lg("VIEWALL f=%lu view %d: %d models, +24=(%.0f %.0f %.0f)", frame, vv, n, rd_f(va_ + 0x24), rd_f(va_ + 0x28), rd_f(va_ + 0x2C));
         }
     VPIX_Frame f; f.frame = frame;
-    if (v >= 16) { VPIX_Render_Submit(f); return; }      /* no 3D view: still show videos/2D (empty scene) */
+    if (v >= 16) { frame_deliver(f); return; }      /* no 3D view: still show videos/2D (empty scene) */
     uint32_t ih = global_rt("InHead");
     f.in_head = track_on && (ih ? mem_readw(ih) != 0 : true);   /* no InHead symbol: renderer tests the camera */
-    f.head_fed = head_fed; f.crouch_mm = crouch_fed;
+    f.head_fed = head_fed; f.crouch_mm = crouch_fed; f.walk_yaw = walk_yaw_fed;
+    if (frame_force_win == 1 && seat2_live()) { f.head_fed = seat2_head_fed; f.crouch_mm = 0; f.walk_yaw = 0; }
     uint32_t ph = global_rt("player_height");
     if (ph) f.player_height = rd_f(ph);
     if (uint32_t gm = global_rt("game_mode")) f.game_mode = (int16_t)mem_readw(gm);   /* DAC: local slot 0's mode (3 = GAME OVER) */
     uint32_t va = vw + v * 0x88;
+    if (!own_glove_by_view.empty()) { own_glove_slots = own_glove_by_view[va]; own_arm_slots = own_arm_by_view[va]; }   /* this view's own gloves only */
     rd_mat(va, f.cam_R, f.cam_T);
     for (int c = 0; c < 3; c++) f.clear[c] = clear_col[c];
     if (wn) { float fov = rd_f(wn + 0xC); if (fov > 5 && fov < 170) f.fov_deg = fov; }
+    {   static const bool cue_on = !getenv("VPIX_DEPTH_CUE") || atoi(getenv("VPIX_DEPTH_CUE"));   /* card depth cue: linear to black */
+        /* black at 3x the game's distance: Ghost Train pairs vs the card, mean brightness ours/card = 0.60 at 1x, 1.09 at 3x, 1.37 at 6x,
+           1.7 with no cue (Bobby 10-25: "made the game more scary") */
+        static const float cue_k = getenv("VPIX_DEPTH_CUE_K") ? (float)atof(getenv("VPIX_DEPTH_CUE_K")) : 3.f;   /* dev: fade length scale */
+        if (cue_on && depth_cue > 0.f && f.fog_end <= 0.f) { f.fog_start = 0.f; f.fog_end = depth_cue * cue_k; f.fog_col[0] = f.fog_col[1] = f.fog_col[2] = 0; } }
+    if (uint32_t lt = region_rt("light"))                /* the game's lights (VPIX_GAME_LIGHT=0: old fixed light) */
+        for (int i = 0; i < 4; i++) {
+            uint32_t la = lt + 0x38 * i;
+            VPIX_Frame::Light L = {rd_f(la), rd_f(la + 8), {rd_f(la + 0x10), rd_f(la + 0x14), rd_f(la + 0x18)}};
+            float d2 = L.dir[0] * L.dir[0] + L.dir[1] * L.dir[1] + L.dir[2] * L.dir[2];
+            if (!(L.amb > 0.f || L.diff > 0.f) || !(L.amb <= 4.f && L.diff <= 4.f)) continue;   /* unset (or not floats) */
+            /* NOT normalised: the card uses the vector as sent (Shoot For Loot sends (5,-8,40) with diffuse 0.02 = 0.8 at full; normalised it
+               was 0.6x the card's brightness). The other games send unit vectors. */
+            if (d2 <= 1e-6f) L.diff = 0.f;
+            f.lights[f.n_lights++] = L;
+        }
     for (int w = 0; w < 16; w++) {
         uint32_t bits = mem_readd(va + 0x40 + 4 * w);
         for (int k = 0; bits && k < 32; k++) {
@@ -808,6 +1758,7 @@ static void submit_frame() {
             uint32_t ma = md + (uint32_t)(32 * w + k) * model_stride;
             VPIX_Instance in;
             in.handle = mem_readd(ma);
+            if (ref_mode && in.handle < 0x10000000u) in.handle = ref_h(in.handle);
             if (in.handle >= 0x10000000u) {
                 /* 2D bitmap object. PIXBITMAP at +0xA0: u16 flags, u32 handle, u16 src x/y @+A/+C,
                    u16 w/h @+E/+10, u16 screen x/y @+12/+14, f32 drawn w/h @+16/+1A, tint @+26 (flag 4) */
@@ -815,7 +1766,7 @@ static void submit_frame() {
                 if (!bp) continue;
                 VPIX_Blit b;
                 uint16_t fl = mem_readw(bp);
-                b.handle = mem_readd(bp + 2);
+                b.handle = ref_h(mem_readd(bp + 2));
                 b.sx = mem_readw(bp + 0xA); b.sy = mem_readw(bp + 0xC); b.sw = mem_readw(bp + 0xE); b.sh = mem_readw(bp + 0x10);
                 b.x = (int16_t)mem_readw(bp + 0x12); b.y = (int16_t)mem_readw(bp + 0x14);
                 b.dw = rd_f(bp + 0x16); b.dh = rd_f(bp + 0x1A);
@@ -836,8 +1787,16 @@ static void submit_frame() {
                 /* VPIX_GLYPH_COLOUR (games.ps1 GlyphColour, Ghost Train): flag 0x800 = the glyph's colour at
                    +0x2C (R, G, B); each letter comes twice, the second 2 px down-right in black = drop shadow */
                 static const bool glyph_col = getenv("VPIX_GLYPH_COLOUR") && atoi(getenv("VPIX_GLYPH_COLOUR"));
+                /* Sea Diving's older PIX lib (model stride 0x8C): +0x2C is always FFFFFFFF, the colour is at +0x30 (score digits FFFF00,
+                   their shadows 000000, box text C8C8C8); read at +0x2C every glyph and shadow was white (Bobby 10-24: white blobs) */
+                const uint32_t col_at = model_stride == 0x8C ? 0x30 : 0x2C;
                 if (glyph_col && (fl & 0x1800))           /* 0x1000: colour pair, the first one used */
-                    for (int c = 0; c < 3; c++) b.tint[c] = mem_readb(bp + 0x2C + c) / 255.f;
+                    { for (int c = 0; c < 3; c++) b.tint[c] = mem_readb(bp + col_at + c) / 255.f; b.glyph = true;
+                      if ((fl & 0x1000) && col_at == 0x2C) { for (int c = 0; c < 3; c++) b.tint2[c] = mem_readb(bp + 0x30 + c) / 255.f; b.grad = true; } }
+                {   static const bool blitlog = getenv("VPIX_BLITLOG") != NULL; static std::set<uint32_t> logged;   /* dev: each bitmap's record once */
+                    if (blitlog && logged.insert(b.handle).second) lg("BLITREC h=%u flags=%04X rec[%s]", b.handle, fl, rd_hex(bp, 0x38).c_str()); }
+                {   const uint32_t pc = ((uint32_t)mem_readb(ma + 0x60) << 16) | ((uint32_t)mem_readb(ma + 0x61) << 8) | mem_readb(ma + 0x62);
+                    if (pc) for (int c = 0; c < 3; c++) b.pal0[c] = ((pc >> (16 - 8 * c)) & 255) / 255.f; }
                 b.prio = (int32_t)mem_readd(ma + 0x54);
                 if (b.sw > 0 && b.sh > 0) f.blits.push_back(b);
                 /* VPIX_TIMER_COPY (games.ps1 TimerCopy, Zone Hunter): for the last 10 s the game takes the top timer's units digit
@@ -869,8 +1828,10 @@ static void submit_frame() {
                     std::string key = rd_hex(bp, 0x3A);
                     static const int minw = getenv("VPIX_BLITLOG_MINW") ? atoi(getenv("VPIX_BLITLOG_MINW")) : 0;   /* only pictures at least this wide (the small bubbles flood the log) */
                     static const int minprio = getenv("VPIX_BLITLOG_MINPRIO") ? atoi(getenv("VPIX_BLITLOG_MINPRIO")) : -2000000000;   /* only UI-layer bitmaps */
-                    if ((!minw || b.sw >= minw) && b.prio >= minprio && seen.size() < 3000 && seen.emplace(key, 1).second)
-                        lg("BLIT f=%lu slot=%u h=%u fl=%04X prio=%d [%s]", frame, 32 * w + k, b.handle, fl, b.prio, key.c_str());
+                    static const unsigned long from = getenv("VPIX_BLITLOG_FROM") ? strtoul(getenv("VPIX_BLITLOG_FROM"), NULL, 10) : 0;   /* only from this frame (attract floods the 3000 lines) */
+                    if (frame >= from && (!minw || b.sw >= minw) && b.prio >= minprio && seen.size() < 3000 && seen.emplace(key, 1).second)
+                        lg("BLIT f=%lu slot=%u type=%08X h=%u fl=%04X prio=%d at %d,%d drawn %.1fx%.1f pos=(%.0f %.0f %.0f) pal %08X %08X glyph %d [%s]", frame, 32 * w + k, in.handle,
+                           b.handle, fl, b.prio, b.x, b.y, b.dw, b.dh, b.pos[0], b.pos[1], b.pos[2], mem_readd(ma + 0x60), mem_readd(ma + 0x64), (int)b.glyph, key.c_str());
                 }
                 continue;
             }
@@ -944,8 +1905,13 @@ static void submit_frame() {
                     }
                 }
             }
-            in.prio = (int32_t)mem_readd(ma + 0x54);
+            {   /* the card's priority: +0x54 as PIX_SetModel last sent it, or a later PIX_ModifyModelPriority */
+                const uint32_t sl = 32 * w + k; const int32_t p54 = (int32_t)mem_readd(ma + 0x54);
+                if (p54 != last_p54[sl]) { last_p54[sl] = p54; mod_prio_set[sl] = false; }
+                in.prio = mod_prio_set[sl] ? mod_prio[sl] : p54;
+            }
             for (int c = 0; c < 3; c++) in.S[c] = rd_f(ma + 0x44 + 4 * c);
+            in.light_mask = mem_readd(ma + 0x5C) & 15; if (!in.light_mask) in.light_mask = 1;   /* 0 = default: light 0 (DN2 attract room lit on the card) */
             for (int c = 0; c < 16; c++)
                 in.pal[c] = ((uint32_t)mem_readb(ma + 0x60 + 4 * c) << 16) | ((uint32_t)mem_readb(ma + 0x61 + 4 * c) << 8) | mem_readb(ma + 0x62 + 4 * c),
                 in.palw[c] = mem_readd(ma + 0x60 + 4 * c);
@@ -968,15 +1934,30 @@ static void submit_frame() {
             }
             /* VPIX_POLY_SELECT="name,name" (games.ps1 PolySelect, Zone Hunter: scorepow): PIXMODEL +0x50 (sent to the card by PIX_SendModelOTHER)
                picks which polygons show by their 3rd word bits. Zone's bonus box holds 1K / 5K / 10K / x2 / x3 / x5 strokes in one model
-               (+0x50 = 3 '1K', 5 '5K'); drawn all at once they piled up (Bobby 10-17: '100K', too big). Not game-wide yet: kickW\gun.bin's
-               arm armour has bit 1 with +0x50 = 0 */
+               (+0x50 = 3 '1K', 5 '5K'); drawn all at once they piled up (Bobby 10-17: '100K', too big). kickW\gun.bin (the first gun):
+               its 36 bit-1 polygons sit past the barrel's end (y 760-1260, white/cyan 0x22) = the muzzle flash, shown only while
+               firing; drawn always (Bobby 10-24 'shoot flash on all the time'). The machine guns (gun1/gun2) and enemy guns have none. */
             {   static std::vector<std::string> ps; static bool rd = false;
                 if (!rd) { rd = true; const char *e = getenv("VPIX_POLY_SELECT"); if (e) { std::string s(e); size_t p = 0;
                     while (p <= s.size()) { size_t q = s.find(',', p); if (q == std::string::npos) q = s.size(); std::string t = s.substr(p, q - p);
                         std::transform(t.begin(), t.end(), t.begin(), ::tolower); if (!t.empty()) ps.push_back(t); p = q + 1; } } }
                 if (!ps.empty()) { auto mf = model_files.find(in.handle);
                     if (mf != model_files.end()) { std::string lo = mf->second; std::transform(lo.begin(), lo.end(), lo.begin(), ::tolower);
-                        for (const std::string &t : ps) if (lo.find(t) != std::string::npos) { in.poly_select = 1; in.select = mem_readd(ma + 0x50); break; } } }
+                        for (const std::string &t : ps) if (lo.find(t) != std::string::npos) { in.poly_select = 1; in.select = mem_readd(ma + 0x50); break; }
+                        if (in.poly_select && !muzzle_model.empty() && lo.find(muzzle_model) != std::string::npos && hap_ms_now() < muzzle_until) in.select |= 1; }   /* VPIX_MUZZLE: GUN.BIN's 36 flash polys carry select word 1 */
+                    if (in.poly_select && getenv("VPIX_SELLOG") && mf->second.find("gun") != std::string::npos) {   /* dev: Zone fire_weapon[0..1] vs the trigger */
+                        static uint32_t lfw = 0xFFFFFFFF, lbt = 0xFFFFFFFF; static int nf = 0; uint32_t fa = global_rt("fire_weapon");
+                        uint32_t fw = fa ? mem_readd(fa) ^ (mem_readd(fa + 4) << 16) : 0, bt = cur_in.buttons & VPIX_BTN_TRIGGER;
+                        if ((fw != lfw || bt != lbt) && nf++ < 600) lg("FIREW f=%lu fire_weapon[0]=%d [1]=%d trigger=%u", frame, fa ? (int)mem_readd(fa) : -99, fa ? (int)mem_readd(fa + 4) : -99, bt);
+                        lfw = fw; lbt = bt;
+                        static std::map<uint32_t, std::string> lrec; static int nr = 0;   /* the gun's record past the matrix/position (+0x44..): what changes on firing? */
+                        std::string rec = rd_hex(ma + 0x44, model_stride - 0x44);
+                        if (lrec[in.slot] != rec && nr++ < 1500) lg("GUNREC f=%lu slot %u trig=%u +44 [%s]", frame, (unsigned)in.slot, bt, rec.c_str());
+                        lrec[in.slot] = rec; }
+                    if (in.poly_select && getenv("VPIX_SELLOG")) {   /* dev: each change of a select model's +0x50 (Zone gun muzzle flash = bit 1 while firing) */
+                        static std::map<uint32_t, uint32_t> last; static int nl = 0; auto it = last.find(in.slot);
+                        if ((it == last.end() || it->second != in.select) && nl++ < 2000) lg("SEL f=%lu slot %u h=%u %s select %08X", frame, (unsigned)in.slot, in.handle, mf->second.c_str(), in.select);
+                        last[in.slot] = in.select; } }
             }
             /* VPIX_SEAL="name,name" (games.ps1 Seal, Zone: rooms\room): outline pass that fills T-junction cracks */
             {   static std::vector<std::string> sl; static bool rd = false;
@@ -993,18 +1974,27 @@ static void submit_frame() {
                the cap also lay in the front door's plane (flicker). Trimmed 400 back. */
             /* 10-17: 'name:ymin@anchor' = trim only the copies whose trimmed end (local y ymin) lies within 1500 of a model named
                'anchor' (post-pass below). The tunnel mouth sits in the outdoor FRONT wall too (frontl/r, lining 400 deep): trimmed
-               there it left a sky-blue gap round the doorway (Bobby 10-17); only the ends at room5's wall need it. */
+               there it left a sky-blue gap round the doorway (Bobby 10-17); only the ends at room5's wall need it.
+               10-24: anchor LIST 'a|!b|*' (post-pass): the first name found near the end decides, plain = trim, '!' = keep, '*' = trim
+               when none matched. The tunnels end at many other rooms' door walls too (doorl at y 60400, scorepow/crate rooms) with the
+               same blue band (Bobby 10-24 'on multiple doors'), but some halls are two tunnel pieces end to end (another room3 400 away):
+               trimmed there they open a gap (Bobby). Zone: 'doorl|doorr|room5|!front|!room3.bin|!room4.bin|*'. */
             {   static bool rd = false;
                 if (!rd) { rd = true; const char *e = getenv("VPIX_CLAMP_Y"); if (e) { std::string s(e); size_t p = 0;
                     while (p <= s.size()) { size_t q = s.find(',', p); if (q == std::string::npos) q = s.size(); std::string t = s.substr(p, q - p);
                         std::transform(t.begin(), t.end(), t.begin(), ::tolower); size_t c = t.find(':');   /* name:ymin[:ymax][@anchor] */
                         std::string an; size_t at = t.find('@'); if (at != std::string::npos) { an = t.substr(at + 1); t = t.substr(0, at); }
-                        if (c != std::string::npos && c > 0) { size_t c2 = t.find(':', c + 1);
+                        /* 'name:*k' (10-24): scale the model's y by k instead of clamping. Zone's doors are 500 deep (y -300..200) in 400-thick
+                           walls; the 10-17 clamp to -100..100 squashed their front panels onto one plane and they flickered (Bobby 10-24):
+                           *0.4 = 200 deep with every panel still at its own depth */
+                        if (c != std::string::npos && c > 0 && t[c + 1] == '*') { ClampY cy{t.substr(0, c), -1e30f, 1e30f, an}; cy.yscale = (float)atof(t.c_str() + c + 2);
+                            if (cy.yscale > 0.f) clamp_y.push_back(cy); }
+                        else if (c != std::string::npos && c > 0) { size_t c2 = t.find(':', c + 1);
                             clamp_y.push_back({t.substr(0, c), (float)atof(t.c_str() + c + 1), c2 == std::string::npos ? 1e30f : (float)atof(t.c_str() + c2 + 1), an}); }
                         p = q + 1; } } }
                 if (!clamp_y.empty()) { auto mf = model_files.find(in.handle);
                     if (mf != model_files.end()) { std::string lo = mf->second; std::transform(lo.begin(), lo.end(), lo.begin(), ::tolower);
-                        for (const auto &t : clamp_y) if (lo.find(t.name) != std::string::npos) { in.ymin = t.ymin; in.ymax = t.ymax; break; } } }
+                        for (const auto &t : clamp_y) if (lo.find(t.name) != std::string::npos) { if (t.yscale != 1.f) in.S[1] *= t.yscale; else { in.ymin = t.ymin; in.ymax = t.ymax; } break; } } }
             }
             /* VPIX_MOVE_Y="name:from:to" (games.ps1 MoveY, Zone: powerpil:-327:-392): vertices at model-space y 'from' (+-0.5) are
                drawn at 'to'. POWERPIL's sign (panel + P/S/I letters) lies at y -327, 63 units INSIDE the pill's front face (-390):
@@ -1021,6 +2011,17 @@ static void submit_frame() {
                     if (mf != model_files.end()) { std::string lo = mf->second; std::transform(lo.begin(), lo.end(), lo.begin(), ::tolower);
                         for (const auto &t : my) if (lo.find(t.first) != std::string::npos) { in.ymove_from = t.second.first; in.ymove_to = t.second.second; in.ymove = true; break; } } }
             }
+            {   /* dev VPIX_SIGHTLOG=1 (Zone: 'crosshair sometimes blinks out', Bobby 10-24): explosions\sight*.bin distance from the camera every
+                   60 frames, and each return after frames without it (= the game itself dropped it) */
+                static const bool sightlog = getenv("VPIX_SIGHTLOG") != NULL;
+                if (sightlog) { auto mf = model_files.find(in.handle);
+                    if (mf != model_files.end() && mf->second.find("sight") != std::string::npos) {
+                        static unsigned long seen = 0; static int nl = 0;
+                        float dx = in.T[0] - f.cam_T[0], dy = in.T[1] - f.cam_T[1], dz = in.T[2] - f.cam_T[2], d = sqrtf(dx * dx + dy * dy + dz * dz);
+                        if (seen && frame > seen + 1 && nl++ < 500) lg("SIGHT f=%lu back after %lu frames without it (%s dist %.0f)", frame, frame - seen - 1, mf->second.c_str(), d);
+                        else if (frame % 60 == 0 && frame != seen && nl++ < 500) lg("SIGHT f=%lu %s slot %u dist %.0f S=(%.2f %.2f %.2f)", frame, mf->second.c_str(), (unsigned)in.slot, d, in.S[0], in.S[1], in.S[2]);
+                        seen = frame; } }
+            }
             {   /* dev VPIX_ARMLOG=1: where the game puts the own arm pieces + gun near the camera (Zone: gun floats off the forearm) */
                 static const bool armlog = getenv("VPIX_ARMLOG") != NULL;
                 if (armlog && frame % 30 == 0) { auto mf = model_files.find(in.handle);
@@ -1032,14 +2033,18 @@ static void submit_frame() {
                                frame, lo.c_str(), in.T[0], in.T[1], in.T[2], in.R[0][0], in.R[0][1], in.R[0][2], in.R[1][0], in.R[1][1], in.R[1][2], in.R[2][0], in.R[2][1], in.R[2][2],
                                in.S[0], in.S[1], in.S[2], f.cam_T[0], f.cam_T[1], f.cam_T[2], head_fed.p[0], head_fed.p[1], head_fed.p[2], hand_fed[0], hand_fed[1], hand_fed[2]); } }
             }
-            {   /* VPIX_NEAR_MODELS="name,name" (games.ps1 NearModels, Zone Hunter: doorl,doorr): drawn slightly toward the eye */
-                static std::vector<std::string> nm; static bool rd = false;
+            {   /* VPIX_NEAR_MODELS="name,name^n" (games.ps1 NearModels, Zone Hunter: doorl,doorr): drawn slightly toward the eye,
+                   4 decal layers, or n with '^n'. Zone's doors take 8: the tunnels (room3/4, on the list for the floor fix) got the same 4
+                   and tied with the doors again where a tunnel end sits in the door plane (Bobby 10-24: first hall door flickers) */
+                static std::vector<std::pair<std::string, int>> nm; static bool rd = false;
                 if (!rd) { rd = true; const char *e = getenv("VPIX_NEAR_MODELS"); if (e) { std::string s(e); size_t p = 0;
                     while (p <= s.size()) { size_t q = s.find(',', p); if (q == std::string::npos) q = s.size(); std::string t = s.substr(p, q - p);
-                        std::transform(t.begin(), t.end(), t.begin(), ::tolower); if (!t.empty()) nm.push_back(t); p = q + 1; } } }
+                        std::transform(t.begin(), t.end(), t.begin(), ::tolower); int n = 4; size_t c = t.find('^');
+                        if (c != std::string::npos) { n = atoi(t.c_str() + c + 1); t.erase(c); if (n < 1 || n > 64) n = 4; }
+                        if (!t.empty()) nm.push_back({t, n}); p = q + 1; } } }
                 if (!nm.empty()) { auto mf = model_files.find(in.handle);
                     if (mf != model_files.end()) { std::string lo = mf->second; std::transform(lo.begin(), lo.end(), lo.begin(), ::tolower);
-                        for (const std::string &t : nm) if (lo.find(t) != std::string::npos) { in.near_bias = 1; break; } } }
+                        for (const auto &t : nm) if (lo.find(t.first) != std::string::npos) { in.near_bias = (uint8_t)t.second; break; } } }
             }
             if (getenv("VPIX_SIGNLOG") && frame % 10 == 0) {   /* dev: Missile Command 'skip intro' sign colour vs where the camera looks (10-17: gone when looked at) */
                 auto mf = model_files.find(in.handle);
@@ -1079,7 +2084,8 @@ static void submit_frame() {
             if (std::find(own_glove_slots.begin(), own_glove_slots.end(), (uint32_t)in.slot) != own_glove_slots.end()) in.own_hand = 5;
             else if (std::find(own_arm_slots.begin(), own_arm_slots.end(), (uint32_t)in.slot) != own_arm_slots.end()) in.own_hand = 6;
             f.inst.push_back(in);
-            if (getenv("VPIX_INSTLOG") && frame % 600 == 300) {   /* dev: every model in the view, name + distance + draw priority */
+            if ((getenv("VPIX_INSTLOG") && frame % 600 == 300) || (getenv("VPIX_INSTLOG_NEAR") && frame % 20 == 0 &&   /* _NEAR=<units>: models that close, every 20 frames */
+                 fabsf(in.T[0] - f.cam_T[0]) + fabsf(in.T[1] - f.cam_T[1]) + fabsf(in.T[2] - f.cam_T[2]) < (float)atof(getenv("VPIX_INSTLOG_NEAR")))) {   /* dev: every model in the view, name + distance + draw priority */
                 auto mf = model_files.find(in.handle);
                 float d[3] = {in.T[0] - f.cam_T[0], in.T[1] - f.cam_T[1], in.T[2] - f.cam_T[2]};
                 lg("INST f=%lu slot=%u h=%X %s dist=%.0f T=(%.0f %.0f %.0f) prio=%d o50=%08X o58=%08X o5C=%08X pal=%08X %08X %08X %08X %08X %08X %08X %08X", frame, 32 * w + k, in.handle, mf == model_files.end() ? "?" : mf->second.c_str(),
@@ -1181,7 +2187,11 @@ static void submit_frame() {
     if (getenv("VPIX_HAND_FWD_OFF")) {
         bool ring = false;
         for (auto &in : f.inst) { auto mf = model_files.find(in.handle); if (mf != model_files.end() && mf->second.find("ring\\ring.bin") != std::string::npos) { ring = true; break; } }
-        box_ring_view = ring;
+        /* VPIX_BOX_RING_FEED=1 (games.ps1 RingFeed): character select gets the ring's hand feed too (no 400 mm shift back, ring reach
+           + fist spread). Bobby 10-20: the select arm 'only registers forward and back', select punch reversed, and the tracking
+           only came good at the bell - it should start at character select */
+        static const bool ring_feed = getenv("VPIX_BOX_RING_FEED") && atoi(getenv("VPIX_BOX_RING_FEED"));
+        box_ring_view = ring || ring_feed;
     }
     static const bool blit_prio = getenv("VPIX_BLIT_PRIORITY") && atoi(getenv("VPIX_BLIT_PRIORITY"));
     /* VPIX_SCARED_FACE (games.ps1 ScaredFace, Pac-Man): a ghost is 4 consecutive model slots, body then eyes / mouth. While the body is
@@ -1224,11 +2234,28 @@ static void submit_frame() {
                 for (const auto &t : clamp_y) if (lo.find(t.name) != std::string::npos) { cy = &t; break; }
                 if (!cy || cy->anchor.empty()) continue;
                 float e[3]; for (int k = 0; k < 3; k++) e[k] = in.T[k] + in.S[1] * cy->ymin * in.R[1][k];
-                bool near_ = false;
-                for (const VPIX_Instance &o : f.inst) {
-                    if (&o == &in) continue;
-                    float d2 = 0; for (int k = 0; k < 3; k++) { float dd = o.T[k] - e[k]; d2 += dd * dd; }
-                    if (d2 < 1500.f * 1500.f && lname(o).find(cy->anchor) != std::string::npos) { near_ = true; break; }
+                /* anchor list 'a|!b|*': the first entry with a model of that name within 1500 of the end decides - plain = trim,
+                   '!' = keep; '*' last = trim when none matched (default keep) */
+                bool near_ = false, decided = false; size_t p0 = 0;
+                const std::string &al = cy->anchor;
+                while (!decided && p0 <= al.size()) {
+                    size_t q0 = al.find('|', p0); if (q0 == std::string::npos) q0 = al.size();
+                    std::string tk = al.substr(p0, q0 - p0); p0 = q0 + 1;
+                    if (tk.empty()) continue;
+                    if (tk == "*") { near_ = true; decided = true; break; }
+                    const bool neg = tk[0] == '!'; if (neg) tk.erase(0, 1);
+                    for (const VPIX_Instance &o : f.inst) {
+                        if (&o == &in) continue;
+                        float d2 = 0; for (int k = 0; k < 3; k++) { float dd = o.T[k] - e[k]; d2 += dd * dd; }
+                        if (d2 < 1500.f * 1500.f && lname(o).find(tk) != std::string::npos) { near_ = !neg; decided = true; break; }
+                    }
+                }
+                if (getenv("VPIX_CLAMPLOG") && frame % 300 == 0) {   /* dev: what each tunnel end meets (Bobby 10-24: blue band round another door) */
+                    std::string best; float bd = 1e18f;
+                    for (const VPIX_Instance &o : f.inst) { if (&o == &in) continue; float d2 = 0; for (int k = 0; k < 3; k++) { float dd = o.T[k] - e[k]; d2 += dd * dd; }
+                        if (d2 < bd) { bd = d2; best = lname(o); } }
+                    float c2 = 0; for (int k = 0; k < 3; k++) { float dd = e[k] - f.cam_T[k]; c2 += dd * dd; }
+                    if (c2 < 30000.f * 30000.f) lg("CLAMPEND f=%lu %s slot %u end (%.0f %.0f %.0f) cam dist %.0f nearest %s %.0f -> %s", frame, lo.c_str(), (unsigned)in.slot, e[0], e[1], e[2], sqrtf(c2), best.c_str(), sqrtf(bd), near_ ? "TRIM" : "keep");
                 }
                 if (!near_) { in.ymin = -1e30f; in.ymax = 1e30f; }
             }
@@ -1401,6 +2428,32 @@ static void submit_frame() {
                 if (!b.backdrop) { static unsigned long npb = 0; if (npb++ % 900 == 0) lg("PICTURE_BACK f=%lu h=%u %.0fx%.0f prio %d -> bottom layer", frame, b.handle, b.dw, b.dh, b.prio); }
                 b.backdrop = true;
             }
+        /* VPIX_PICTURE_HEADLOCK (games.ps1 PictureLock, Zone Hunter): while such a picture is up (opening / loading screens), the 3D
+           models with it (the ZONE HUNTER title, the spinning logo) are locked to the head like the picture. They sat in the world
+           and moved against the picture when the player looked around (Bobby 10-24: 'make them all stationary') */
+        /* =2 (Zone, Bobby 10-24 'do the same for the intro'): no head lock - the picture screen's 2D layer stays with the game camera
+           instead (renderer VPIX_PANEL_WORLD, like the attract score table); the layering below still applies */
+        static const int pic_lock_mode = getenv("VPIX_PICTURE_HEADLOCK") ? atoi(getenv("VPIX_PICTURE_HEADLOCK")) : 0;
+        static const bool pic_lock = pic_lock_mode != 0;
+        if (pic_lock) { bool any = false; for (const VPIX_Blit &b : f.blits) if (b.backdrop) { any = true; break; }
+            /* VPIX_PICTURE_WAIT_MS (games.ps1 PictureWait, Zone 5000): a picture screen's picture is held back until its texts are up
+               (another screen bitmap in the frame), at most this long - it showed alone at the bottom while its texts and the spinning
+               logo loaded in (Bobby 10-24: 'dont load that first bitmap till all the text load') */
+            static const unsigned long long pic_wait = getenv("VPIX_PICTURE_WAIT_MS") ? strtoull(getenv("VPIX_PICTURE_WAIT_MS"), NULL, 10) : 0;
+            static bool pic_was = false, pic_text = false; static unsigned long long pic_t0 = 0;
+            if (any && !pic_was) { pic_t0 = hap_ms_now(); pic_text = false; }
+            pic_was = any;
+            if (any && pic_wait && !pic_text) {
+                for (const VPIX_Blit &b : f.blits) if (!b.world && !b.backdrop) { pic_text = true; break; }
+                if (!pic_text && hap_ms_now() - pic_t0 < pic_wait) {
+                    f.blits.erase(std::remove_if(f.blits.begin(), f.blits.end(), [](const VPIX_Blit &b) { return b.backdrop; }), f.blits.end());
+                    for (int c = 0; c < 3; c++) f.clear[c] = 0; any = false; }
+            }
+            if (any) { if (pic_lock_mode == 1) for (VPIX_Instance &in : f.inst) if (!in.headlock) in.headlock = 2;   /* 2 = locked, keeps its shading */
+                /* every other screen bitmap goes under the 3D too, after the picture: the spinning logo is the top layer (Bobby
+                   10-24: the picture's corner / copyright line covered it) */
+                std::stable_partition(f.blits.begin(), f.blits.end(), [](const VPIX_Blit &b) { return b.backdrop; });
+                for (VPIX_Blit &b : f.blits) if (!b.world) b.backdrop = true; } }
         if (pic_back >= 2) { static unsigned long npl = 0;   /* dev: picture vs model priorities (which side the translucent picture goes) */
             for (const VPIX_Blit &b : f.blits) if (!b.world && b.alpha < 1.f && b.dw >= 176.f && npl++ % 300 == 0)
                 lg("PICPRIO f=%lu h=%u prio %d, top 3D prio %d -> %s", frame, b.handle, b.prio, top3d, b.backdrop ? "under the 3D" : "over the 3D"); }
@@ -1454,7 +2507,7 @@ static void submit_frame() {
                 lg("BIGBLIT f=%lu h=%u world=%d key=%d alpha=%.2f src=%dx%d at (%d,%d) drawn %.0fx%.0f prio=%d dist=%.0f clear=(%d,%d,%d)", frame, b.handle, (int)b.world, b.key, b.alpha, b.sw, b.sh, b.x, b.y, b.dw, b.dh, b.prio, dist, f.clear[0], f.clear[1], f.clear[2]);
         }
     }
-    VPIX_Render_Submit(f);
+    frame_deliver(f);
 }
 
 static void write_snapshot() {
@@ -1477,7 +2530,7 @@ static void write_snapshot() {
 static uint32_t hle_replace(VHook &h) {
     const std::string &n = h.name;
     if (n == "PIX_LoadModel" || n == "PIX_LoadTexture" || n == "PIX_LoadBitmap") {
-        uint32_t hd = next_handle++;
+        uint32_t hd = forced_handle ? forced_handle : next_handle++;
         std::string fn = rd_str(reg_eax);
         bool ok = true;
         if (n == "PIX_LoadModel") {
@@ -1536,9 +2589,63 @@ static uint32_t hle_replace(VHook &h) {
         lg("CD_ReadData drive=%u track=%u -> serial signature \"%s\"", reg_eax, reg_edx, sig ? sig : "");
         return 0;
     }
-    if (n == "PIXI_FIFOStatus")                     /* (channel mask, fifo 0/1/2): mask of channels whose status bit */
+    /* SU3000 / 2000E (VPIX_PIX3K): one PIX2000E board, PCI 1172:5601 at bus 0 device 1. The BARs match the RAM that
+       vpix.cpp maps (BAR0 0xC0000000 PowerPC memory, BAR1 0xC4000000 registers). Watcom regs: PCI_FindDevice(ax device,
+       dx vendor, bx index, ecx -> bus/devfn word) 0 = found, 0x86 = none; PCI_GetDeviceConfigurationSpace(ax busdev, edx -> packed
+       PCICONFIGSPACE: +0 vendor, +2 device, +8 revision, +0x11 BAR0, +0x15 BAR1) */
+    /* SU3000 MPEG card (no video yet): movies take their real time. Attract mode plays the next movie and redraws the
+       high-score text whenever MPEG_GetStatus says 1 (finished); answering 1 at once cycled every frame until the game's
+       512 objects ran out. Length = file size at MPEG-1 rates (~1.4 Mbit/s); VPIX_MPEG_SCALE scales it (0 = instant). */
+    if (n.compare(0, 5, "MPEG_") == 0) {
+        static std::map<uint32_t, double> secs; static double until = 0; static uint32_t next = 0x2000;
+        static std::map<uint32_t, std::string> files;
+        static const double scale = getenv("VPIX_MPEG_SCALE") ? atof(getenv("VPIX_MPEG_SCALE")) : 1.0;
+        double now = std::chrono::duration<double>(std::chrono::steady_clock::now() - host_t0).count();
+        if (n == "MPEG_LoadFile") {
+            std::string fn = rd_str(reg_eax); std::vector<uint8_t> d; uint32_t hd = next++;
+            double t = read_dos_file(fn, d) ? d.size() * 8.0 / 1.4e6 : 5.0;
+            secs[hd] = (std::max)(1.0, (std::min)(t, 180.0)) * scale;
+            if (h.calls < 60) lg("MPEG_LoadFile \"%s\" -> %X (%.1f s)", fn.c_str(), hd, secs[hd]);
+            files[hd] = fn;
+            return hd;
+        }
+        if (n == "MPEG_Play") {
+            auto it = secs.find(reg_eax); until = now + (it != secs.end() ? it->second : 5.0);
+            auto fi = files.find(reg_eax);
+            if (fi != files.end() && mpeg_start(fi->second)) until = now + 1e9;   /* real playback: finished when the stream ends */
+            return 0;
+        }
+        if (n == "MPEG_Stop" || n == "MPEG_UnloadFile") { if (n == "MPEG_Stop") mpeg_stop(); until = 0; return 0; }
+        if (n == "MPEG_GetStatus") { if (mpeg_running()) return 2; if (until > now + 1e8) until = 0; return now < until ? 2 : 1; }
+        return h.retval;
+    }
+    if (n == "EXP_GetCDExperience") {              /* (drive, buf) -> experience code from the disc's serial track; SU3000 PROC_security
+                                                       compares it with the game's exp_code: answer with that */
+        uint32_t ec = global_rt("exp_code"); std::string code = ec ? rd_str(mem_readd(ec)) : "";
+        for (size_t i = 0; i <= code.size(); i++) mem_writeb(reg_edx + (uint32_t)i, i < code.size() ? (uint8_t)code[i] : 0);
+        lg("EXP_GetCDExperience -> \"%s\" (game's exp_code)", code.c_str());
+        return 0;
+    }
+    if (n == "PCI_FindDevice" || n == "OS_PCI_FindDevice") {
+        bool hit = (reg_eax & 0xFFFF) == 0x5601 && (reg_edx & 0xFFFF) == 0x1172 && (reg_ebx & 0xFFFF) == 0;
+        if (hit) mem_writew(reg_ecx, 0x0008);
+        if (h.calls < 20) lg("%s dev=%04X ven=%04X idx=%u -> %s (cs %04X base %08X, ds %04X base %08X, ss base %08X)", n.c_str(), reg_eax & 0xFFFF, reg_edx & 0xFFFF, reg_ebx & 0xFFFF, hit ? "PIX2000E" : "none",
+                             SegValue(cs), (unsigned)SegPhys(cs), SegValue(ds), (unsigned)SegPhys(ds), (unsigned)SegPhys(ss));
+        return hit ? 0 : 0x86;
+    }
+    if (n == "PCI_GetDeviceConfigurationSpace" || n == "OS_PCI_GetDeviceConfigurationSpace") {
+        for (int i = 0; i < 0x40; i++) mem_writeb(reg_edx + i, 0);
+        mem_writew(reg_edx + 0, 0x1172); mem_writew(reg_edx + 2, 0x5601); mem_writew(reg_edx + 4, 0x0006); mem_writeb(reg_edx + 8, 0x01);
+        mem_writed(reg_edx + 0x11, 0xC0000000u); mem_writed(reg_edx + 0x15, 0xC4000000u);
+        if (h.calls < 20) lg("%s busdev=%04X -> PIX2000E BAR0 C0000000 BAR1 C4000000", n.c_str(), reg_eax & 0xFFFF);
+        return 0;
+    }
+    if (n == "PCI_ReadConfigWord" || n == "OS_PCI_ReadConfigWord") { mem_writew(reg_ebx, reg_edx == 0 ? 0x1172 : reg_edx == 2 ? 0x5601 : 0x0006); return 0; }
+    if (n == "PIXI_FIFOStatus")                  /* (channel mask, fifo 0/1/2): mask of channels whose status bit */
         return reg_edx == 2 ? (reg_eax & 3) : 0;    /* 0x80/0x40/0x20 is clear; a real idle card reads 0xCF */
     if (n.compare(0, 4, "SND_") == 0) return hle_sound(n, h);
+    if (n.compare(0, 4, "AWE_") == 0) return hle_awe(n, h);
+    if (getenv("VPIX_CD_DIR") && n.compare(0, 3, "CD_") == 0) return hle_cd(n);
     if (n == "PIX_InitFLIC" || n == "PIX_ReadNextFLICFrame" || n == "PIX_CloseFLIC") return hle_flic(n);
     if (n == "TRK_Open") { lg("TRK_Open \"%s\" -> 0 (HLE tracker)", rd_str(reg_eax).c_str()); return track_on ? 0 : (uint32_t)-2000; }
     if (n == "TRK_GetTrackerRecord") return hle_trk_record(reg_eax, reg_edx);
@@ -1547,15 +2654,62 @@ static uint32_t hle_replace(VHook &h) {
         uint32_t tmp = SegPhys(ss) + reg_esp - 0x400;
         return hle_trk_record(reg_eax, tmp, reg_edx);
     }
+    if (n == "PIX_DrawStatic") {                       /* see frame_deliver: remember it for this frame's picture */
+        if (h.calls < 3 || h.calls % 500 == 0) lg("PIX_DrawStatic #%lu f=%lu mask=%X texture=%u window %ux%u", h.calls, frame, reg_eax & 0xFF, reg_edx, reg_ebx & 0xFFFF, reg_ecx & 0xFFFF);
+        static_tex = reg_edx; static_w = (uint16_t)reg_ebx; static_h = (uint16_t)reg_ecx; static_frame = frame;
+        return 0;
+    }
+    if (n == "PIX_SetPixelSize") {                     /* (mask, x size, y size), 8.8 fixed: Sea Diving 0x200 = 2D x in double-wide pixels */
+        uint32_t xs = reg_edx & 0xFFFF, ys = reg_ebx & 0xFFFF;
+        pix_xsize = xs >= 0x40 && xs <= 0x800 ? xs / 256.f : 1.f;
+        pix_ysize = ys >= 0x40 && ys <= 0x800 ? ys / 256.f : 1.f;
+        lg("PIX_SetPixelSize mask=%X x=%04X y=%04X -> line scale %.2f x %.2f", reg_eax, xs, ys, pix_xsize, pix_ysize);
+        return 0;
+    }
+    if (n == "PIX_SetPenColor") {
+        for (int c = 0; c < 3; c++) pen_rgb[c] = mem_readb(reg_eax + c);
+        if (h.calls < 3) lg("PIX_SetPenColor f=%lu rgb=%02X%02X%02X", frame, pen_rgb[0], pen_rgb[1], pen_rgb[2]);
+        return 0;
+    }
+    if (n == "PIX_DrawLine") {
+        /* pixel centres: card pixel 30 at size 2 covers screen 60-61, centre 61 = the dial's centre (dial.vst at x 30, 62 wide;
+           from the left edge the needle sat a little left of the AIR wedge's point, Bobby 10-24) */
+        VPIX_Frame::Line l = {((int16_t)reg_eax + .5f) * pix_xsize, ((int16_t)reg_edx + .5f) * pix_ysize, ((int16_t)reg_ebx + .5f) * pix_xsize, ((int16_t)reg_ecx + .5f) * pix_ysize,
+                              {pen_rgb[0], pen_rgb[1], pen_rgb[2]}};
+        if (h.calls < 3 || h.calls % 2000 == 0) lg("PIX_DrawLine #%lu f=%lu (%d,%d)-(%d,%d)", h.calls, frame, (int16_t)reg_eax, (int16_t)reg_edx, (int16_t)reg_ebx, (int16_t)reg_ecx);
+        if (lines_now.size() < 256) lines_now.push_back(l);
+        return 0;
+    }
     if (n == "CTRL_GetJoystick") {                     /* eax player mask, edx 4, ebx CTRLJOYDATA[] (6 bytes) */
+        if (h.calls < 3 || h.calls % 5000 == 0) lg("CTRL_GetJoystick call %lu f=%lu mask=%X buttons now %X", h.calls, frame, reg_eax, cur_in.buttons);
         for (int s = 0, k = 0; s < 32; s++) {
             if (!(reg_eax >> s & 1)) continue;
             uint32_t a = reg_ebx + 6 * k++;
             /* s8 x, s8 y: the pod joystick's axes (VPIX_JOYAXES games; 0 elsewhere) */
             int jx = s == 0 ? (int)lroundf(cur_in.joy[0] * 127) : 0, jy = s == 0 ? (int)lroundf(cur_in.joy[1] * 127) : 0;
-            mem_writeb(a, (uint8_t)(int8_t)jx); mem_writeb(a + 1, (uint8_t)(int8_t)jy); mem_writed(a + 2, s == 0 ? cur_in.buttons | (two_hand_trigger ? VPIX_BTN_TRIGGER : 0) : 0);
+            /* VPIX_SEAT2_MIRROR=1 (dev, Duo tests): the second seat's joystick gets the first seat's buttons */
+            static const bool seat2_mirror = getenv("VPIX_SEAT2_MIRROR") && atoi(getenv("VPIX_SEAT2_MIRROR"));
+            const bool own = s == 0 || (seat2_mirror && s == 1);
+            uint32_t btn = own ? cur_in.buttons | (two_hand_trigger ? VPIX_BTN_TRIGGER : 0) : 0;
+            if (s == 1 && seat2_live()) btn = seat2_in.buttons | (seat2_two_hand_trigger ? VPIX_BTN_TRIGGER : 0);   /* remote seat 2 */
+            if (seat_client_on()) btn = 0;   /* remote seat PC: its own game stays in attract (we draw the host's seat 2) */
+            mem_writeb(a, (uint8_t)(int8_t)jx); mem_writeb(a + 1, (uint8_t)(int8_t)jy); mem_writed(a + 2, btn);
+            { static int bl = 0; static uint32_t lb = 0; uint32_t bb = mem_readd(a + 2);
+              if (s == 0 && bb != lb && bl < 100) { lg("CTRL_GetJoystick f=%lu buttons %X -> %X (data at %06X)", frame, lb, bb, a); lb = bb; bl++; } }
             { static int jl = 0; static int lx = 0, ly = 0; if ((jx != lx || jy != ly) && jl < 200) { lg("CTRL_GetJoystick axes x=%d y=%d", jx, jy); lx = jx; ly = jy; jl++; } }
         }
+        return 0;
+    }
+    /* ZENECA's data glove: (hand mask, CTRLFLEXORDATA *): 4 raw finger bends, then a button dword at +4. TRK_readFlexor scales
+       the bends with RUNFILES\FLEXOR.DAT (min 6 12 5 18, range 69 57 36 38): trigger held = fist, else open hand. The title
+       script's UNTIL START ends on button bits 0-2 (SCRIPT_until: flexor+4 & 7) */
+    if (n == "CTRL_GetFlexor") {
+        static const uint8_t fmin[4] = {6, 12, 5, 18}, frange[4] = {69, 57, 36, 38};
+        bool fist = (cur_in.buttons & VPIX_BTN_TRIGGER) || two_hand_trigger;
+        for (int i = 0; i < 4; i++) mem_writeb(reg_edx + i, (uint8_t)(fmin[i] + (fist ? frange[i] : 0)));
+        uint32_t b = (fist || cur_in.start) ? 1 : 0;
+        mem_writed(reg_edx + 4, b);
+        { static int fl = 0; static uint32_t lb = 0; if (b != lb && fl < 40) { lg("CTRL_GetFlexor f=%lu buttons %X -> %X", frame, lb, b); lb = b; fl++; } }
         return 0;
     }
     if (n == "CTRL_GetButton") {                       /* front panel: bit 0 = start (player 1 only) */
@@ -1565,7 +2719,7 @@ static uint32_t hle_replace(VHook &h) {
         /* front panel bit 0 = SINGLE PLAY, bit 1 = LINK UP (DAC: link needs credits in both slots,
            then joins the other pods). With the pod network on, start presses both: games take the
            link path when it is possible and fall back to single play */
-        uint32_t press = VPIX_NET_Enabled() ? 3 : 1;
+        uint32_t press = start_bits ? start_bits : VPIX_NET_Enabled() ? 3 : 1;   /* SU3000 Zero Hour: PROCESS_buttons starts player 1 on bit 4 (8 = the other start) */
         bool start = cur_in.start;
         /* DAC linked pods: the asking pod waits 10 s for the other pod's players to press LINK UP too;
            only when both pods have nextMode 4/4 does the 4-player game start. Pressing on both pods at
@@ -1579,7 +2733,23 @@ static uint32_t hle_replace(VHook &h) {
             if (start != was) lg("NET: slave pod %s LINK UP (%s)", start ? "presses" : "releases", net_state().c_str());
             was = start;
         }
-        for (int s = 0, k = 0; s < 32; s++) if (reg_eax >> s & 1) mem_writed(reg_edx + 4 * k++, (s == 0 && start) ? press : 0);
+        /* Master pod: a press before the other pod's lobby status has arrived (remote slots 2-3 not game_mode 2 + inCredit 1) starts a
+           solo game (DN2 10-19: autostart pressed at 28 s, the slave's status landed at 30 s, no link). Latch the press
+           and give it to the game once the other pod is known, or after 20 s (a pod needs ~30 s to boot; no other pod: a normal solo start). */
+        if (VPIX_NET_Enabled() && VPIX_NET_Pod() == 1 && nm) {
+            static double pend = -1;
+            uint32_t gm = global_rt("game_mode"), ic = global_rt("inCredit");   /* remote slots 2-3: in the lobby (2) with credits (1) */
+            bool unknown = gm && ic && !(mem_readd(gm + 8) == 2 && mem_readd(gm + 12) == 2 && (int16_t)mem_readw(ic + 4) == 1 && (int16_t)mem_readw(ic + 6) == 1);
+            if (start && unknown && pend < 0) { pend = hap_ms_now(); lg("NET: master start held until the other pod is heard (20 s max)"); }
+            if (pend >= 0) {
+                if (!unknown || hap_ms_now() - pend > 20000) { start = true; pend = -1; lg("NET: master start released (%s)", unknown ? "no other pod" : net_state().c_str()); }
+                else start = false;
+            }
+        }
+        if (seat_client_on()) start = false;
+        for (int s = 0, k = 0; s < 32; s++) if (reg_eax >> s & 1)
+            mem_writed(reg_edx + 4 * k++, ((s == 0 && start) || (s == 1 && seat2_live() && seat2_in.start)) ? press : 0);   /* seat 2: the remote seat's start */
+        { static int pl = 0; if (start && pl < 6) { lg("CTRL_GetButton press %X -> %06X (start_bits %X)", press, reg_edx, start_bits); pl++; } }
         return 0;
     }
     if (n == "EXP_GetCredit") {                        /* 1 = a credit is available */
@@ -1587,6 +2757,11 @@ static uint32_t hle_replace(VHook &h) {
         uint32_t r = (free_play || c > 0) ? 1 : 0;
         if (h.calls < 5) lg("EXP_GetCredit mask=%X -> %u%s", reg_eax, r, free_play ? " (free play)" : "");
         return r;
+    }
+    if (n == "EXP_GetCreditMode") {                    /* Zero Hour (hooks ZERO3K.game): (mask, &mode). Free play -> 8: PROCESS_credits sees a mode */
+        uint32_t m = free_play ? 8 : 2;                 /* ... bit outside 2|4 and sets credit -1 = FREEPLAY (Bobby 10-18: credits counted up like crazy) */
+        if (reg_edx) mem_writed(reg_edx, m);
+        return 0;
     }
     if (n == "EXP_RemoveCredit") {
         if (!free_play && cur_in.coins > coins_used) coins_used++;
@@ -1616,11 +2791,68 @@ static uint32_t hle_replace(VHook &h) {
         last = (std::max)(due, now - std::chrono::milliseconds(100));
         }
         if (frame % snap_every == 0) write_snapshot();
+        {   /* VPIX_PPCDUMP=<frame> (dev, SU3000): PowerPC 0's database memory (model objects) -> <log>.ppc0 */
+            static const char *pd = getenv("VPIX_PPCDUMP");
+            if (pd && frame == strtoul(pd, NULL, 10) && VPIX_Pix3K_Mem(0xC0000000u, 0x800000)) {
+                FILE *f = fopen((log_base + ".ppc0").c_str(), "wb");
+                if (f) { fwrite(VPIX_Pix3K_Mem(0xC0000000u, 0x800000), 1, 0x800000, f); fclose(f); lg("PPC memory dumped at frame %lu", frame); }
+            }
+        }
         if (track_on) {
             uint32_t tc = global_rt("trk_config");
             if (tc) { if (frame == 0) lg("trk_config+19 = %u", mem_readd(tc + 0x19)); mem_writed(tc + 0x19, 1); }
+            /* VPIX_NO_AIM_ASSIST (run_su3k.sh, Total Recoil): TRACK_adjust pulls the gun's az/el halfway to the head's whenever the gun
+               points within track_calib_ang[0] of the view (the pod's gun sensor sat at the cheek when shouldered). A Vive controller
+               is always near the head, so the gun followed the head more than the hand (Bobby 10-18). Threshold 0 = never. */
+            {   /* dev (Bobby 10-18: 'gun stays up high even at my waist'): fed head/hand vs the game's gun object, once a second */
+                static unsigned long nh = 0; uint32_t ho = global_rt("hand_obj"), o = ho ? mem_readd(ho) : 0;
+                uint32_t hg = global_rt("head_obj"), oh = hg ? mem_readd(hg) : 0;
+                if (o && nh % 600 == 0) { uint32_t gr = mem_readd(o); if (gr) lg("GUNOFF f=%lu hand_obj rec %08X +D52 = (%.1f %.1f %.1f)", frame, gr, rd_f(gr + 0xD52), rd_f(gr + 0xD56), rd_f(gr + 0xD5A)); }
+                if (o && nh++ % 60 == 0)
+                    lg("HANDPOS f=%lu real head (%.0f %.0f %.0f) hand (%.0f %.0f %.0f) | fed hand (%.0f %.0f %.0f) | game head_obj (%.0f %.0f %.0f) hand_obj (%.0f %.0f %.0f)", frame,
+                       cur_in.head.p[0], cur_in.head.p[1], cur_in.head.p[2], cur_in.hand.p[0], cur_in.hand.p[1], cur_in.hand.p[2], hand_fed[0], hand_fed[1], hand_fed[2],
+                       oh ? rd_f(oh + 0x4E) : 0.f, oh ? rd_f(oh + 0x52) : 0.f, oh ? rd_f(oh + 0x56) : 0.f, rd_f(o + 0x4E), rd_f(o + 0x52), rd_f(o + 0x56));
+            }
+            static const bool no_assist = getenv("VPIX_NO_AIM_ASSIST") && atoi(getenv("VPIX_NO_AIM_ASSIST"));
+            /* VPIX_AIM_ASSIST_DEG = keep a small window instead (Bobby 10-18: off = 'super hard to hit'; the game's 65 deg glued the
+               gun to the head). Within it the shot is bent towards where you look, the game's own way. */
+            static const float assist_deg = getenv("VPIX_AIM_ASSIST_DEG") ? (float)atof(getenv("VPIX_AIM_ASSIST_DEG")) : 0.f;
+            /* Only when shouldered (Bobby 10-18: 'lock to head when close helps a ton', but the hip shot locked too). The game fades the
+               blend out from 300 to 700 mm head-gun distance and is back to FULL past 700 (the pod's mounted gun never got that far), so
+               its range is pushed out of reach (RANGE_MIN/MAX huge = always full) and we scale the window by the REAL controller-headset
+               distance: full below VPIX_AIM_ASSIST_NEAR (300 mm), none beyond VPIX_AIM_ASSIST_FAR (450 mm), linear between. */
+            static const float a_near = getenv("VPIX_AIM_ASSIST_NEAR") ? (float)atof(getenv("VPIX_AIM_ASSIST_NEAR")) : 300.f;
+            static const float a_far = getenv("VPIX_AIM_ASSIST_FAR") ? (float)atof(getenv("VPIX_AIM_ASSIST_FAR")) : 450.f;
+            /* VPIX_AIM_ASSIST_FAR_DEG: the window left with the gun away from the face (Bobby 10-18: 'a mix of the old one where the gun
+               tracked far away from face too') - the lock fades from VPIX_AIM_ASSIST_DEG at the eye to this at the hip */
+            static const float far_deg = getenv("VPIX_AIM_ASSIST_FAR_DEG") ? (float)atof(getenv("VPIX_AIM_ASSIST_FAR_DEG")) : 0.f;
+            if (no_assist) if (uint32_t ca = global_rt("track_calib_ang")) {
+                float k = 1.f;
+                const bool assisted = cur_in.aim_mode == 1;   /* VPIX_AIM_MODES 'assisted' = the old way: window always full, the game's own cheek snap range */
+                if (!assisted && cur_in.head.valid && cur_in.hand.valid && a_far > a_near) {
+                    float dx = cur_in.hand.p[0] - cur_in.head.p[0], dy = cur_in.hand.p[1] - cur_in.head.p[1], dz = cur_in.hand.p[2] - cur_in.head.p[2];
+                    float d = sqrtf(dx * dx + dy * dy + dz * dz);
+                    k = (a_far - d) / (a_far - a_near); k = k < 0 ? 0 : k > 1 ? 1 : k;
+                    static unsigned long nl = 0; if (nl++ % 1800 == 0) lg("aim assist: gun %.0f mm from head -> window %.1f deg", d, far_deg + (assist_deg - far_deg) * k);
+                }
+                float a = (far_deg + (assist_deg - far_deg) * k) * 0.0174533f; uint32_t u; memcpy(&u, &a, 4);
+                if (frame == 0) lg("aim assist window %.0f deg when shouldered (< %.0f mm, off beyond %.0f; game's was %.0f deg)", assist_deg, a_near, a_far, rd_f(ca) * 57.2958f);
+                mem_writed(ca, u);
+                /* Position snap (Total Recoil TRACK_adjust2 end): the hand is pulled onto a cheek point beside the head with weight 1
+                   below TRACK_CALIB_RANGE_MIN, fading out to RANGE_MAX (300 / 700 mm on the pod, whose sensor sat on the gun). Setting
+                   the range huge (to free the angle window) pinned the gun to the cheek even at the hip (Bobby 10-18: 'gun stays high
+                   at my waist'). Now its own zone: VPIX_GUN_SNAP_NEAR (200 mm) full, VPIX_GUN_SNAP_FAR (300 mm) none. */
+                static const float s_near = getenv("VPIX_GUN_SNAP_NEAR") ? (float)atof(getenv("VPIX_GUN_SNAP_NEAR")) : 200.f;
+                static const float s_far = getenv("VPIX_GUN_SNAP_FAR") ? (float)atof(getenv("VPIX_GUN_SNAP_FAR")) : 300.f;
+                float sv[3] = {s_near, s_far, s_far - s_near};
+                if (assisted) { sv[0] = 300.f; sv[1] = 700.f; sv[2] = 400.f; }   /* the pod's values (TRACK_CALIB_RANGE_MIN/MAX, DIFF) */
+                const char *sn[3] = {"TRACK_CALIB_RANGE_MIN", "TRACK_CALIB_RANGE_MAX", "TRACK_CALIB_RANGE_DIFF"};
+                for (int i = 0; i < 3; i++) if (uint32_t ga = global_rt(sn[i])) { memcpy(&u, &sv[i], 4); mem_writed(ga, u); }
+            }
         }
         submit_frame();
+        seat_tick();                                     /* remote seat (vpix_seat.h): seat 2's input in, its frame out */
+        voice_tick();                                    /* voice chat (vpix_voice.h) */
         {   /* VPIX_TEXTDUMP: log the operator screen (DOS text page at 0xB8000) when it changes */
             static const bool td = getenv("VPIX_TEXTDUMP") != NULL; static std::string last; static unsigned long nt = 0;
             if (td && nt++ % 2000 == 0) {
@@ -1651,8 +2883,8 @@ static uint32_t hle_replace(VHook &h) {
                 for (char ch : s) { if (ch != ',') { n += ch; continue; }
                     uint32_t a = n.empty() ? 0 : global_rt(n.c_str());
                     if (a) { float v[12]; for (int i = 0; i < 12; i++) { uint32_t w = mem_readd(a + i * 4); memcpy(&v[i], &w, 4); }
-                        lg("PEEK f=%lu %s %.1f %.1f %.1f %.3f %.3f %.3f | %.1f %.1f %.1f %.3f %.3f %.3f", frame, n.c_str(),
-                           v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], v[9], v[10], v[11]); }
+                        lg("PEEK f=%lu %s %.1f %.1f %.1f %.3f %.3f %.3f | %.1f %.1f %.1f %.3f %.3f %.3f | hex %08X %08X %08X", frame, n.c_str(),
+                           v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], v[9], v[10], v[11], mem_readd(a), mem_readd(a + 4), mem_readd(a + 8)); }
                     n.clear(); } }
         }
         if (frame < 5 || frame % 100 == 0) {
@@ -1660,6 +2892,12 @@ static uint32_t hle_replace(VHook &h) {
             static auto t0 = std::chrono::steady_clock::now();
             snprintf(b, sizeof(b), " host=%.2fs", std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count()); w += b;
             for (auto &x : watches) { uint32_t u = mem_readd(x.st + data_delta); float f; memcpy(&f, &u, 4); snprintf(b, sizeof(b), " %s=%g", x.name.c_str(), f); w += b; }
+            /* VPIX_PEEKW=f7dac,ff5ec,... (dev): dword at each static EXE data address, hex */
+            static const char *pw = getenv("VPIX_PEEKW");
+            if (pw) { std::string s(pw); s += ','; std::string a;
+                for (char ch : s) { if (ch != ',') { a += ch; continue; }
+                    if (!a.empty()) { snprintf(b, sizeof(b), " %s=%08X", a.c_str(), mem_readd((uint32_t)strtoul(a.c_str(), NULL, 16) + data_delta)); w += b; }
+                    a.clear(); } }
             lg("== %s frame %lu%s %s", n.c_str(), frame, w.c_str(), net_state().c_str()); fflush(flog);
         }
         frame++;
@@ -1681,7 +2919,7 @@ static uint32_t hle_replace(VHook &h) {
 
 /* DAC linked game: each pod is a Duo (two player slots), so a 4-player link with one person per pod
    leaves local slot 1 as a "human" with no input (VEGA/BLAIZE standing still). person+9 is the human
-   flag (person[] stride 0xEB1): 0 sends the slot to CCP_handle, the game's own computer player (as in
+   flag (person[] stride 0xEB1; DN2 0xECF via the hooks line 'personstride'): 0 sends the slot to CCP_handle, the game's own computer player (as in
    solo and attract). Only the pod that owns slot 1 flips it; the other pod keeps it as a remote
    player and gets its position from TX_player_info as before. VPIX_NET_BOTS=0 leaves it human. */
 static bool net_bots_on() {
@@ -1693,7 +2931,28 @@ static bool net_bots_on() {
 static void net_bots() {
     uint32_t pe = global_rt("person");
     if (!net_bots_on() || !pe) return;
-    uint32_t human = pe + 0xEB1 + 9;
+    uint32_t human = pe + person_stride + 9;
+    /* Matches alternate (Bobby 10-19): humans only (each pod's empty seat stays an idle 'human'; both spare seats, slots 1 and 3, are parked far outside the
+       arena every frame, so 2 people play head to head), then computer players fill the empty seats, and so on. Both
+       pods count the same linked starts (nextMode 4 4), so they agree. VPIX_NET_ALTERNATE=0 = always computer players. */
+    static bool alt = !(getenv("VPIX_NET_ALTERNATE") && *getenv("VPIX_NET_ALTERNATE") == '0');
+    static int game_no = 0; static bool was_linked = false, humans_only = false;
+    uint32_t nm = global_rt("nextMode");
+    bool linked = nm && mem_readd(nm) == 4 && mem_readd(nm + 4) == 4;
+    if (linked && !was_linked) {
+        game_no++; humans_only = alt && (game_no % 2) == 1;
+        lg("NET: linked game %d: %s", game_no, humans_only ? "humans only (empty seats parked)" : "computer players fill the empty seats");
+    }
+    was_linked = linked;
+    if (humans_only) {
+        if (mem_readd(human) != 1) mem_writed(human, 1);
+        float away = 500000.f; uint32_t u; memcpy(&u, &away, 4);
+        for (int i : {1, 3}) { mem_writed(pe + i * person_stride + person_pos, u); mem_writed(pe + i * person_stride + person_pos + 4, u); }   /* own spare seat + the other pod's (never sent) */
+        if (frame % 600 == 0) { char t[200]; int n = 0;
+            for (int i = 0; i < 4; i++) n += snprintf(t + n, sizeof(t) - n, " p%d(%.0f %.0f %.0f h%u)", i, rd_f(pe + i * person_stride + person_pos), rd_f(pe + i * person_stride + person_pos + 4), rd_f(pe + i * person_stride + person_pos + 8), mem_readd(pe + i * person_stride + 9));
+            lg("NET: humans only, players%s", t); }
+        return;
+    }
     if (mem_readd(human) == 1) { mem_writed(human, 0); lg("NET: local slot 1 -> computer player (%s)", net_state().c_str()); }
     /* Every player for themselves: the bot's target (opid) comes from a switch in CCP_handle that pairs
        pod partners (person 1 -> 0). Once a second, person 1's case (mov [opid], imm32) is rewritten to
@@ -1702,7 +2961,7 @@ static void net_bots() {
     if (it == codes.end() || frame % 30) return;
     uint32_t ins = it->second + code_delta;
     if (mem_readb(ins) != 0xC7 || mem_readb(ins + 1) != 0x05) return;
-    auto pos = [&](int i, int k) { uint32_t u = mem_readd(pe + i * 0xEB1 + 0x45 + 4 * k); float f; memcpy(&f, &u, 4); return f; };
+    auto pos = [&](int i, int k) { uint32_t u = mem_readd(pe + i * person_stride + person_pos + 4 * k); float f; memcpy(&f, &u, 4); return f; };
     int best = 0; float bd = 1e30f;
     for (int i : {0, 2, 3}) {
         float d = 0; for (int k = 0; k < 3; k++) { float t = pos(i, k) - pos(1, k); d += t * t; }
@@ -1726,6 +2985,10 @@ static std::string net_state() {
 }
 
 static void hle_log(VHook &h) {
+    if (h.name == "PIX_SetVideoCapture") {           /* (input, video texture descriptor): where the MPEG picture goes */
+        uint32_t d = reg_edx & 0xFFFFFF;
+        if (d >= 0x100000 && d < 0x2000000 && d != video_target) { video_target = d; lg("PIX_SetVideoCapture -> texture %06X", d); }
+    }
 
     if (h.name == "PIX_SetTexture") {               /* PIXTEXTURE: flags, handle, origin xyz, su, sv */
         float o[3] = {rd_f(reg_edx + 8), rd_f(reg_edx + 12), rd_f(reg_edx + 16)};
@@ -1740,6 +3003,11 @@ static void hle_log(VHook &h) {
             if (seen[ra]++ % 300 == 0) lg("CALLER %s eax=%X edx=%X from %06X (x%lu) frame %lu", h.name.c_str(), reg_eax, reg_edx, ra, seen[ra], frame);
         }
     }
+    if (h.name == "HI_process") { hi_frame = frame; return; }   /* Zero Hour high-score entry: draw our aim beam (submit_frame_su3k) */
+    if (h.name == "PLAYER_do_blood") {              /* Zero Hour: the player took a hit (edx = hits, 0 = none) -> both hands (Bobby 10-18: no rumble on hits) */
+        if (reg_edx) { VPIX_Haptic(2, 0.25f, 1.f); if (h.calls < 50) lg("player hit f=%lu (edx %u) -> rumble", frame, reg_edx); }
+        return;
+    }
     if (h.name == "BOX_Lean") {                     /* Boxing's lean-to-move (player struct in eax); dev diagnosis */
         if (h.calls % 30 == 0 && h.calls < 60000) {
             uint32_t pl = mem_readd(reg_eax), ob = mem_readd(pl + 0x6c); uint16_t pid = mem_readw(pl + 3);
@@ -1751,8 +3019,38 @@ static void hle_log(VHook &h) {
         }
         return;
     }
+    if (h.name == "PIX_DrawBitmap") {               /* ZENECA (cdecl): (window mask, PIXBITMAP *) from BITMAP_update every frame */
+        uint32_t bmp = mem_readd(SegPhys(ss) + reg_esp + 8);
+        if (bmp > 0x1000 && bmp < 0x4000000) blit3k(drawbmp3k, bmp - 0x1A0, 0xFFFF, true);
+        if (h.calls < 10) lg("PIX_DrawBitmap f=%lu bmp %06X [%s] -> %u blits", frame, bmp, rd_hex(bmp, 0x31).c_str(), (unsigned)drawbmp3k.blits.size());
+        return;
+    }
+    /* PIX_ModifyModelPriority(slot, prio): goes straight to the card (command 0x29), never into the host slot's +0x54. Zone sets its
+       rooms / doors / halls this way every frame (portal order, card keys 989..1000); the card paints by it (VPIX_CARD_ORDER) */
+    /* PIX_SetDepthCue call sites (Ghost Train, hooks DEPTHCUE_<distance|OFF>): the card fades everything to black by that eye
+       distance - the dark fog that hides the end of the drawn world (Bobby 10-25, LeonG's standalone) */
+    if (!h.name.compare(0, 9, "DEPTHCUE_")) depth_cue = h.name == "DEPTHCUE_OFF" ? 0.f : (float)atof(h.name.c_str() + 9);
+    if (h.name == "PIX_ModifyModelPriority") { const uint32_t sl = reg_eax & 0xFFFF; if (sl < 512) { mod_prio[sl] = (int32_t)reg_edx; mod_prio_set[sl] = true; } }
+    if (h.name == "PIX_SetWindow" && h.calls >= 50) return;   /* ZENECA calls it ~15 times a frame */
     if (h.calls >= 20000 && frame > 0) return;      /* keep per-frame chatter bounded */
+    {   static const char *skip = getenv("VPIX_LOG_SKIP");   /* dev: calls left out of the log (comma list), e.g. status polls */
+        if (skip && strstr(skip, h.name.c_str())) return; }
     const std::string &n = h.name;
+    if (n == "safe_exit" || n == "safeExit") {      /* SU3000 games' fatal exit: safe_exit(fmt, ...) / ZENECA safeExit(code, fmt, ...) on the stack */
+        uint32_t sp = SegPhys(ss) + reg_esp; int ai = 0;     /* expand %s / %d / %x from the stack args */
+        if (n == "safeExit") sp += 4;
+        std::string f = rd_str(mem_readd(sp + 4)), o;
+        for (size_t i = 0; i < f.size(); i++) {
+            if (f[i] == '%' && i + 1 < f.size()) {
+                size_t j = i + 1; while (j < f.size() && strchr("-+ #0123456789.l", f[j])) j++;
+                uint32_t a = mem_readd(sp + 8 + 4 * ai++); char b[32];
+                if (f[j] == 's') o += (a > 0x1000 && a < 0x4000000) ? rd_str(a) : "?";
+                else { snprintf(b, sizeof(b), f[j] == 'x' || f[j] == 'X' ? "%X" : "%d", a); o += b; }
+                i = j;
+            } else o += f[i] == '\n' ? ' ' : f[i];
+        }
+        lg("%s: %s", n.c_str(), o.c_str());
+    }
     if (n == "PIX_SetModel")       lg("SetModel slot=%u [%s]", reg_eax, rd_hex(reg_edx, 0xAC).c_str());
     else if (n == "PIX_SetView")   lg("SetView mask=%X [%s]", reg_eax, rd_hex(reg_edx, 0x88).c_str());
     else if (n == "PIX_SetWindow") lg("SetWindow mask=%X [%s]", reg_eax, rd_hex(reg_edx, 0x40).c_str());
@@ -1766,20 +3064,62 @@ static void hle_log(VHook &h) {
 
 static Bitu vpix_hle_cb(void) {
     uint32_t at = (uint32_t)(SegPhys(cs) + reg_eip - 4);
+    /* VPIX_ARM_POLL can arm before DOS/4GW has applied the fixups: the data reference then still holds the object-relative
+       offset. Re-read it on calls until the game's first frame (the relocated value is final by then). */
+    static bool dd_final = false;
+    if (!dd_final && ndataref) {
+        int32_t dd = (int32_t)(mem_readd(dataref_code[0] + code_delta) - dataref_target[0]);
+        if (dd != data_delta) { lg("HLE: data delta now %+d (was %+d: fixups applied after arming)", dd, data_delta); data_delta = dd; }
+        if (frame > 0) dd_final = true;
+    }
     auto it = hook_at.find(at);
     if (it == hook_at.end()) { lg("HLE: stray callback at %08X", at); return CBRET_NONE; }
     VHook &h = hooks[it->second];
+    if (ref_mode && at == ref_trap && !ref_loads.empty()) {
+        /* a native PIX_Load* returned here: load the same file for our renderer under the card's handle, then go back to the caller */
+        RefLoad rl = ref_loads.back(); ref_loads.pop_back();
+        const uint32_t got = reg_eax;
+        if ((int32_t)got >= 0) {
+            VHook tmp = h; tmp.name = rl.name;
+            forced_handle = got + 1; reg_eax = rl.fn;
+            hle_replace(tmp);
+            forced_handle = 0; reg_eax = got;
+        } else lg("%s \"%s\" -> %d on the card", rl.name.c_str(), rd_str(rl.fn).c_str(), (int32_t)got);
+        reg_eip = rl.ra - SegPhys(cs);
+        return CBRET_NONE;
+    }
+    if (h.mode == 'O') {
+        /* reference mode: our side effects, then the native function runs (below, as an L hook) */
+        const std::string &n = h.name;
+        if ((n == "PIX_LoadModel" || n == "PIX_LoadTexture" || n == "PIX_LoadBitmap") && ref_trap) {
+            uint32_t sp = SegPhys(ss) + reg_esp;
+            ref_loads.push_back({n, reg_eax, mem_readd(sp)});
+            mem_writed(sp, ref_trap - SegPhys(cs));          /* the native call returns into the trap */
+        } else if (n == "PIX_RenderSwap" || n == "PIX_Render" || n == "PIX_SetBufferClearMode") {
+            const uint32_t se = reg_eax, sd = reg_edx, sb = reg_ebx, sc = reg_ecx;
+            hle_replace(h);                                 /* frame build / clear colour: reads only, result ignored */
+            reg_eax = se; reg_edx = sd; reg_ebx = sb; reg_ecx = sc;
+        }
+    }
     if (h.mode == 'F') {
         /* host clock in seconds -> scratch slot at entry+16; the stub at entry+8 does fld [slot]; ret */
         double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - host_t0).count() * time_scale;
-        float f = (float)t; uint32_t u; memcpy(&u, &f, 4);
+        float f = h.name == "AWE32_loadWAV" ? zeneca_load_wav() : (float)t; uint32_t u; memcpy(&u, &f, 4);   /* ZENECA: sample length */
         mem_writed(at + 16, u);
         reg_eip = at + 8 - SegPhys(cs);
         h.calls++;
         return CBRET_NONE;
     }
     if (h.mode == 'R') {
+        /* stack-argument build: present args 1-4 the Watcom register way; restore the registers afterwards (register-
+           convention callers expect ebx/ecx/edx preserved, so a wrong cdecl guess can't corrupt them) */
+        uint32_t sv_edx = reg_edx, sv_ebx = reg_ebx, sv_ecx = reg_ecx;
+        if (h.cdecl_args) {
+            uint32_t sp = SegPhys(ss) + reg_esp;
+            reg_eax = mem_readd(sp + 4); reg_edx = mem_readd(sp + 8); reg_ebx = mem_readd(sp + 12); reg_ecx = mem_readd(sp + 16);
+        }
         uint32_t ret = hle_replace(h);
+        if (h.cdecl_args) { reg_edx = sv_edx; reg_ebx = sv_ebx; reg_ecx = sv_ecx; }
         h.calls++;
         uint32_t ra = mem_readd(SegPhys(ss) + reg_esp);
         reg_esp += 4 + h.retpop;
@@ -1788,8 +3128,36 @@ static Bitu vpix_hle_cb(void) {
     } else {
         hle_log(h);
         h.calls++;
-        reg_esp -= 4;                                   /* the push imm32 we overwrote */
-        mem_writed(SegPhys(ss) + reg_esp, h.imm);       /* EIP now sits on our NOP, then the CALL CHK */
+        if (h.pro[0] == 0x68) {
+            reg_esp -= 4;                                   /* the push imm32 we overwrote */
+            mem_writed(SegPhys(ss) + reg_esp, h.imm);       /* EIP now sits on our NOP, then the CALL CHK */
+        } else {
+            /* SU3000 builds have no stack-check prologue: re-run the overwritten instructions (push r32, mov r32,r32,
+               sub esp,imm; gen_hooks.py only emits L hooks whose first 5+ bytes are those) and resume after them */
+            uint32_t *R[8] = {&reg_eax, &reg_ecx, &reg_edx, &reg_ebx, &reg_esp, &reg_ebp, &reg_esi, &reg_edi};
+            int i = 0;
+            while (i < 5) {
+                uint8_t op = h.pro[i];
+                if (op >= 0x50 && op <= 0x57) { uint32_t v = *R[op - 0x50]; reg_esp -= 4; mem_writed(SegPhys(ss) + reg_esp, v); i += 1; }
+                else if ((op == 0x89 || op == 0x8B) && h.pro[i + 1] >= 0xC0) {
+                    int rm = h.pro[i + 1] & 7, rg = (h.pro[i + 1] >> 3) & 7;
+                    if (op == 0x89) *R[rm] = *R[rg]; else *R[rg] = *R[rm];
+                    i += 2;
+                }
+                else if (op == 0x83 && h.pro[i + 1] == 0xEC) { reg_esp -= (uint32_t)(int32_t)(int8_t)h.pro[i + 2]; i += 3; }
+                else if (op == 0x81 && h.pro[i + 1] == 0xEC) { reg_esp -= (uint32_t)h.pro[i + 2] | (uint32_t)h.pro[i + 3] << 8 | (uint32_t)h.pro[i + 4] << 16 | (uint32_t)h.pro[i + 5] << 24; i += 6; }
+                else if (op >= 0xB8 && op <= 0xBF) { *R[op - 0xB8] = (uint32_t)h.pro[i + 1] | (uint32_t)h.pro[i + 2] << 8 | (uint32_t)h.pro[i + 3] << 16 | (uint32_t)h.pro[i + 4] << 24; i += 5; }
+                else if (op == 0xE8) {                      /* call rel32: push the return address, continue at the target */
+                    const int32_t rel = (int32_t)((uint32_t)h.pro[i + 1] | (uint32_t)h.pro[i + 2] << 8 | (uint32_t)h.pro[i + 3] << 16 | (uint32_t)h.pro[i + 4] << 24);
+                    const uint32_t ret = at + i + 5;
+                    reg_esp -= 4; mem_writed(SegPhys(ss) + reg_esp, ret - SegPhys(cs));
+                    reg_eip = ret + (uint32_t)rel - SegPhys(cs);
+                    return CBRET_NONE;
+                }
+                else { lg("HLE: %s prologue byte %02X at +%d not emulated", h.name.c_str(), op, i); break; }
+            }
+            reg_eip = at + i - SegPhys(cs);
+        }
     }
     return CBRET_NONE;
 }
@@ -1855,7 +3223,7 @@ static void eip_sample(Bitu) {
         uint32_t v = mem_readd(SegPhys(ss) + reg_esp + 4 * i) - (uint32_t)code_delta;
         if (v >= 0x10000 && v < 0x100000) { snprintf(b, sizeof(b), " %06X", v); st += b; }
     }
-    lg("EIP %08X static %08X frame %lu stack%s", at, at - (uint32_t)code_delta, frame, st.c_str());
+    lg("EIP %08X static %08X frame %lu cs %04X:%08X pm %d v86 %d ss:esp %04X:%08X stack%s", at, at - (uint32_t)code_delta, frame, SegValue(cs), (unsigned)reg_eip, (int)cpu.pmode, (int)((reg_flags & FLAG_VM) != 0), SegValue(ss), (unsigned)reg_esp, st.c_str());
     static int n = 0;
     if (++n % 5 == 0) {                                  /* every 5 s: the 80x25 text screen */
         for (int y = 0; y < 25; y++) {
@@ -1869,13 +3237,59 @@ static void eip_sample(Bitu) {
 
 /* Called from the vpix I/O handlers on the first PIX port access (inside PIX_Open, before
    the game reaches PIX_InitChannel). Finds the game code in memory and patches the hooks. */
+/* VPIX_ARM_POLL=1 (SU3000 games): arm as soon as the game's code is in memory (poll every 50 ms), not on the first
+   PIX port access: their MPEG_Open runs before any PIX call and must already be answered by the HLE */
+static const bool arm_poll = getenv("VPIX_ARM_POLL") && atoi(getenv("VPIX_ARM_POLL"));
+static bool arm_hooks_loaded = false, arm_hooks_ok = false;
+/* bytes 0-4 get overwritten and must match exactly; later bytes may hold absolute addresses the loader relocated
+   (static + one of the deltas) */
+static bool match_prologue(const VHook &h, uint32_t rt, std::initializer_list<int32_t> deltas) {
+    bool match = true;
+        for (int i = 0; i < 16 && match; i++) {
+            if (mem_readb(rt + i) == h.pro[i]) continue;
+            match = false;
+            for (int k = (std::max)(h.mode == 'L' ? 5 : 1, i - 3); k <= i && !match; k++) {   /* R/F hooks never run their own bytes */
+                uint32_t live = mem_readd(rt + k), st = 0;     /* a dword may run past the 16-byte window */
+                for (int j = 0; j < 4; j++) st |= (uint32_t)(k + j < 16 ? h.pro[k + j] : (uint8_t)(live >> (8 * j))) << (8 * j);
+                for (int32_t dl : deltas) {   /* -0x10000: code addresses as immediates (LE object 1 at 0x10000; SU3000 MPEG/CTRL/TRK prologues) */
+                    uint32_t want = st + (uint32_t)dl; bool ok = true;
+                    for (int j = 0; j < 4 && k + j < 16; j++) if ((uint8_t)(want >> (8 * j)) != (uint8_t)(live >> (8 * j))) ok = false;
+                    if (ok) { match = true; i = k + 3; break; }
+                }
+            }
+        }
+    return match;
+}
+
 void VPIX_HLE_Arm(void) {
     if (tried) return;
-    tried = true;
+    if (!arm_poll) tried = true;
     const char *hp = getenv("VPIX_HOOKS");
-    if (!hp || !*hp) return;
-    if (strstr(hp, "PEARL")) { model_stride = 0x8C; model_shift = 0x20; }
-    const bool hooks_ok = load_hooks(hp);              /* may set model_stride ('modelstride' line) */
+    if (!hp || !*hp) { tried = true; return; }
+    if (!arm_hooks_loaded) {
+        arm_hooks_loaded = true;
+        if (strstr(hp, "PEARL")) { model_stride = 0x8C; model_shift = 0x20; }
+        arm_hooks_ok = load_hooks(hp);                  /* may set model_stride ('modelstride' line) */
+    }
+    if (arm_poll) {   /* pre-check: anchor loaded and the CPU in protected mode */
+        if (!(cpu.cr0 & 1)) return;
+        size_t ms = (size_t)MEM_TotalPages() * 4096; long at = -1;
+        for (size_t i = 0; i + 16 <= ms && at < 0; i++) if (MemBase[i] == anchor_pro[0] && !memcmp(MemBase + i, anchor_pro, 16)) at = (long)i;
+        if (at < 0) return;
+        /* DOS/4GW may still be loading the upper code pages (GUN 3000: the PCI library sat at zeros): wait for every hook site */
+        int32_t cd = (int32_t)((uint32_t)at - anchor_st);
+        for (auto &h : hooks) { uint32_t rt = h.st + cd; if ((size_t)rt + 4 <= ms && !memcmp(MemBase + rt, "\0\0\0\0", 4) && memcmp(h.pro, "\0\0\0\0", 4)) return; }
+        /* and for the relocations: patching first lets a fixup land on a planted stub (the F clock stub crashed) */
+        if (dataobj_base && ndataref && mem_readd(dataref_code[0] + cd) == dataref_target[0] - dataobj_base) return;
+        /* fixups go page by page: wait while any hook site still matches only with unrelocated (object-relative) values */
+        if (dataobj_base) {
+            int32_t dd = (int32_t)(mem_readd(dataref_code[0] + cd) - dataref_target[0]);
+            for (auto &h : hooks) { uint32_t rt = h.st + cd;
+                if (!match_prologue(h, rt, {dd, cd, (int32_t)-0x10000}) && match_prologue(h, rt, {-(int32_t)dataobj_base, cd, (int32_t)-0x10000})) return; }
+        }
+        tried = true;
+    }
+    const bool hooks_ok = arm_hooks_ok;
     if (getenv("VPIX_MODEL_STRIDE")) { model_stride = (uint32_t)strtoul(getenv("VPIX_MODEL_STRIDE"), NULL, 0); model_shift = 0xAC - model_stride; }
     if (model_stride != 0xAC) lg("model record stride 0x%X", model_stride);
     if (!hooks_ok) return;
@@ -1900,13 +3314,19 @@ void VPIX_HLE_Arm(void) {
         lg("HLE: dataref %08X -> %08X (static %08X) data delta %+d", dataref_code[k], rt, dataref_target[k], dd);
         if (k == 0) data_delta = dd; else if (dd != data_delta) lg("HLE: WARNING data delta mismatch");
     }
+    for (auto &g : globalrefs) lg("HLE: globalref %s -> %08X", g.first.c_str(), mem_readd(g.second + code_delta));
 
     /* hooks/<GAME>.patch: "poke <static code addr> <expected hex> <new hex>" byte patches (operator
        screens etc.); applied only where the expected bytes match, so other builds are left alone */
     {
         std::string pp(hp); size_t dot = pp.rfind(".hooks");
         if (dot != std::string::npos) pp = pp.substr(0, dot) + ".patch";
-        FILE *pf = dot != std::string::npos ? fopen(pp.c_str(), "r") : NULL;
+        /* VPIX_PATCH_EXTRA=<file>: one more patch file, opt-in (Boxing Duo: BOX_duo.patch) */
+        for (int pass = 0; pass < 2; pass++) {
+        const char *xp = getenv("VPIX_PATCH_EXTRA");
+        if (pass == 1 && !(xp && *xp)) break;
+        FILE *pf = pass == 1 ? fopen(xp, "r") : dot != std::string::npos ? fopen(pp.c_str(), "r") : NULL;
+        if (pass == 1) lg("HLE: extra patch file %s %s", xp, pf ? "opened" : "NOT FOUND");
         char line[512];
         while (pf && fgets(line, sizeof(line), pf)) {
             char kw[32], a[32], b[128], c[128];
@@ -1920,6 +3340,7 @@ void VPIX_HLE_Arm(void) {
             lg("HLE: poke %s %s", a, match ? "applied" : "SKIPPED (bytes differ)");
         }
         if (pf) fclose(pf);
+        }
     }
 
     CALLBACK_HandlerObject *cbo = new CALLBACK_HandlerObject();   /* lives for the session */
@@ -1930,22 +3351,7 @@ void VPIX_HLE_Arm(void) {
     for (size_t k = 0; k < hooks.size(); k++) {
         VHook &h = hooks[k];
         uint32_t rt = h.st + code_delta;
-        /* bytes 0-4 get overwritten and must match exactly; later bytes may hold absolute
-           addresses the loader relocated (static + code/data delta) */
-        bool match = true;
-        for (int i = 0; i < 16 && match; i++) {
-            if (mem_readb(rt + i) == h.pro[i]) continue;
-            match = false;
-            for (int k = (std::max)(h.mode == 'L' ? 5 : 1, i - 3); k <= i && !match; k++) {   /* R/F hooks never run their own bytes */
-                uint32_t live = mem_readd(rt + k), st = 0;     /* a dword may run past the 16-byte window */
-                for (int j = 0; j < 4; j++) st |= (uint32_t)(k + j < 16 ? h.pro[k + j] : (uint8_t)(live >> (8 * j))) << (8 * j);
-                for (int32_t dl : {data_delta, code_delta}) {
-                    uint32_t want = st + (uint32_t)dl; bool ok = true;
-                    for (int j = 0; j < 4 && k + j < 16; j++) if ((uint8_t)(want >> (8 * j)) != (uint8_t)(live >> (8 * j))) ok = false;
-                    if (ok) { match = true; i = k + 3; break; }
-                }
-            }
-        }
+        bool match = match_prologue(h, rt, {data_delta, code_delta, (int32_t)-0x10000});
         if (!match) { lg("HLE: %s prologue mismatch at %08X [%s] - skipped", h.name.c_str(), rt, rd_hex(rt, 16).c_str()); continue; }
         mem_writeb(rt + 0, 0xFE); mem_writeb(rt + 1, 0x38);            /* DOSBox callback opcode */
         mem_writeb(rt + 2, (uint8_t)(cb_num & 0xFF)); mem_writeb(rt + 3, (uint8_t)(cb_num >> 8));
@@ -1954,17 +3360,75 @@ void VPIX_HLE_Arm(void) {
             mem_writeb(rt + 8, 0xD9); mem_writeb(rt + 9, 0x05); mem_writed(rt + 10, rt + 16); mem_writeb(rt + 14, 0xC3);
         }
         hook_at[rt] = k; ok++;
+        if (ref_mode && h.name == "PIX_RunDebugger") ref_trap = rt;
     }
+    if (ref_mode) lg("HLE: reference card mode, load trap %s", ref_trap ? "at PIX_RunDebugger" : "MISSING (our own handles: models won't match)");
     lg("HLE: %d/%u hooks patched, callback %u", ok, (unsigned)hooks.size(), (unsigned)cb_num);
     PIC_AddEvent(eip_sample, 1000.0);
     fflush(flog);
     armed = ok > 0;
 }
 
+static void arm_poll_ev(Bitu) { VPIX_HLE_Arm(); if (!tried) PIC_AddEvent(arm_poll_ev, 50.0); }
+
+/* VPIX_KEYS="secs:key,secs:key,..." - keys pressed on this machine's keyboard at those times (seconds after start). Boxing's
+   linked bout needs its CONTROLLER machine (/vn3) driven from its keyboard like the arcade operator did: F5 = select player
+   machines one and two, F7 = Link Up, F12 = start a game that is ready on the selected machine, S = start machines early
+   (its CONTROL SCREEN help, BOX.EXE 0xCF62C). Keys: f1-f12, a-z, 0-9, space, enter, esc. */
+#include "keyboard.h"
+static std::vector<std::pair<double, KBD_KEYS>> key_script;
+static std::chrono::steady_clock::time_point key_t0;
+static size_t key_next = 0; static KBD_KEYS key_up = KBD_NONE;
+static void key_ev(Bitu) {
+    if (key_up != KBD_NONE) { KEYBOARD_AddKey(key_up, false); key_up = KBD_NONE; }
+    double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - key_t0).count();
+    if (key_next < key_script.size() && t >= key_script[key_next].first) {
+        key_up = key_script[key_next].second; KEYBOARD_AddKey(key_up, true);
+        lg("VPIX_KEYS t=%.1f s: key %d down", t, (int)key_up); key_next++;
+    }
+    if (key_next < key_script.size() || key_up != KBD_NONE) PIC_AddEvent(key_ev, 80.0);
+}
+static void keys_init() {
+    const char *e = getenv("VPIX_KEYS"); if (!e || !*e) return;
+    static const KBD_KEYS fk[12] = {KBD_f1, KBD_f2, KBD_f3, KBD_f4, KBD_f5, KBD_f6, KBD_f7, KBD_f8, KBD_f9, KBD_f10, KBD_f11, KBD_f12};
+    static const KBD_KEYS lk[26] = {KBD_a, KBD_b, KBD_c, KBD_d, KBD_e, KBD_f, KBD_g, KBD_h, KBD_i, KBD_j, KBD_k, KBD_l, KBD_m, KBD_n, KBD_o, KBD_p, KBD_q, KBD_r, KBD_s, KBD_t, KBD_u, KBD_v, KBD_w, KBD_x, KBD_y, KBD_z};
+    static const KBD_KEYS dk[10] = {KBD_0, KBD_1, KBD_2, KBD_3, KBD_4, KBD_5, KBD_6, KBD_7, KBD_8, KBD_9};
+    std::string s(e); size_t p = 0;
+    while (p < s.size()) {
+        size_t q = s.find(',', p); if (q == std::string::npos) q = s.size();
+        std::string it = s.substr(p, q - p); p = q + 1;
+        size_t c = it.find(':'); if (c == std::string::npos) continue;
+        double t = atof(it.c_str()); std::string k = it.substr(c + 1);
+        std::transform(k.begin(), k.end(), k.begin(), ::tolower);
+        KBD_KEYS kk = KBD_NONE;
+        if (k.size() >= 2 && k[0] == 'f' && isdigit((unsigned char)k[1])) { int n = atoi(k.c_str() + 1); if (n >= 1 && n <= 12) kk = fk[n - 1]; }
+        else if (k == "space") kk = KBD_space; else if (k == "enter") kk = KBD_enter; else if (k == "esc") kk = KBD_esc;
+        else if (k.size() == 1 && k[0] >= 'a' && k[0] <= 'z') kk = lk[k[0] - 'a'];
+        else if (k.size() == 1 && k[0] >= '0' && k[0] <= '9') kk = dk[k[0] - '0'];
+        if (kk != KBD_NONE) key_script.push_back({t, kk});
+    }
+    std::sort(key_script.begin(), key_script.end(), [](const std::pair<double, KBD_KEYS> &a, const std::pair<double, KBD_KEYS> &b) { return a.first < b.first; });
+    key_t0 = std::chrono::steady_clock::now();
+    if (!key_script.empty()) PIC_AddEvent(key_ev, 80.0);
+}
+
+/* Buggy Ball native rebuild (VPIX_NATIVE=buggy): no DOS game, our own loop on the HLE mixer + renderer */
+#include "vpix_seat.h"
+#include "vpix_voice.h"
+#include "vpix_buggy.h"
+
 void VPIX_HLE_Init(const char *logbase) {
+    if (getenv("VPIX_NATIVE") && !strcmp(getenv("VPIX_NATIVE"), "buggy")) {
+        if (!(getenv("VPIX_WINDOW") && atoi(getenv("VPIX_WINDOW")) == 0)) VPIX_Render_Start();
+        buggy::start(logbase);
+        return;
+    }
     if (!getenv("VPIX_HOOKS")) return;
+    log_base = logbase;
+    if (arm_poll) PIC_AddEvent(arm_poll_ev, 50.0);
     std::string b = logbase;
     flog = fopen((b + ".calls").c_str(), "w");
+    keys_init();
     if (getenv("VPIX_PLAY")) CALL_LOG_MAX = 20000;
     if (!getenv("VPIX_PLAY")) fscene = fopen((b + ".scene").c_str(), "wb");   /* scene snapshots: debugging only */
     const char *e;
@@ -1977,6 +3441,7 @@ void VPIX_HLE_Init(const char *logbase) {
     if ((e = getenv("VPIX_HAND_XY")) != NULL) hand_xy = (float)atof(e);
     if ((e = getenv("VPIX_TRACKER")) != NULL) track_on = atoi(e) != 0;
     if ((e = getenv("VPIX_FREEPLAY")) != NULL) free_play = atoi(e) != 0;
+    if ((e = getenv("VPIX_START_BITS")) != NULL) start_bits = strtoul(e, NULL, 0);
     if ((e = getenv("VPIX_SOUND")) != NULL) sound_on = atoi(e) != 0;
     if ((e = getenv("VPIX_SOUND_GAIN")) != NULL && atof(e) > 0) snd_gain = (float)atof(e);
     lg("VPIX HLE ready (snap every %lu frames, max %lu)", snap_every, snap_max);

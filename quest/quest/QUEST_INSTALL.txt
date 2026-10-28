@@ -1,0 +1,79 @@
+MallVR FOR META QUEST 0.1 - TEST BUILD - HOW TO INSTALL
+=========================================================
+MallVR plays the 1990s Virtuality arcade VR games (Dactyl Nightmare, Pac-Man VR, Zone Hunter, Boxing, Buggy Ball ...) on the
+headset itself: no PC needed to play. Quest 2, Quest 3, Quest 3S, Quest Pro.
+
+THIS IS A TEST BUILD. Nobody has run it on a Quest yet: you are the first. If something goes wrong, that's useful too.
+Please press REPORT A PROBLEM afterwards (step 6), whether it worked or not.
+
+You need: the headset, the Meta Horizon phone app, a PC or Mac with a USB-C DATA cable (once, to install), Wi-Fi.
+Files: MallVR-Quest-0.1.apk (the app). MallVR-Quest-0.1-source.zip is its source code (GPL); you don't need it to play.
+
+
+1. DEVELOPER MODE (once per headset)
+   Apps from outside the Meta store need Developer Mode. It's free, it's switched on from the phone app, not the headset.
+   a) Make a Meta developer account / organisation: developers.meta.com/horizon (sign in with your Meta account, create an
+      organisation, verify the account as asked; you must be 18+).
+   b) Phone: Meta Horizon app > the headset icon > your headset > Headset settings > Developer mode > ON.
+   c) Restart the headset.
+   Meta's own page: developers.meta.com/vr/documentation/android-apps/enable-developer-mode/ (or search "Meta Quest enable
+   developer mode"). Menu names change with app updates.
+
+2. INSTALL THE APK (SideQuest, the easy way)
+   a) Install SideQuest (sidequestvr.com, "Advanced Installer") on the PC/Mac. Windows may also ask for Meta's ADB driver.
+   b) Plug the headset in with the USB-C cable, put it on: "Allow USB debugging?" -> tick Always allow from this computer -> Allow.
+      SideQuest's top left dot turns green.
+   c) Drag MallVR-Quest-0.1.apk onto the SideQuest window (or the "Install APK file from folder" button). Wait for "Success".
+   Command line instead:  adb install -r MallVR-Quest-0.1.apk
+
+3. OPEN MALLVR
+   Headset: App Library > top right filter > Unknown Sources > MallVR. It opens as a flat window (the launcher).
+
+4. ALLOW FILE ACCESS (first start)
+   MallVR keeps everything in the "MallVR" folder of the headset storage (games, logs, settings), so it survives reinstalls.
+   Press ALLOW FILE ACCESS, switch "Allow access to manage all files" on for MallVR, then go back.
+   No such screen on your headset? From the PC (headset plugged in):
+      adb shell appops set --uid com.gainesphere.mallvr MANAGE_EXTERNAL_STORAGE allow
+
+5. GET THE GAMES (MallVR ships no game files)
+   Easiest: press GET GAMES and GET each item. MallVR downloads the community's archive.org copies straight onto the headset
+   and unpacks them. Keep the headset awake on Wi-Fi; if a download stops, press GET again and it carries on.
+      Virtuality SU2000 HDD Dump    173 MB   most games
+      Pac-Man VR with music files   126 MB   Pac-Man VR's CD (Pac-Man needs it)
+      SU3000 / 2000E HDD Dump       217 MB   Total Recoil, Zero Hour, Zeneca Migraine
+      Buggy Ball game data           10 MB   Buggy Ball
+   Already have the PC version? Copy its "games" folder over USB instead: with the headset plugged in it appears in Windows
+   Explorer (allow access in the headset) as "Quest ... > Internal shared storage". Put the folder at:
+      Internal shared storage\MallVR\games\
+   (same layout as on the PC: ...\games\VR 2000 Series Disc Image (Simon's)\DAC\DAC.EXE, PACMAN.CUE + PACMAN.BIN, ...)
+   Back in the launcher press CHECK AGAIN: games you have turn green (READY).
+   MallVR also asks once whether to send anonymous PLAY NOTES (which games, how long, frame rate, headset model, whether VR
+   started, crashes; no names, no account). Please say yes for this test build: it tells us what works without you writing
+   anything. Off unless you say yes; the PLAY NOTES button changes it any time.
+
+6. PLAY, AND TELL US WHAT HAPPENED
+   START puts you in the game. Controls are the PC version's Touch layout: trigger = fire / throttle, A = game button
+   (Dactyl: crouch), B = coin / start, sticks = walk and turn, Y held = adjust aim and reach.
+   Back to the launcher: press and keep holding A + B for about a second.
+   The Meta button still opens the headset's own menu (Quit closes the game too).
+
+   Then in the launcher: REPORT A PROBLEM. Write one line (which game, what you saw: black screen? wrong colours? too slow? it
+   worked?), press SEND TO MALLVR. It sends your headset model, its system version, MallVR's version and the logs of your last
+   game. No name, account or location. A copy is saved in the headset's Download folder: if sending fails, post that zip in
+   the MallVR Discord, #bug-reports.
+
+KNOWN IN 0.1
+   - Solo only. Online play with PC players (crossplay) is the next step.
+   - Total Recoil's movies don't play yet (the PC uses ffmpeg; the Quest version needs its own player).
+   - Voice chat isn't on the Quest yet.
+   - First-run things we're watching for: picture too dark/bright, floor height wrong, slow games. Your report tells us.
+
+TESTER SWITCHES (only if we ask you to)
+   Internal shared storage\MallVR\settings\quest_extra.conf: lines added to every game's DOSBox-X settings, e.g.
+      [cpu]
+      core=dynamic
+
+UNINSTALL
+   SideQuest > Installed apps, or: adb uninstall com.gainesphere.mallvr. Your MallVR folder (games, scores) stays.
+
+MallVR is free software (GNU GPL v2 or later). Credits and licences: the ABOUT button. gainesphere.com/pages/mallvr

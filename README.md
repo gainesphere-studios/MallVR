@@ -10,18 +10,23 @@ MallVR is a modified [DOSBox-X](https://github.com/joncampbell123/dosbox-x). The
 
 ## What works
 
-- Dactyl Nightmare, Dactyl Nightmare 2, Pac-Man VR, Zone Hunter, Ghost Train, Virtuality Boxing, Missile Command VR, Olin Shotgun, Shoot For Loot
-- SteamVR headsets (developed on an HTC Vive), or a desktop window
+- 14 games: Dactyl Nightmare, Dactyl Nightmare 2, Pac-Man VR, Zone Hunter, Ghost Train, Virtuality Boxing, Missile Command VR, Olin Shotgun, Shoot For Loot, Sea Diving (Pearl), Buggy Ball, plus the SU3000 games Total Recoil, Zero Hour and Zeneca Migraine
+- SteamVR headsets (developed on an HTC Vive), or a desktop window; a 32-bit build for older Windows
+- Meta Quest, standalone (no PC needed): see [`quest/`](quest/)
 - Linked pods: the original pod network card is emulated, so linked games run between copies on one PC, on a home network, or online (QUICK MATCH)
 - Controller rumble, crouch, arm reach and aim trims, self-update
 
 **MallVR ships no game files.** Bring your own copy of the SU2000 software.
 
+## Meta Quest
+
+[`quest/`](quest/) holds the source of **MallVR Quest**, the first DOSBox-X running on Meta Quest: the same engine built for Android with OpenXR, a headset launcher, play notes and REPORT A PROBLEM. Build steps are in `quest/README_SOURCE.txt`. The APK and install guide are on the [download page](https://gainesphere.com/pages/mallvr-download#quest).
+
 ## Play online
 
 The pods were cabled together in the arcade; MallVR links them over the internet the same way: one arena, one shared scoreboard. Open `MallVR_Launcher.bat`, pick a linkable game, click **ONLINE**, then **QUICK MATCH**. It pairs you with another player and starts the match by itself. No server to set up, no IP addresses to type.
 
-Online play is live for Dactyl Nightmare (Citizen build), with Zone Hunter and Pac-Man next. Step-by-step instructions: [gainesphere.com/pages/mallvr-download](https://gainesphere.com/pages/mallvr-download) (the "Play online" section). Need someone to play? Find a match on the [Discord](https://discord.gg/7tDn2AAXEC) and use its voice channels while you play.
+Step-by-step instructions: [gainesphere.com/pages/mallvr-download](https://gainesphere.com/pages/mallvr-download) (the "Play online" section). Need someone to play? Find a match on the [Discord](https://discord.gg/7tDn2AAXEC) and use its voice channels while you play.
 
 ## Join the MallRats
 
