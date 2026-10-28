@@ -40,7 +40,7 @@ MallVR is built with its players. Here is how to get involved:
 - **Report bugs:** open an [issue](../../issues) with your game, headset (or window mode) and what happened. Logs are in MallVR's `logs` folder.
 - **Share what you know:** if you worked on, ran or owned Virtuality pods, we want your stories, photos, manuals and settings. Every detail helps the emulation get closer to the real thing.
 - **Build with us:** code, fixes and new tools are welcome as pull requests. New games and experiences for this platform, even walkable 3D movies, are on the roadmap.
-- **Back the work:** [Citizens](https://ko-fi.com/mallvr/tiers) ($7 a month) get each newly restored game first, early builds and a vote on what comes next; tips on [Ko-fi](https://ko-fi.com/mallvr) pay for voice chat and more online games. About one to two years after a game launches for Citizens, it moves into the free version.
+- **Back the work:** [Citizens](https://ko-fi.com/mallvr/tiers) ($7 a month) get early test builds of new games and features, a vote on what we build next, the Citizen channel on the Discord and priority support. Every finished game stays free for everyone. Tips on [Ko-fi](https://ko-fi.com/mallvr) fund what's next: a Quest test headset first, then two-player Pac-Man online and our own original games.
 
 More from Gainesphere Studios, including 3D files and other projects, will be published here on GitHub.
 
