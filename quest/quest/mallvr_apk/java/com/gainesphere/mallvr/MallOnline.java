@@ -32,7 +32,7 @@ public class MallOnline {
         }
     }
 
-    public static final int LAN_PORT = 27209, NET_PROTO = 2;
+    public static final int LAN_PORT = 27209, NET_PROTO = 3;   // 3: S carries the host's game options (opt=, MallOnline.cs)
     public static final int HOST_PORT = envPort("MALLVR_HOST_PORT", 27200);
     static int envPort(String v, int d) { try { int p = Integer.parseInt(System.getenv(v)); return p > 1024 && p < 65536 ? p : d; } catch (Exception e) { return d; } }
     public volatile String listUrl = "", name = "PLAYER", version = "", key = "";
@@ -47,6 +47,9 @@ public class MallOnline {
     int maxOf(String g) { synchronized (maxFor) { Integer m = maxFor.get(g); return m != null ? m : 2; } }
     String sha1Of(String g) { synchronized (sha1For) { String h = sha1For.get(g); return h != null ? h : ""; } }
     public volatile int goPod;
+    // the host's OPTIONS for the game being started (opt= in S, "time:60,death:1"; "none" = each pod's own files). This app has no
+    // OPTIONS tab yet, so a Quest host sends none. MallVR.plan applies them like play.ps1 -Options.
+    public volatile String options = "none";
     public volatile boolean inGame;
     public String lanIp = "";
     public volatile boolean quick;
@@ -77,6 +80,7 @@ public class MallOnline {
     String proposeGame = "";
     long proposeAt;
     public String switchNote = "", joinVia = "";
+    public volatile String matchId = "";                  // host id + START / switch number, the same on every pod (MallOnline.cs)
     public double joinSecs;
     long joinAt, startAt, hostedAt;
 
@@ -183,6 +187,10 @@ public class MallOnline {
     String switchPacket(int sq, String g) {
         StringBuilder b = new StringBuilder("S\t" + sq + "\t" + g);
         for (Member m : members) b.append('\t').append(!m.id.isEmpty() ? m.id : m.name).append('=').append(m.pod);
+        options = "none";
+        b.append("\topt=none");
+        matchId = id + "-" + sq;
+        b.append("\tmatch=").append(matchId);
         return b.toString();
     }
 
@@ -467,12 +475,16 @@ public class MallOnline {
         else if (k == 'S') {
             if (f.length < 3) return;
             int sq, pod = 0;
+            String opt = "none";
             try { sq = Integer.parseInt(f[1]); } catch (Exception e) { return; }
             for (int i = 3; i < f.length; i++) {
                 String[] kv = f[i].split("=");
                 if (kv.length == 2 && (kv[0].equals(id) || kv[0].equals(name))) try { pod = Integer.parseInt(kv[1]); } catch (Exception e) { }
+                else if (kv.length == 2 && kv[0].equals("match")) matchId = kv[1].replaceAll("[^0-9a-f-]", "");
+                else if (kv.length == 2 && kv[0].equals("opt")) { opt = kv[1].replaceAll("[^A-Za-z0-9:,]", ""); if (opt.isEmpty() || opt.length() > 200) opt = "none"; }
             }
             if (sq <= seenSwitch) return;
+            options = opt;
             seenSwitch = sq; seenSeq = Math.max(seenSeq, sq); promptSeq = 0;
             String g = clean(f[2], 10);
             if (pod < 2 || pod > 4) { if (answered != sq) { leave(); note = "THE GROUP WENT TO " + g + " WITHOUT YOU"; } return; }

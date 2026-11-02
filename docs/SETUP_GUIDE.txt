@@ -6,15 +6,24 @@ MALLVR - SETUP GUIDE
    C:\Games\MallVR. Avoid C:\Program Files.
 
 2. GAME FILES
-   This download has no game files. For Pac-Man VR you need:
-     - the Virtuality SU2000 HDD dump (archive.org item "su2000-hdd-files"): copy the folder
-       "VR 2000 Series Disc Image (Simon's)" into the games folder
-     - the Pac-Man VR CD image, PACMAN.CUE + PACMAN.BIN (archive.org item
-       "drive-download-20240331T000417Z-001", inside its pacman.zip), put in the games folder
-   Step by step, with links: gainesphere.com/pages/mallvr-download
+   This download has no game files. Get them from archive.org:
+     - SU2000 games (Dactyl Nightmare 1 + 2, Pac-Man VR, Missile Command, Olin Shotgun,
+       Boxing, Zone Hunter, Ghost Train, Shoot For Loot, Sea Diving):
+       https://archive.org/details/su2000-hdd-files
+       (inside: the "VR 2000 Series Disc Image (Simon's)" folder)
+     - Pac-Man VR CD image, PACMAN.CUE + PACMAN.BIN (inside its pacman.zip):
+       https://archive.org/details/drive-download-20240331T000417Z-001
+     - Total Recoil, Zero Hour + Zeneca Migraine (SU3000 drive, su3000.zip):
+       https://archive.org/details/su3000
+     - Buggy Ball game data (Buggy.7z; MallVR rebuilds the game, the original BALL.EXE is lost):
+       https://archive.org/details/buggy.-7z
+   Unzip each one, as it is, into the games folder. Subfolders are fine - the
+   launcher searches the whole games folder. Do not rename the game folders.
    Example:
-     games\VR 2000 Series Disc Image (Simon's)\PAC\PAC.EXE
-     games\PACMAN.CUE  (and PACMAN.BIN beside it)
+     games\VR 2000 Series Disc Image (Simon's)\DAC\DAC.EXE
+     games\Pac-Man CD\PACMAN.CUE
+     games\su3000\ZERO\ZERO.EXE
+     games\Buggy\BALL\RUNFILES\CARS.DBS
 
 3. CHECK
    Double-click Check_My_Games.bat. Every game should say READY.
@@ -51,6 +60,29 @@ MALLVR - SETUP GUIDE
      2. Change the line  check_on_launch = yes  to  check_on_launch = no
      3. Save and close. From then on, MallVR only looks for updates when you run
         Update.bat. To turn it back on, change the no back to yes.
+
+3D SIDE-BY-SIDE (a head-mounted display that takes a 1920 x 1080 SBS picture)
+   In the launcher pick WINDOW, then click 3D OFF until it says 3D SBS or
+   3D HALF-SBS. MallVR then opens a borderless 1920 x 1080 window: left eye in
+   the left half, right eye in the right half, each at the game's own 4:3.
+     3D SBS       each eye 960 x 720, black bars above and below
+     3D HALF-SBS  each eye squeezed to 720 x 1080; for displays that stretch
+                  each half back to full width (it then shows 4:3)
+   Which screen: add a line  sbs_monitor = 2  to settings\launcher.txt (1, 2,
+   3 ... in the order Windows lists them; logs\<game>.render lists them with
+   their positions). Without it the window opens on the main display.
+   Adjust it with the headset on (keys work while the 3D window is in front;
+   values show in the picture and are kept for next time):
+     F1 show / hide the values      F2 / F3   eye distance (3D strength)
+     F4 / F5 picture size           F6 / F7   pictures closer / apart (lenses)
+     F8 / F9 picture down / up      F10       swap left / right eyes
+     F11 SBS <-> HALF-SBS           F12       depth of the score / text
+     Page Down  next screen         Page Up   detail 100 / 75 / 50 % (slow PC)
+     Home  reset all                Esc       quit
+   If the keys do nothing, click inside the 3D picture once. If the 3D looks
+   inside out or hurts, press F10. Mouse + keyboard play as in window mode
+   (docs\CONTROLS.txt). Works without SteamVR, so Windows 7 64-bit is fine for
+   this mode once PowerShell 5.1 is installed.
 
 FIXING PROBLEMS
    Nothing happens / a box says the game was not found

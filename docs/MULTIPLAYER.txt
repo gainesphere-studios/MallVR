@@ -1,0 +1,119 @@
+MALLVR - LINKED PODS (MULTIPLAYER)
+==================================
+
+In the arcades, Virtuality pods were cabled together so players could share one game.
+MallVR links copies of itself the same way, in the games that linked up in the arcades:
+
+DACTYL NIGHTMARE (4-player arena: STING, VEGA, STEALTH, BLAIZE). Pod 1 presses START,
+pod 2 joins by itself. With one person per pod, the two empty seats are computer players.
+
+DACTYL NIGHTMARE 2 links the same way as Dactyl Nightmare.
+
+SEA DIVING links the same way too: 4 divers, two of them computer divers when two people play.
+
+GHOST TRAIN (2 players, the red car and the blue car on one ride). It starts differently:
+BOTH players press START (top button). The second press links the two pods.
+
+BUGGY BALL (up to 4 players). Player 1 pulls the trigger on the title to start the match
+for everyone; every pod picks its own car. Empty cars are driven by the computer.
+(Buggy Ball is our rebuild from the game data: the original BALL.EXE is still missing.)
+
+VIRTUALITY BOXING (2 players, head to head). The arcade's two-boxer pod ran both boxers on one
+PC; MallVR does the same on pod 1's PC, and pod 2 boxes from its own headset (or window): it sends
+your moves over and shows your boxer's view. Both players press START (B), then punch to pick a
+boxer. Works on one PC, two PCs at home, and online.
+
+SHOOT FOR LOOT (2 players). Each player pulls the trigger to start; you race each other
+for loot, each in your own rooms (pod 1 is the master).
+
+TAKING TURNS WITH THE COMPUTER: with fewer than 4 people, linked games alternate. The first
+match is people only (head to head), the next one the computer fills the empty seats, and so
+on (Dactyl Nightmare 1 and 2, Buggy Ball).
+
+The other games were single-player in the arcades and stay that way.
+
+How a linked Dactyl Nightmare (1 or 2) or Sea Diving game starts
+   Pod 1 is the "master": its player presses START (right menu button, or 1 on the
+   keyboard). Pod 2 joins by itself within a few seconds. You do not press start on
+   pod 2. If pod 2 isn't ready yet, pod 1 waits up to 20 seconds for it, then plays a normal game.
+
+PLAY ONLINE (anywhere: easiest)
+   Before you start: put the Virtuality HDD dump in the games folder (Check_My_Games.bat
+   says READY for Dactyl Nightmare). For the headset, turn it on and start SteamVR first.
+
+   1. Double-click MallVR_Launcher.bat.
+   2. Choose HEADSET or WINDOW, then click ONLINE.
+   3. Click QUICK MATCH. It plays ANY GAME you both have (click the game name first if you
+      only want one game). MallVR looks for another player who is searching too. If nobody
+      is, it waits for one ("WAITING FOR ANOTHER PLAYER..."). When you're paired it counts
+      down 3-2-1 and the game opens by itself. CANCEL stops looking.
+   4. In the game (Dactyl Nightmare 1 or 2, Sea Diving; the others start as described at
+      the top): the player whose screen says pod 1 (the host) presses START
+      (headset: menu button; window: 1). The other player does NOT press start: their
+      game joins by itself within a few seconds.
+   5. Both see FOCUS VISETTE / WAITING FOR OPPONENT: each player pulls the trigger
+      (window: Space or left click). A moment later you're both in the same arena with
+      one shared scoreboard.
+   6. When the game ends, close the game window: you're back on the ONLINE screen, still
+      together as a group. The host presses START for another round, or clicks the game name
+      first to pick another game everyone has. LEAVE (or CANCEL for the host) ends the group.
+
+   SWITCH GAME without stopping (headset): the host holds A + B for the Button Masher Menu and
+   picks SWITCH GAME, then the game. Everyone else gets GO / STAY OUT for 10 seconds (no
+   answer = GO, so nobody has to let go of the controls). Every PC closes its game and opens
+   the new one, linked to the same group. Everyone needs v0.11.2 or newer for this.
+
+   Your name: you start as PLAYER482 or similar. Click the name on the ONLINE screen,
+   type your own (up to 12 letters), press Enter. MallVR remembers it.
+
+   First time only: Windows may ask whether PowerShell may use the network (that's MallVR's
+   online part). Click Allow. Since v0.12.0 the games themselves (DOSBox-X) only talk to your own
+   PC during online play, so they don't need to be allowed. If you said no by mistake:
+   Windows Security > Firewall > Allow an app > Windows PowerShell. (LINK NETWORK, two PCs in
+   one house, still needs DOSBox-X allowed on private networks.)
+
+   Hosting and your router: nothing to set up. MallVR asks your router to open UDP port
+   27200 (UPnP); if the router says no (common, and always with two routers in a row, like
+   a fiber box plus your own Wi-Fi router), the two PCs "punch through" instead: each asks a
+   public STUN server which address the internet sees, then both send to each other at once,
+   which both routers allow. Very strict routers (some office / phone networks) can still
+   block it: then let the other player host.
+
+   MORE OPTIONS (for people who like to pick)
+   Shows everyone online and every open game. HOST a game yourself, or JOIN one from the
+   list; the host presses START when everyone's in. PCs in the same house find each
+   other here even without internet.
+
+   Window mode: the mouse locks into the game window to look around. TAB lets it go
+   (and locks it back), ESC closes the game. More in docs\CONTROLS.txt.
+   Voice chat: built in, in every linked and online game. Your mic starts ON (the headset's
+   mic when Windows uses it as the recording device). Click the LEFT stick to turn it off,
+   click again to turn it on (short buzz = off, long buzz = on). Window mode: M.
+   Only sends while you talk. To switch it off for good: set MALLVR_VOICE=0 in Windows.
+
+TWO PLAYERS ON ONE PC
+   Double-click Link_<game>_This_PC.bat (for example Link_Dactyl_Nightmare_This_PC.bat).
+   Player 1 wears the headset. Player 2 plays in a window on the monitor with the
+   keyboard (J/L/I/K look, Space fire, W walk; click the window first).
+
+TWO PCs ON THE SAME HOME NETWORK (each with MallVR, the games and a headset)
+   1. On both PCs, double-click the same Link_<game>_Network.bat.
+   2. It shows that PC's own address (IPv4, like 192.168.1.20). Type 1 as the pod
+      number on one PC and 2 on the other, then type the OTHER PC's address.
+   3. The first time, Windows asks whether DOSBox-X may use the network: allow it on
+      private networks. (Uses UDP ports 27101-27104.)
+   4. Start pod 2 first, then press start on pod 1.
+
+Who is in the arena
+   The arcade pods were "Duo" machines with two player places each, so a linked game
+   is always 4 players. With one person per pod, the other two (VEGA and BLAIZE) are
+   played by the game's own computer opponent, like in a single-player game. It's every
+   player for themselves: each computer player hunts whoever is nearest, human or not.
+   The red "no entry" sign is the game's own warning that you are at the edge of a
+   platform and can't walk further that way.
+
+Each pod keeps its own settings and high scores in settings\pod1, settings\pod2.
+
+Advanced: MallVR.bat dac -Pod <1-4> [-Peers host[:port],...] [-Desktop]
+Online play shows your name, the game you're in and, while you host, your internet address to other
+MallVR players (that's how they connect to you). Nothing else is sent.

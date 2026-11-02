@@ -20,6 +20,21 @@ index 719e5ed..85de475 100644
          GUS_Init();
          IDE_Init();
          IMFC_Init();
+diff --git a/vs/config.h b/vs/config.h
+index 36f5274..fd0bd1d 100644
+--- a/vs/config.h
++++ b/vs/config.h
+@@ -99,7 +99,9 @@
+ #elif defined(_M_ARM64) || defined (_M_ARM) /* Microsoft C++ arm32 and arm64 */
+ # undef C_FPU_X86
+ #else
+-# define C_FPU_X86 1
++/* MallVR 2026-10-26: the 32-bit build uses the portable C FPU like x64. With the x87 assembly core the SU2000 games' own
++   float maths came out as infinity (light vectors 0x7F800000; DevilMaster's stock 32-bit DOSBox-X: "Domain error in pow"). */
++# undef C_FPU_X86
+ #endif
+ 
+ /* Define to 1 to enable freetype support */
 diff --git a/vs/dosbox-x.vcxproj b/vs/dosbox-x.vcxproj
 index 95401e5..87d7702 100644
 --- a/vs/dosbox-x.vcxproj

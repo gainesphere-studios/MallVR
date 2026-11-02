@@ -1,0 +1,4 @@
+# Ghost Train v01.00.11 (SD2000 Duo / Jebus7754 dump) byte patches, ported from GHOST.patch (2026-10-24).
+# Operator screen 180 s countdown -> 0.5 s (same instruction as GHOST.patch 00043B2E, moved +0x2E0 in this build)
+poke 00043E0E c745d400003443 c745d40000003f
+# Link fix (GHOST.patch 0003CF4F / 0004C16D) NOT ported: those sites hold relocated addresses; check whether this build sets the link word first.

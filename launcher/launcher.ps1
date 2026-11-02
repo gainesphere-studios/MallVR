@@ -8,15 +8,18 @@ $ErrorActionPreference = 'Stop'
 $Engine = $PSScriptRoot
 $Root = Split-Path -Parent $Engine
 . (Join-Path $Engine 'games.ps1')
+. (Join-Path $Engine 'options.ps1')
 $logs = Join-Path $Root 'logs'; $settings = Join-Path $Root 'settings'
 New-Item -ItemType Directory -Force $logs, $settings | Out-Null
 
 Add-Type -AssemblyName System.Windows.Forms, System.Drawing
-if (-not [Environment]::Is64BitOperatingSystem) {   # the engine is 64-bit: say so instead of a game that never opens
+# 32-bit Windows: the 32-bit engine in engine\x86, window mode only (DevilMaster 10-22; SteamVR needs 64-bit Windows)
+$x86 = -not [Environment]::Is64BitOperatingSystem
+if ($x86 -and -not (Test-Path -LiteralPath (Join-Path $Engine 'x86\dosbox-x.exe'))) {
     [void][System.Windows.Forms.MessageBox]::Show("MallVR needs 64-bit Windows 10 or 11.`n`nThis PC runs 32-bit Windows, which can't start MallVR's engine (with or without a headset).", 'MallVR', 'OK', 'Error')
     exit 1
 }
-$cs = @((Join-Path $Engine 'MallLauncher.cs'), (Join-Path $Engine 'MallOnline.cs'), (Join-Path $Engine 'MallGetGames.cs'), (Join-Path $Engine 'MallVrPanel.cs'), (Join-Path $Engine 'MallNotes.cs'), (Join-Path $Engine 'openvr_api.cs'))
+$cs = @((Join-Path $Engine 'MallLauncher.cs'), (Join-Path $Engine 'MallHall.cs'), (Join-Path $Engine 'MallOnline.cs'), (Join-Path $Engine 'MallGetGames.cs'), (Join-Path $Engine 'MallVrPanel.cs'), (Join-Path $Engine 'MallNotes.cs'), (Join-Path $Engine 'openvr_api.cs'))
 $tag = (($cs | ForEach-Object { (Get-FileHash -LiteralPath $_ -Algorithm SHA1).Hash.Substring(0, 4) }) -join '')
 $dll = Join-Path $logs "MallLauncher_$tag.dll"
 if (-not (Test-Path $dll)) {
@@ -24,6 +27,13 @@ if (-not (Test-Path $dll)) {
     Add-Type -Path $cs -ReferencedAssemblies System.Windows.Forms, System.Drawing, System.Net, System.IO.Compression -OutputAssembly $dll
 }
 Add-Type -Path $dll
+# the Gainesphere intro (MallHall.cs, MallIntro) plays while the games are found and SteamVR starts; 'intro = 0' in
+# settings\launcher.txt (or VPIX_NOSPLASH) turns it off
+$sfIntro = Join-Path $settings 'launcher.txt'
+if (-not $Shot -and -not $env:VPIX_NOSPLASH -and -not ((Test-Path -LiteralPath $sfIntro) -and (Select-String -LiteralPath $sfIntro -Pattern '^\s*intro\s*=\s*0' -Quiet))) {
+    [MallIntro]::Start((Join-Path $Engine 'hall\intro'))
+}
+[HallData]::Preload((Join-Path $Engine 'hall'), $settings, [MallLauncher]::EraPods)   # the hall's pictures + text, while the intro plays
 
 # which games are in the games folder: <CODE>\<CODE>.EXE, as play.ps1 looks for them. Looked for again each time the game select
 # screen opens (GET GAMES may have just unpacked some).
@@ -34,7 +44,7 @@ Get-ChildItem -LiteralPath (Join-Path $Root 'games') -Recurse -Filter '*.EXE' -F
         $c = $_.BaseName.ToUpper()
         if ($_.Directory.Name -ine $c) { return }
         # SU3000 games keep their own EXE name (GUN\GUN.EXE = Total Recoil, ZERO\ZERO.EXE = Zero Hour): tell them apart by SHA1, as play.ps1 does
-        $su3k = @($Games.Keys | Where-Object { $Games[$_].Su3k -and $Games[$_].Exe -ieq $c })
+        $su3k = @($Games.Keys | Where-Object { ($Games[$_].Su3k -or $Games[$_].VersionOf) -and $Games[$_].Exe -ieq $c })   # (other builds too, games.ps1 VersionOf)
         if ($su3k.Count) {
             $h = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA1).Hash.ToLower()
             $hit = $su3k | Where-Object { $Games[$_].Sha1 -eq $h } | Select-Object -First 1
@@ -49,6 +59,10 @@ foreach ($k in @($Games.Keys)) {   # native rebuilds: their data folder
             Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName $gi.DataFile) } | Select-Object -First 1
         if ($d) { $exes[$k] = $d.FullName }
     }
+}
+foreach ($k in @($Games.Keys)) {   # games built on another one's files (Phantom Freight = Ghost Train): found when the base game is
+    $gi = $Games[$k]
+    if ($gi.Base -and $exes[$gi.Base]) { $exes[$k] = $exes[$gi.Base] }
 }
 $exes
 }
@@ -145,6 +159,28 @@ $crashed =
 # window / taskbar icon (a .bat can't carry one): stacked MALL / VR wordmark, yellow on navy
 $icon = $null; try { $icoPath = Join-Path $Engine 'mallvr.ico'; if (Test-Path -LiteralPath $icoPath) { $icon = New-Object System.Drawing.Icon $icoPath } } catch { }
 
+# a "MallVR" shortcut with the MallVR icon on the Desktop and in the Start menu (Bobby 10-31: players should see which file to
+# start, with no .exe that antivirus could flag). Made on this PC, so Windows has nothing to warn about. Made once: deleted by the
+# player = stays deleted (AppData\MallVR\shortcut_made.txt). A shortcut that is there is moved to this copy (a new version
+# unzips to a new folder). It starts MallVR_Launcher.bat in a normal window (7 = minimized came down to the menu: Bobby 10-31).
+if (-not $Shot -and (Test-Path -LiteralPath (Join-Path $Root 'MallVR_Launcher.bat'))) {   # not from the dev template (no .bat there)
+    try {
+        $made = Join-Path $env:APPDATA 'MallVR\shortcut_made.txt'
+        $bat = Join-Path $Root 'MallVR_Launcher.bat'
+        $sh = New-Object -ComObject WScript.Shell
+        foreach ($lnk in @((Join-Path ([Environment]::GetFolderPath('Desktop')) 'MallVR.lnk'),
+                           (Join-Path ([Environment]::GetFolderPath('Programs')) 'MallVR.lnk'))) {
+            if (-not (Test-Path -LiteralPath $lnk) -and (Test-Path -LiteralPath $made)) { continue }
+            $s = $sh.CreateShortcut($lnk)
+            if ($s.TargetPath -eq $bat -and $s.IconLocation -like "$icoPath*" -and $s.WindowStyle -eq 1) { continue }
+            $s.TargetPath = $bat; $s.WorkingDirectory = $Root; $s.IconLocation = "$icoPath,0"; $s.WindowStyle = 1
+            $s.Description = 'MallVR: the Virtuality arcade in your headset'
+            $s.Save()
+        }
+        if (-not (Test-Path -LiteralPath $made)) { New-Item -ItemType Directory -Force (Split-Path $made) | Out-Null; Set-Content -LiteralPath $made "made $(Get-Date -Format s) from $Root" }
+    } catch { }
+}
+
 [MallGetGames]::Games = Join-Path $Root 'games'
 while ($true) {
     if ([MallGetGames]::AnyDone) { $exes = Find-Games; [MallGetGames]::AnyDone = $false }
@@ -153,13 +189,26 @@ while ($true) {
     $i = 0
     foreach ($code in $Games.Keys) {
         $g = $Games[$code]
+        if ($g.VersionOf) { continue }   # another build of a game: its VERSION row (options.ps1), no block of its own
         $name = $g.Name -replace '^Virtuality ', ''
         $f.AddGame($code, $name, [bool]$g.Link, $exes.ContainsKey($code), $(if ($g.MaxPlayers) { [int]$g.MaxPlayers } else { 2 }))
         if ($g.Sha1) { $Net.Sha1For[$code] = $g.Sha1 }   # sent on JOIN: a host refuses different game files (check.ps1 only starts this EXE)
         if ($last.game -eq $code) { $f.Game = $i }
+        # its OPTIONS tab (options.ps1: checked rows only)
+        foreach ($row in Get-MVOptionRows $code) {
+            $ids = [string[]]@($row.Values | ForEach-Object { ($_ -split '=', 2)[0] }); $labels = [string[]]@($row.Values | ForEach-Object { ($_ -split '=', 2)[1] })
+            $f.AddOption($code, $row.Key, $row.Label, $ids, $labels, $row.Default)
+        }
         $i++
     }
     if ($last.mode) { $f.Mode = [int]$last.mode }
+    if ($env:MALLVR_MODE) { $f.Mode = [int]$env:MALLVR_MODE }        # dev: -Shot in HEADSET (0) or WINDOW (1) mode
+    if ($last.style) { $f.Style = [int]$last.style }                 # 0 = CYBERSPACE HALL (default), 1 = OPERATOR
+    if ($env:MALLVR_STYLE) { $f.Style = [int]$env:MALLVR_STYLE }      # dev: -Shot of either style
+    if ($last.music -eq '0') { $f.Music = $false }                   # the hall's menu loop, on unless switched off
+    if ($env:MALLVR_WANTED) { $f.Wanted = $true }                     # dev: -Shot of the WANTED board
+    # dev: MALLVR_HALLSHOT=1 = -Shot of the hall on a PC with no games (normally MallVR opens GET GAMES then, below)
+    if ($last.sbs) { $f.Sbs = [int]$last.sbs }
     if ($last.players) { $f.Players = [int]$last.players }
     if ($last.pod) { $f.Pod = [int]$last.pod }
     if ($last.peer) { $f.Peer = $last.peer }
@@ -168,45 +217,58 @@ while ($true) {
     $saved = ''; try { if (Test-Path -LiteralPath $nameFile) { $saved = (Get-Content -LiteralPath $nameFile -Raw).Trim() } } catch { }
     if ($saved) { $f.PlayerName = $saved } elseif ($last.name) { $f.PlayerName = $last.name }
     $f.Net = $Net
+    $f.Root = $Root; $f.SyncOptions()                              # every game's OPTIONS, for the START packet when this PC hosts
     $f.OnlineScreen = $online
     if ($online -and $Net.InGroup) { $f.Advanced = $true }      # back from a group game: the group's screen (START / next game / LEAVE)
     $f.Root = $Root; $f.ReportTag = $lastTag; $f.ReportGame = $lastName
     if ($crashed) { $f.CrashGame = $crashed; $crashed = '' }
-    if ($exes.Count -eq 0 -and -not $online -and -not $gotOffered) { $gotOffered = $true; $f.OpenGetGames() }   # no games yet: GET GAMES right away
+    if ($exes.Count -eq 0 -and -not $online -and -not $gotOffered -and -not $env:MALLVR_HALLSHOT) { $gotOffered = $true; $f.OpenGetGames() }   # no games yet: GET GAMES right away
 
-    if ($Shot) { $f.SavePng($Shot); exit 0 }
+    if ($Shot) { $f.ShotTime = 2.0; $f.SavePng($Shot); exit 0 }
+    if ($x86) { $f.Mode = 1 }   # 32-bit Windows: WINDOW only
     if (-not $vrOn -and $f.Mode -eq 0) { $vrOn = $Vr.Start($Engine) }   # headset mode only; tried again each time the screen opens
     if ($vrOn) { $f.InHeadset = $true; $Vr.Attach($f) }
+    [MallIntro]::Wait()
     [void]$f.ShowDialog()
     $Vr.Detach()
     if ($vrOn -and ($f.Action -eq 'start' -or $f.Action -eq 'online')) { $Vr.Say('VS16A.WAV') }   # "Nice move. Let's get out of here."
 
     $code = $f.Codes[$f.Game]
-    $last = @{ game = $code; mode = $f.Mode; players = $f.Players; pod = $f.Pod; peer = $f.Peer; name = $f.PlayerName; server = $last.server; key = $Net.Key; stats = [MallNotes]::Consent }
+    $last = @{ game = $code; mode = $f.Mode; players = $f.Players; pod = $f.Pod; peer = $f.Peer; name = $f.PlayerName; server = $last.server; key = $Net.Key; stats = [MallNotes]::Consent; sbs = $f.Sbs; sbs_monitor = $last.sbs_monitor; style = $f.Style; music = $(if ($f.Music) { 1 } else { 0 }); intro = $last.intro }
     if (-not $last.stats) { $last.Remove('stats') }
+    if (-not $last.sbs_monitor) { $last.Remove('sbs_monitor') }
+    if (-not $last.intro) { $last.Remove('intro') }
     if ($f.Action -eq 'start' -or $f.Action -eq 'online') { Note-Start $f.Mode }
     if (-not $last.server -or $last.server -eq 'https://downloads.gainesphere.com/mallvr/online/list.php') { $last.Remove('server') }
     $online = $f.OnlineScreen
     ($last.GetEnumerator() | ForEach-Object { "$($_.Key) = $($_.Value)" }) | Set-Content -LiteralPath $sf -Encoding UTF8
     $g = $code.ToLower()
-    $desk = @(); if ($f.Mode -eq 1) { $desk = @('-Desktop') }
+    $desk = @(); if ($f.Mode -eq 1 -or $x86) { $desk = @('-Desktop') }
+    # window 3D for a head-mounted display (VPIX_SBS, 1920x1080 borderless; sbs_monitor = N in settings\launcher.txt picks the
+    # screen, 1 = the first Windows lists). Never on pod 2's window when two pods share this PC (that one stays flat).
+    $sbs = $(if ($desk.Count -and $f.Sbs -eq 1) { 'full' } elseif ($desk.Count -and $f.Sbs -eq 2) { 'half' } else { '' })
+    $env:VPIX_SBS = ''; $env:VPIX_SBS_MONITOR = $(if ($last.sbs_monitor) { "$($last.sbs_monitor)" } else { '' })
     switch ($f.Action) {
         'start' {
             if ($f.Players -eq 1) {        # two pods on this PC: pod 2 in a window first, then pod 1 (headset unless WINDOW)
                 Run-Play @($g, '-Pod', '2', '-Desktop') -NoWait | Out-Null
+                $env:VPIX_SBS = $sbs
                 Run-Play (@($g, '-Pod', '1') + $desk) -How 'link_pc' -Pod 1 | Out-Null
             }
-            elseif ($f.Players -eq 2) { Run-Play (@($g, '-Pod', "$($f.Pod)", '-Peers', $f.Peer) + $desk) -How 'link_net' -Pod $f.Pod | Out-Null }
-            else { Run-Play (@($g) + $desk) | Out-Null }
+            elseif ($f.Players -eq 2) { $env:VPIX_SBS = $sbs; Run-Play (@($g, '-Pod', "$($f.Pod)", '-Peers', $f.Peer) + $desk) -How 'link_net' -Pod $f.Pod | Out-Null }
+            else { $env:VPIX_SBS = $sbs; Run-Play (@($g) + $desk) | Out-Null }
         }
         'online' {      # START pressed (host) or the host started (joiner): our pod links through MallOnline
             $g = $Net.Game.ToLower()
             $pod = $f.OnlinePod
             $quick = $Net.Quick
+            $env:VPIX_SBS = $sbs
             # the group can switch games mid-game (host: Button Masher Menu > SWITCH GAME): close, start the next one as the new pod
             while ($true) {
                 $Net.BeginGame($pod)
-                $r = Run-Play (@($g, '-Pod', "$pod", '-Peers', "127.0.0.1:$([MallOnline]::LocalPort($pod))") + $desk) -How 'online' -Pod $pod
+                # the host's OPTIONS for this game (MallOnline: sent with START / the switch), the same on every pod
+                $opt = $(if ($Net.Options) { $Net.Options } else { 'none' })
+                $r = Run-Play (@($g, '-Pod', "$pod", '-Peers', "127.0.0.1:$([MallOnline]::LocalPort($pod))", '-Options', $opt) + $desk) -How 'online' -Pod $pod
                 if ([MallNotes]::On) {
                     $host1 = $Net.IsHost
                     [MallNotes]::Add('online', 'game', $g.ToUpper(), 'role', $(if ($host1) { 'host' } else { 'member' }), 'quick', $(if ($quick) { '1' } else { '0' }),

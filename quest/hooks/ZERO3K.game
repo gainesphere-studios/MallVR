@@ -15,6 +15,8 @@ hook PLAYER_do_blood L 0004B9E8 535156575583ec088844240431f685d2 0 0
 # high-score entry: HI_process shoots along gunModel (obj; +0xE = model slot) but draws no laser -> our aim beam
 global gunModel 002052BC
 hook HI_process L 00031688 5156575589e581ec5802000083e4f889 0 0
+# garage doors (BAD_process, type 0xD gdoors): 'mov edx,6' before part 1's OBJ_update, eax = obj -> small door follows the big door
+hook GDOORS_small L 00020F13 ba0600000005a0010000e84a4802008b 0 0
 # free play: report a credit mode outside bits 2|4 -> PROCESS_credits sets credit -1 (FREEPLAY), no endless credits
 hook EXP_GetCreditMode R 00069BC8 8b4424048b542408e8270000008b0485 0 0
 cdecl 00069BC8 EXP_GetCreditMode

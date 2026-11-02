@@ -3,7 +3,7 @@
      OpenXR (hello_xr's manifest parts), in its own process ":game". Version: build_mallvr_apk.sh fills @VERSION@ / @CODE@. -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.gainesphere.mallvr" android:versionCode="@CODE@" android:versionName="@VERSION@" android:installLocation="auto">
-    <uses-sdk android:minSdkVersion="29" android:targetSdkVersion="32" />
+    <uses-sdk android:minSdkVersion="29" android:targetSdkVersion="34" />
     <uses-feature android:glEsVersion="0x00030001" android:required="true" />
     <uses-feature android:name="android.hardware.vr.headtracking" android:version="1" android:required="true" />
     <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
@@ -19,6 +19,9 @@
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <!-- Android 14 (targetSdk 34): OnlineService's type. connectedDevice = linked to other pods (PCs, headsets) over the network;
+         its runtime prerequisite is CHANGE_WIFI_MULTICAST_STATE above (granted at install) -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
     <!-- voice chat in online games (asked on the ONLINE screen, never during a game) -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <queries>
@@ -31,20 +34,24 @@
         android:largeHeap="true" android:requestLegacyExternalStorage="true" android:usesCleartextTraffic="false"
         android:theme="@android:style/Theme.Material.NoActionBar">
         <meta-data android:name="com.oculus.supportedDevices" android:value="quest2|questpro|quest3|quest3s" />
-        <activity android:name="com.gainesphere.mallvr.LauncherActivity" android:exported="true" android:launchMode="singleTask"
+        <!-- true = the Meta store build (no GET GAMES), false = sideload build. build_mallvr_apk.sh fills it (store option) -->
+        <meta-data android:name="com.gainesphere.mallvr.store" android:value="@STORE@" />
+        <!-- the launch activity: Meta's upload check wants excludeFromRecents="true" and landscape (every activity is landscape) on it. A 2D panel without the VR category (hybrid
+             app: starts on its panel, then opens the immersive MallVRActivity itself) -->
+        <activity android:name="com.gainesphere.mallvr.LauncherActivity" android:exported="true" android:launchMode="singleTask" android:excludeFromRecents="true" android:screenOrientation="landscape"
             android:configChanges="density|keyboard|keyboardHidden|navigation|orientation|screenLayout|screenSize|uiMode">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
-        <activity android:name="com.gainesphere.mallvr.GetGamesActivity" android:exported="false" />
-        <activity android:name="com.gainesphere.mallvr.ReportActivity" android:exported="false" android:windowSoftInputMode="adjustResize" />
-        <activity android:name="com.gainesphere.mallvr.AboutActivity" android:exported="false" />
+        <activity android:name="com.gainesphere.mallvr.GetGamesActivity" android:exported="false" android:screenOrientation="landscape" />
+        <activity android:name="com.gainesphere.mallvr.ReportActivity" android:exported="false" android:screenOrientation="landscape" android:windowSoftInputMode="adjustResize" />
+        <activity android:name="com.gainesphere.mallvr.AboutActivity" android:exported="false" android:screenOrientation="landscape" />
         <!-- ONLINE (crossplay with PC): the lobby screen + the service that keeps the group alive while a game is in front -->
-        <activity android:name="com.gainesphere.mallvr.OnlineActivity" android:exported="false" android:launchMode="singleTop" android:windowSoftInputMode="adjustResize"
+        <activity android:name="com.gainesphere.mallvr.OnlineActivity" android:exported="false" android:launchMode="singleTop" android:screenOrientation="landscape" android:windowSoftInputMode="adjustResize"
             android:configChanges="density|keyboard|keyboardHidden|navigation|orientation|screenLayout|screenSize|uiMode" />
-        <service android:name="com.gainesphere.mallvr.OnlineService" android:exported="false" />
+        <service android:name="com.gainesphere.mallvr.OnlineService" android:exported="false" android:foregroundServiceType="connectedDevice" />
         <activity android:name="com.gainesphere.mallvr.MallVRActivity" android:exported="false" android:process=":game"
             android:launchMode="singleTask" android:excludeFromRecents="true" android:screenOrientation="landscape" android:resizeableActivity="false"
             android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen"

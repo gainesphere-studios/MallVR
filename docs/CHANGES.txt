@@ -1,6 +1,212 @@
 MALLVR - WHAT'S NEW
 ===================
 
+v0.14.0 (November 2026) - THE LOST PAC-MAN LEVEL
+
+  - PAC-MAN VR 1996 PROTOTYPE: pick it on the OPTIONS tab, VERSION row. It has the temple level
+    the released game lost (level 2), plus its own music, HUD and top view. GET GAMES fetches it.
+  - More VERSION rows: Ghost Train v1.11, Missile Command v1.12 (with the cut final wave after the
+    mother ship), Dactyl Nightmare v1.03 and Dactyl Nightmare 2 v2.04.
+  - Zone Hunter: optional RANDOM ENEMIES row on the OPTIONS tab (off by default).
+  - Dactyl Nightmare + Dactyl Nightmare 2: portals show their moving TV snow.
+  - Boxing: moving your hand sideways at character select no longer throws a punch, and your gloves
+    stay red the whole match. 2D screens are no longer squashed.
+  - Sea Diving: colours, score fade, pearl icon and crosshair fixed.
+  - Missile Command: stars and moons in the sky.
+  - Dactyl Nightmare 2: platform corners black, not cyan.
+  - Pac-Man: floor and ghost lighting. Shoot For Loot: wall colours and character select.
+  - Phantom Freight: window mode shots go where you aim.
+  - ONLINE: PC and Quest play together again with MallVR for Quest 0.4.
+
+v0.13.1 (October 2026) - THE CYBERSPACE HALL
+
+  - NEW LAUNCHER MENU: the Cyberspace Hall. Pick your game on a wall of glowing blocks, see the
+    pod it ran on (photos from the Simon Marston Collection) turning in the spotlight, read each
+    machine's sheets and the WANTED board of games still missing, and get MallVR news.
+    The old operator screen is still there: click STYLE.
+  - A MallVR shortcut with the MallVR icon: made on your Desktop and in the Start menu the first
+    time you start MallVR_Launcher.bat (delete it and it stays gone). A new version moves it to the
+    new folder. "_START HERE" in the folder says which file to double-click.
+  - HOW TO PLAY follows MODE: WINDOW shows each game's keyboard + mouse keys, HEADSET the
+    controller buttons, and gun games add the gun-aim fix (Up / Down arrows, Quest: hold Y).
+  - Menu music: 11 original synth songs, shuffled. MUSIC turns them off (remembered).
+  - GET GAMES flashes red while games are missing, and still opens by itself when none are found.
+
+v0.13.0 (October 2026) - PHANTOM FREIGHT, the Halloween ride
+
+  - NEW GAME: PHANTOM FREIGHT, a Halloween ride built on your own copy of Ghost Train (it needs
+    Ghost Train in the games folder; nothing from the game is in this download):
+      - a gun in each hand (Zone Hunter's gun if you have Zone Hunter), rapid fire, plus a sword
+      - more enemies and zombie crowds on the track, a different floaty monster every ride, track
+        barriers that are balls of snarling critters, shootable pumpkins and floating targets
+      - fog, smoke, spooky lighting, Halloween decorations, graveyard props, coaster sounds and rumble
+      - cart jumps with named tricks, new ride music, a 3D PHANTOM FREIGHT title
+      - after the original ride: HELL (devil girls on pillars, DEVILMASTER - 32-BIT EDITION, the
+        Dactyl swooping on slow riders if you have Dactyl Nightmare)
+      - then the MALLVR MUSEUM: a slow guided ride through Starlite Commons with voice-over, your
+        host Bobby, the rotunda, CyberZone VR (the pods), the Simon Marston Collection, Quarter Quest
+        arcade, the food court, the stores and a thank-you room
+      - and an ending you have to see. No tutorial and no initials screen to get stuck on.
+  - Windows 7 and 8.1: MallVR now says plainly that it needs Windows PowerShell 5.1 and how to get
+    it (free from Microsoft, works offline), instead of stopping with odd errors.
+  - 32-bit Windows 10: MallVR now runs, in WINDOW mode (a 32-bit engine ships in engine\x86 and is
+    picked by itself). Headset play still needs 64-bit Windows, like SteamVR.
+  - NEW: 3D side-by-side for head-mounted displays that take a 1920 x 1080 SBS picture (DIY
+    headsets, 3D video glasses). Launcher: WINDOW, then click 3D OFF for 3D SBS or 3D HALF-SBS.
+    Each eye keeps the game's own 4:3 picture. F-keys adjust eye distance, picture size, lens
+    spacing, height, swap eyes and text depth while you play; Page Up lowers the detail for slower
+    PCs. See docs\SETUP_GUIDE.txt. Works on 32-bit Windows and without SteamVR.
+  - Olin Shotgun: no more crash after GAME OVER; the score digits, stopwatch and QUALIFIED sign
+    show properly, and the big top's colours are right.
+  - VR hands: the left controller is found even when SteamVR gives it no hand role; guns and hands
+    are drawn in front of everything.
+  - The PC source download builds again (every engine header ships).
+
+  - Windows 7 and 8.1: MallVR now says plainly that it needs Windows PowerShell 5.1 and how to get
+    it (free from Microsoft, works offline), instead of stopping with odd errors.
+  - 32-bit Windows 10: MallVR now runs, in WINDOW mode (a 32-bit engine ships in engine\x86 and is
+    picked by itself). Headset play still needs 64-bit Windows, like SteamVR.
+  - NEW: 3D side-by-side for head-mounted displays that take a 1920 x 1080 SBS picture (DIY
+    headsets, 3D video glasses). Launcher: WINDOW, then click 3D OFF for 3D SBS or 3D HALF-SBS.
+    Each eye keeps the game's own 4:3 picture. F-keys adjust eye distance, picture size, lens
+    spacing, height, swap eyes and text depth while you play; Page Up lowers the detail for slower
+    PCs. See docs\SETUP_GUIDE.txt. Works on 32-bit Windows and without SteamVR.
+
+v0.12.1 (October 2026) - GET GAMES
+
+  - NEW: GET GAMES. Press it at the bottom of the game select screen (it opens by itself if MallVR
+    finds no games): MallVR downloads the game files from archive.org, checks them and puts them in
+    the right place. No unzipping, no folder hunting. About 550 MB for all 14 games. Works in the
+    headset panel too. (Windows 10: if it can't unpack a .7z file, it says so and keeps the download.)
+  - The game select screen shows how many players are online right now, next to ONLINE.
+  - Button Masher Menu > VOICE CHAT: MY MIC shows LIVE or MUTED (click to switch), and PUSH TO TALK
+    on / off (hold the left stick to talk). Kept for next time.
+  - CHECK GAMES points you to GET GAMES when games are missing.
+  - Online matches get a match number in the play notes (groundwork for high scores and tournaments).
+
+v0.12.0 (October 2026) - online with Meta Quest players (TEST)
+
+  - CROSSPLAY: PC and Meta Quest players (MallVR for Quest 0.2) are in one ONLINE list and play the
+    same linked games together: QUICK MATCH, HOST, JOIN, and groups that stay together between games.
+    Each player shows PC or QUEST. This is new: if it works or breaks, press REPORT A PROBLEM.
+  - VOICE CHAT with Quest players too. NEW on the Button Masher Menu: VOICE CHAT, turn each friend
+    up or down (0-200 %) or mute them. Only changes what you hear; kept for next time.
+  - Safer online play: the online list no longer shows anyone's home internet address (you only get
+    the address of the host you join), and the game's network port only listens on your own PC
+    during online play. A host turns away a player whose game files are a different version.
+  - QUICK MATCH on ANY GAME no longer waits forever when two players host games the other lacks.
+  - Updates are now signed: MallVR only installs updates made by us.
+  - Older versions can still see who is online but can't join internet games: update when asked.
+
+v0.11.3 (October 2026) - every game, free for everyone
+
+  - The free download now has ALL 14 games and their launchers: Dactyl Nightmare 1 and 2, Pac-Man VR,
+    Missile Command VR, Olin Shotgun, Virtuality Boxing, Zone Hunter, Ghost Train, Shoot For Loot,
+    Sea Diving, Buggy Ball, Total Recoil, Zero Hour and Zeneca Migraine. Linked and online play
+    (QUICK MATCH) too. You still bring your own game files (docs\SETUP_GUIDE.txt, step 2).
+  - Buggy Ball: the ball badges and the music folder (music\buggy: any WAVs you drop in play as the
+    game music) now load. A typo in the launcher hid them since v0.11.0.
+
+v0.11.2 (October 2026) - fixes from your bug reports, thank you
+
+LAUNCHER
+  - The launcher now shows up inside your headset (HEADSET mode, SteamVR running): point with
+    your controller and pull the trigger to pick a game, START, go online.
+  - NEW: the BUTTON MASHER MENU in every game. PRESS AND KEEP HOLDING A + B together (Vive wands:
+    both menu buttons) until the menu appears, about a second. A quick press does nothing. RESUME,
+    BACK TO MENU, SWITCH GAME (online groups), REPORT A PROBLEM and PLAY NOTES, without taking the
+    headset off.
+  - NEW: REPORT A PROBLEM (game select screen and the Button Masher Menu). Type one line about
+    what went wrong; it goes to us with the logs of that game (your Windows user name is cut out
+    of them). If it can't be sent, the file lands on your Desktop: drag it into our Discord
+    #bug-reports. If a game closes by itself, MallVR offers this straight away.
+  - NEW: PLAY NOTES, asked once the first time you start this version. Say YES and MallVR sends us
+    anonymous notes: which games you play and for how long, frame rate, your headset and graphics
+    card, crashes and online connection problems. No names, no files. Off unless you say yes;
+    PLAY NOTES ON / OFF on the game select screen changes it any time. Details:
+    gainesphere.com/pages/mallvr-privacy
+  - Total Recoil and Zero Hour start from MallVR_Launcher.bat and show up in Check My
+    Games with the folder and file names they have on archive.org (GUN\GUN.EXE and
+    ZERO\ZERO.EXE). No renaming needed any more.
+  - 32-bit Windows: MallVR now says plainly that it needs 64-bit Windows 10 or 11,
+    instead of a game that never opens.
+
+ONLINE GROUPS
+  - A group now stays together after a game. You're back on the ONLINE screen with the same
+    players: the host presses START for another round, or clicks the game name to pick another
+    game (only games everyone in the group has).
+  - SWITCH GAME in the middle of a game: the host holds A + B for the Button Masher Menu and picks
+    SWITCH GAME. Everyone else sees "<HOST> WANTS TO PLAY <GAME>" with GO / STAY OUT for 10
+    seconds (no answer = GO). Then every PC closes its game and opens the new one, linked again.
+    STAY OUT = you leave the group. In window mode the question is a small window on top.
+  - Everyone in a group needs v0.11.2 or newer to switch games. Older versions can still join
+    a normal game; MallVR now also refuses a player whose online version can't link with yours,
+    instead of a game that breaks.
+
+META QUEST
+  - Quest / Oculus Touch controllers get their own MallVR layout in SteamVR.
+  - HOLD Y to adjust: left stick = gun aim, right stick = arm reach. See docs\CONTROLS.txt.
+
+VIRTUALITY BOXING
+  - If your punches don't count in the ring (reported on Quest), use the keyboard: Right
+    arrow = a shorter jab lands, Left arrow = longer; Up / Down = arm height; [ ] = glove
+    spread. Saved for next time. Optional: punch tracking is unchanged unless you press them.
+  - Two-player Boxing: both players need v0.11.2.
+
+PAC-MAN VR
+  - Walk with the triggers: RIGHT trigger forward, LEFT trigger back (the sticks still work).
+  - VR: the score and lives are pulled in from the edge of the lenses.
+
+GHOST TRAIN
+  - The sight lines up with your shots.
+  - Name entry letters at the end: the drop shadows are black again (the letters looked doubled).
+
+v0.11.1 (October 2026)
+
+TWO-PLAYER BOXING
+  - Virtuality Boxing is now head to head, like the arcade's two-boxer pod: one PC on
+    each side, at home or online (Link_Virtuality_Boxing_*.bat, the launcher, or QUICK MATCH).
+
+VOICE CHAT
+  - Talk to the other players in every linked and online game. Click the LEFT stick
+    to turn your mic off / on (window: M).
+
+ONLINE
+  - QUICK MATCH now plays ANY GAME you both have; click the game name to pick just one.
+  - Hosting works behind routers that refuse to open a port (including two routers in
+    a row): MallVR punches through by itself. No router settings to change.
+
+VIRTUALITY BOXING
+  - Punches land: a jab is measured from where your own fist rests, so a short punch
+    counts (VR jabs used to stop short of the game's punch line).
+  - VR: the sticks no longer slide you backwards into a corner; they lean like the pod.
+
+v0.11.0 (October 2026)
+
+CITIZENS: EVERY GAME, NOW (BETA)
+  - The Citizen edition now has every game MallVR runs, as a beta. Please report anything
+    that breaks in the Discord. The free edition stays Pac-Man VR.
+  - New: TOTAL RECOIL and ZERO HOUR, the SU3000 / 2000E rifle games.
+  - New: BUGGY BALL, rebuilt by us from the original game data. The original program
+    (BALL.EXE) has not been found, so the driving, ball physics and rules are our best
+    reconstruction, not the arcade game exactly. If you have a Buggy Ball BALL.EXE (pod
+    hard drive or install CD), please contact us on Discord: it would make it accurate.
+  - Where to get each game's files (all on archive.org): docs\SETUP_GUIDE.txt, step 2.
+
+MULTIPLAYER
+  - Linked and online play (QUICK MATCH) now works in six games: Dactyl Nightmare,
+    Dactyl Nightmare 2, Ghost Train, Buggy Ball (up to 4 players), Shoot For Loot and
+    Sea Diving. Only games that linked up in the arcades get it. See docs\MULTIPLAYER.txt.
+  - Taking turns with the computer: with fewer than 4 people, Dactyl Nightmare 1 and 2 and
+    Buggy Ball alternate people-only matches and computer-filled ones.
+
+THANKS
+  - Jeremy Shartzer, who gave us Buggy Ball, and ErrorDan for the 3000-series games
+    (Total Recoil, Zero Hour) and newer versions of the older ones.
+
+VIRTUALITY BOXING
+  - A missing piece of its setup now ships with MallVR (it was only on our test PC).
+
 v0.10.4 (October 2026)
 
 WINDOW MODE (no headset)

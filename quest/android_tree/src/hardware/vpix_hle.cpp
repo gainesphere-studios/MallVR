@@ -42,11 +42,17 @@
 #include <mutex>
 #include <set>
 #include <array>
+#include <deque>
 #include <chrono>
 #include <thread>
 #include <atomic>
 #include "../libs/decoders/dr_mp3.h"   /* the decoder itself is compiled in DOSBox-X's cdrom_image (CD-audio tracks as MP3) */
 #include <algorithm>
+#ifdef _WIN32
+#include <windows.h>
+#include <mmsystem.h>
+#pragma comment(lib, "winmm.lib")
+#endif
 
 uint8_t *VPIX_Pix3K_Mem(uint32_t phys, uint32_t len);   /* vpix.cpp: host view of the SU3000 PIX2000E board memory */
 static std::string log_base;
@@ -111,6 +117,8 @@ static std::vector<RefLoad> ref_loads;
 static uint32_t forced_handle = 0;             /* set while the trap loads a file under the card's handle */
 /* the card numbers models, bitmaps and textures from 0, which our tables use as 'none': our copies are filed one higher */
 static inline uint32_t ref_h(uint32_t h) { return ref_mode ? h + 1 : h; }
+static double hook_ms = 0, cap_ms = 0;      /* host time spent in our hooks since the last frame, less the frame cap's sleep (pace log) */
+static std::chrono::steady_clock::time_point cap_due;   /* VPIX_FPS: the next frame may not start before this */
 static long fps_limit = 0;                 /* 0 = off; the game's logic is clock-driven */
 static auto host_t0 = std::chrono::steady_clock::now();
 static double time_scale = 1.0;
@@ -133,6 +141,9 @@ static bool parse_hex(const char *s, uint8_t *out, size_t n) {
    PIX_SetModel's flags test); PEARL also by the table name; VPIX_MODEL_STRIDE overrides. */
 static uint32_t model_stride = 0xAC, model_shift = 0;
 static uint32_t person_stride = 0xEB1, person_pos = 0x45;   /* linked-pod bots: person[] record size, x/y/z offset (hooks lines "personstride", "personpos"; DN2 ECF / 5B) */
+/* SU3000 PPCDEVICE pointer in pixConfig: +0x1DA (PIX 1.37+: Total Recoil, Zero Hour, ZENECA), +0x1D6 in PIX 1.34 (Pac-Man VR prototype
+   v00.00.69, hooks line "ppcdev 1D6") */
+static uint32_t ppcdev_off = 0x1DA;
 static bool load_hooks(const char *path) {
     FILE *f = fopen(path, "r");
     if (!f) { lg("HLE: cannot open hook table %s", path); return false; }
@@ -164,6 +175,8 @@ static bool load_hooks(const char *path) {
             person_stride = (uint32_t)strtoul(a, NULL, 16);
         } else if (!strcmp(kw, "personpos") && n >= 2) {
             person_pos = (uint32_t)strtoul(a, NULL, 16);
+        } else if (!strcmp(kw, "ppcdev") && n >= 2) {
+            ppcdev_off = (uint32_t)strtoul(a, NULL, 16);
         } else if (!strcmp(kw, "modelstride") && n >= 2) {   /* gen_hooks.py: older PIX lib record size (0x8C) */
             model_stride = (uint32_t)strtoul(a, NULL, 16); model_shift = 0xAC - model_stride;
         } else if (!strcmp(kw, "hook") && n >= 6) {
@@ -243,9 +256,61 @@ static uint32_t start_bits = 0;   /* VPIX_START_BITS: front-panel bits a start p
 static VPIX_Input cur_in;              /* sampled once per game frame */
 static unsigned long long trigger_down_ms = 0; static bool trigger_held = false;
 static unsigned long long hap_ms_now() { return (unsigned long long)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }   /* VPIX_HAPTIC gun rules: when the trigger last went down */
+/* VPIX_DUAL_GUN=<shots per second> (Phantom Freight, Bobby 10-26: "double machine guns from Zone Hunter"): Ghost Train runs ONE
+   gun per PC (a car's 2nd seat is another pod), so the one gun alternates between the hands. Holding a trigger fires that hand's gun
+   in bursts (the trigger the game sees is pulsed: down for the first half of each shot period); holding both alternates right, left,
+   right... and the hand fed to the game is the one whose shot it is, so the game's own hit test decides every hit. */
+static float dual_rate = -1;           /* shots per second, 0 = off */
+static int dual_hand = 0;              /* 0 = right controller fed as the gun, 1 = left */
+static bool dual_trig = false;         /* the trigger the game sees this frame */
+static unsigned long long dual_shot_ms = 0, dual_next_ms = 0;
+static bool dual_on() { if (dual_rate < 0) { const char *e = getenv("VPIX_DUAL_GUN"); dual_rate = e ? (float)atof(e) : 0.f; if (dual_rate < 0) dual_rate = 0; } return dual_rate > 0; }
+/* Ghost Train aims with the HEAD: its "gun pose" (0x11FF7C + index * 0xAC) is the rider's camera (also the sound listener), the
+   sight is fixed in the screen centre, and the fire routine 0x29AD0 shoots along the camera's row 1. Phantom Freight (Bobby 10-27:
+   "make it where the gun aims and shoots where its pointed on the right hand with trigger and the left trigger is the look to shoot"):
+   while the right gun has the shot, an L hook on 0x29AD0 (GHOST_Fire, added when VPIX_DUAL_GUN is on) puts the right controller's pose
+   (the drawn gun's barrel: the aim trim + VPIX_DUAL_GUN_POSE pitch, its grip point) into the rider's camera entry for the length of
+   the call, and the call returns into the hook's own entry, which puts the camera back. The left trigger leaves the camera alone. */
+static unsigned long long ghost_ride_ms = 0;   /* last frame the rider's own cart was riding (state 1): dual guns only then */
+static bool gf_right = false;                  /* the right gun has this shot */
+static uint32_t gf_ret = 0, gf_gb = 0;         /* while swapped: the caller's return address, the camera entry */
+static uint8_t gf_save[0x3C];                  /* the camera entry's matrix rows + position (+4 .. +0x40) */
+static float gf_o[3], gf_d[3];                 /* the ray the last shot used, for MallVR's own targets */
+static uint32_t gf_cart = 0; static unsigned long long gf_ms = 0;
+static uint32_t gf_game = 0;                   /* the game of the swapped shot (for its hit result) */
+static float gf_aim_pt[3]; static unsigned long long gf_aim_ms = 0;   /* VR 3D crosshair: where the right gun's ray meets its target */
+static double jump_h_now = 0;
+static float snatch_h = 0;                     /* VPIX_DACTYL: how high the pterodactyl has lifted the rider's cart (added to the hop) */
+static int sky_ww = 0, sky_wh = 0;              /* VPIX_SKY_FLYERS: the witch picture's size (0 = not loaded) */
+static bool snatch_witch_now = false;           /* VPIX_SNATCH_WITCH: the witch is swooping on the rider (the sky witch hides) */
+static bool mall_now = false;                    /* VPIX_MALLRIDE: the rider is on the mall / museum ride: no snatch, no wind */
+static std::vector<float> museum_xy;              /* VPIX_MALLRIDE: where the exhibits stand (x, y pairs), for the thank-you sign to keep clear of */
+static float sword_A[3], sword_B[3]; static unsigned long long sword_ms = 0;   /* VPIX_SWORD: the blade (hilt, tip) last frame, for the ending's balls */
+static int ghost_gm = -1;   /* Ghost Train's game mode (9 = the TUTORIAL? question) */
+static bool mall_in_room = false;                /* ... and inside a room with its exhibits: the joke gun (BANG!), no shots, no targets. Between rooms
+                                                    the guns fire, quietly, at random targets (Bobby 10-29: "enable the guns just low volume and put
+                                                    some random targets in", "but in statue sections its bang") */
+static bool dm_fight_now = false;                /* VPIX_DEVILMASTER is up: the fog is pushed back so he stands out */
+static unsigned long long power_boost_until = 0;   /* VPIX_SWORD power-up: super speed until then (the jump code raises the clamp) */
+static bool gf_sword = false; static float gf_sword_o[3], gf_sword_d[3];   /* VPIX_SWORD slice: the next fire call shoots along the blade */                  /* VPIX_JUMP: the rider's cart's hop height this frame (GHOST_Place) */
 static VPIX_Pose head_fed;             /* last head pose handed to the game (renderer needs it) */
 static float walk_yaw_fed = 0;         /* the walk-turn yaw inside head_fed (Pac-Man strafe / back) */
 static float crouch_fed = 0;           /* VPIX_CROUCH: mm head_fed was lowered by the crouch button */
+/* VPIX_SEATED=auto|<mm>|0 (Phantom Freight, Bobby 10-27: "i play seated a lot but i do stand some times"): Ghost Train puts the
+   rider's eye where the real head is, so a seated player rode low in the cart. auto: at the start of each ride the head height is
+   averaged over ~1 s; below 1350 mm (sitting) the head the game and the eyes get is lifted to 1650 mm (fed like a negative crouch,
+   so view, gun and game move together); standing = no lift. <mm> = always lift by that much. */
+static float seat_lift = 0;
+/* VPIX_ATTRACT_LOCK=1 (Phantom Freight, Bobby 10-27: "make sure that intro screen has no look up down left or right, it's locked, in VR
+   mode, no head tracking till the game starts"): while Ghost Train's game mode (word [0xEF532 + pod * 2], v01.00.09; 0 = ATTRACT_MODE,
+   1 = PLAY_GAME, 2 = GAME_END ... per its "Game Mode :" debug texts) is ATTRACT, the game is fed a head looking straight ahead and the
+   renderer locks the view to the head (frame.lock_view). Starting a game hands head tracking back. */
+static bool attract_lock_now() {
+    static const bool on = getenv("VPIX_ATTRACT_LOCK") && atoi(getenv("VPIX_ATTRACT_LOCK"));
+    if (!on || !data_delta) return false;
+    const int pod = (int)(int8_t)mem_readb(0xFCDFA + data_delta);
+    return pod >= 0 && pod < 4 && mem_readw(0xEF532 + data_delta + pod * 2) == 0;
+}
 static float hand_fed[3] = {0, 0, 0};  /* last hand position handed to the game, tracker mm (VPIX_GLOVELOG) */
 static uint32_t black_backdrop_handle = 0;   /* VPIX_BLACK_BACKDROP=<file fragment>: a picture shown under the 3D scene whenever the game's clear colour is black */
 static bool box_ring_view = false;     /* Boxing: the ring model is in the scene (pan + fight); false at character select */
@@ -256,6 +321,26 @@ static VPIX_Pose seat2_head_fed;       /* seat 2's head as handed to the game (i
 static bool seat2_two_hand_trigger = false;
 static bool seat2_live();              /* a seat PC is connected and sending */
 static std::map<uint32_t, std::string> model_files;   /* PIX_LoadModel handle -> file (diagnosis) */
+static std::map<uint32_t, std::string> bitmap_files;  /* PIX_LoadBitmap handle -> file (Phantom Freight attract screen) */
+/* VPIX_JUMP tricks (Ghost Train Hunted / Phantom Freight, dev): the HLE's jump code says what the rider's own cart is doing, the
+   frame builder turns the cart model to match (submit_frame) */
+static int jump_trick = 0;          /* 0 none, 1 spin left, 2 spin right, 3 front flip, 4 barrel roll */
+static float jump_trick_a = 0.f;    /* trick angle now, radians (0 .. 2 pi) */
+static int trick_word = -1;          /* trick name to pop up: 0 spin, 1 flip, 2 roll, 3 leap, 4 double (VPIX_TITLE3D words) */
+static unsigned long long trick_word_at = 0;
+static unsigned long long dm_duck_until = 0;   /* VPIX_DEVILMASTER: the music ducks under his line too */
+static float narr_duck = 1.f;            /* VPIX_NARRATION: the ride music ducked under a narrator line */
+/* VPIX_ENDING: while the ending runs, everything drawn after the mall code (the track ghosts ...) is cleared again just before the
+   frame goes out, and the ending's sky colour / fog put back; world: the game's world sprites go too (not after game over: initials) */
+static struct { bool on = false, world = false; uint8_t clear[3] = {0, 0, 0}; float fog_start = 0, fog_end = 0; } end_scrub;
+static void play_game_sound(uint32_t num, int vol);   /* below the sound mixer */
+/* VPIX_GHOST_SETS="<dir>;<dir>;..." (Phantom Freight monster preview, dev, Bobby 10-27: "add all the new floaty characters at the
+   start so we can see them right away"): Ghost Train's ghost is one shared 8-frame picture (BITMAPS\16BIT\GHOST1-8.VST), so every
+   ghost looks the same. Each folder holds its own GHOST1-8.VST (engine\phantom_monsters\<name>); they load next to the game's
+   frames and each ghost on screen (by its model slot, in order of appearance) is drawn with the next set. */
+static std::map<uint32_t, int> ghost_frame;               /* game bitmap handle -> ghost frame 1..8 */
+static std::vector<std::array<uint32_t, 9>> ghost_sets;   /* extra sets: frame -> our handle (0 = missing) */
+static std::map<uint32_t, int> ghost_slot_set;            /* model slot -> set index (round robin) */
 static int coins_used = 0;
 static unsigned long trk_calls = 0;
 
@@ -292,6 +377,111 @@ static VPIX_Pose pitched(const VPIX_Pose &h, float deg) {
     for (int i = 0; i < 3; i++) { g.R[1][i] = h.R[1][i] * c + h.R[2][i] * sn; g.R[2][i] = h.R[2][i] * c - h.R[1][i] * sn; }
     return g;
 }
+/* GHOST_Fire entry (eax game, edx cart; [esp] = return address): the shot's ray, swapped to the right controller when it's the right
+   gun's shot. Returns true when the camera entry was swapped (the return address then points back at the hook). */
+static bool ghost_fire_enter(uint32_t at) {
+    const uint32_t g = reg_eax & 1, k = reg_edx & 1, c = mem_readd(0xEDB7C + data_delta + g * 8 + k * 4);
+    gf_game = g;
+    { static int dl = 0; if (dl < 4 || (gf_right && dl < 10)) { dl++; lg("GHOST_Fire call right=%d game %u cart %u -> %06X state %u, hand %s, head %s", (int)gf_right, g, k, c,
+          c ? mem_readb(0xEDB9C + data_delta + g * 16 + k * 2) : 0, cur_in.hand.valid ? "ok" : "none", head_fed.valid ? "ok" : "none"); } }
+    if (!c || mem_readb(0xEDB9C + data_delta + g * 16 + k * 2) != 1) return false;   /* the rider's own riding cart only */
+    const int idx = (int)(int16_t)mem_readw(c + 3) + (int)(int8_t)mem_readb(0xFCDFA + data_delta);
+    const uint32_t gb = 0x11FF7C + data_delta + (uint32_t)(idx < 0 ? 0 : idx) * 0xAC;
+    float M[3][3], P[3];
+    for (int r = 0; r < 3; r++) for (int i = 0; i < 3; i++) M[r][i] = rd_f(gb + 4 + 0x10 * r + 4 * i);
+    for (int i = 0; i < 3; i++) P[i] = rd_f(gb + 0x34 + 4 * i);
+    bool swapped = false;
+    if (gf_sword) {   /* VPIX_SWORD slice: this shot goes along the blade at the enemy, trigger held */
+        gf_sword = false;
+        float N[3][3], up[3] = {0, 0, 1}, *d = gf_sword_d;
+        for (int i = 0; i < 3; i++) N[1][i] = d[i];
+        N[0][0] = d[1] * up[2] - d[2] * up[1]; N[0][1] = d[2] * up[0] - d[0] * up[2]; N[0][2] = d[0] * up[1] - d[1] * up[0];
+        float l0 = sqrtf(N[0][0] * N[0][0] + N[0][1] * N[0][1] + N[0][2] * N[0][2]); if (l0 < 1e-3f) { N[0][0] = 1; N[0][1] = N[0][2] = 0; l0 = 1; }
+        for (int i = 0; i < 3; i++) N[0][i] /= l0;
+        N[2][0] = N[0][1] * d[2] - N[0][2] * d[1]; N[2][1] = N[0][2] * d[0] - N[0][0] * d[2]; N[2][2] = N[0][0] * d[1] - N[0][1] * d[0];
+        for (int i = 0; i < 0x3C; i++) gf_save[i] = mem_readb(gb + 4 + i);
+        auto wf = [](uint32_t a, float v) { uint32_t u; memcpy(&u, &v, 4); mem_writed(a, u); };
+        for (int r = 0; r < 3; r++) for (int i = 0; i < 3; i++) wf(gb + 4 + 0x10 * r + 4 * i, N[r][i]);
+        for (int i = 0; i < 3; i++) wf(gb + 0x34 + 4 * i, gf_sword_o[i]);
+        mem_writew(c + 0x11, 1);   /* the trigger held for this shot */
+        const uint32_t sp = SegPhys(ss) + reg_esp;
+        gf_ret = mem_readd(sp); gf_gb = gb; mem_writed(sp, at - SegPhys(cs));
+        return true;
+    }
+    if (gf_right && cur_in.hand.valid && head_fed.valid) {
+        static float mpitch = 0, off[3] = {0, 0, -20}; static bool rd = false;   /* the drawn gun's VPIX_DUAL_GUN_POSE (renderer) */
+        if (!rd) { rd = true; float sc; if (const char *e = getenv("VPIX_DUAL_GUN_POSE")) sscanf(e, "%f,%f,%f,%f,%f", &mpitch, &sc, &off[0], &off[1], &off[2]); }
+        /* in a window the sight is the screen centre and there is no controller to point (Bobby 11-01: "it tracks centered but when you
+           aim up and down it gets off vertically": the stand-in hand sits under the eye, turned onto the view ray at one distance only,
+           with the VR gun's pitch on top): the shot goes down the view, as Missile Command's does */
+        if (!cur_in.vr) { mpitch = 0; off[0] = off[1] = off[2] = 0; }
+        const VPIX_Pose &h = cur_in.vr ? cur_in.hand : head_fed, &hd = head_fed;
+        const float cam1[3] = {M[1][0], M[1][1], M[1][2]};
+        const VPIX_Pose hp = cur_in.vr ? pitched(h, cur_in.gun_pitch + mpitch) : h;
+        /* tracker vector -> game: its parts along the head's axes, put on the camera's axes (as the renderer places the gun model) */
+        auto tw = [&](const float v[3], float o[3]) {
+            for (int i = 0; i < 3; i++) o[i] = 0;
+            for (int j = 0; j < 3; j++) { const float cj = v[0] * hd.R[j][0] + v[1] * hd.R[j][1] + v[2] * hd.R[j][2];
+                for (int i = 0; i < 3; i++) o[i] += cj * M[j][i]; }
+        };
+        float N[3][3], d[3], w[3], Q[3];
+        for (int r = 0; r < 3; r++) tw(hp.R[r], N[r]);
+        for (int i = 0; i < 3; i++) d[i] = h.p[i] + off[0] * h.R[0][i] + off[1] * h.R[1][i] + off[2] * h.R[2][i] - hd.p[i];
+        if (cur_in.vr) d[2] -= crouch_fed;   /* from the REAL head: head_fed is lowered by crouch_fed (raised ~0.5 m seated); the hand isn't (Bobby 10-28: shots "under the gun like a foot") */
+        tw(d, w);
+        for (int i = 0; i < 3; i++) Q[i] = P[i] + world_scale * w[i];
+        /* the hit test starts 1.5 m out along the aim, past the cart's nose (Bobby 10-29: the tutorial's pumpkin in the middle of the
+           track "is not registering hits only cart hit": aimed low ahead, the shot met our own cart first). VPIX_SHOT_START=<mm> */
+        {   static const float s0 = getenv("VPIX_SHOT_START") ? (float)atof(getenv("VPIX_SHOT_START")) : 1500.f;
+            const float ln = sqrtf(N[1][0] * N[1][0] + N[1][1] * N[1][1] + N[1][2] * N[1][2]) + 1e-6f;
+            for (int i = 0; i < 3; i++) Q[i] += N[1][i] / ln * s0; }
+        for (int i = 0; i < 0x3C; i++) gf_save[i] = mem_readb(gb + 4 + i);
+        auto wf = [](uint32_t a, float v) { uint32_t u; memcpy(&u, &v, 4); mem_writed(a, u); };
+        for (int r = 0; r < 3; r++) for (int i = 0; i < 3; i++) wf(gb + 4 + 0x10 * r + 4 * i, N[r][i]);
+        for (int i = 0; i < 3; i++) wf(gb + 0x34 + 4 * i, Q[i]);
+        const uint32_t sp = SegPhys(ss) + reg_esp;
+        gf_ret = mem_readd(sp); gf_gb = gb; mem_writed(sp, at - SegPhys(cs));   /* return into the hook: put the camera back */
+        memcpy(M, N, sizeof(M)); memcpy(P, Q, sizeof(P)); swapped = true;
+        static int nl = 0;
+        if (nl < 12) { nl++; lg("GHOST_Fire right gun: camera aim (%.2f %.2f %.2f) -> controller (%.2f %.2f %.2f), gun at %+.0f %+.0f %+.0f from the eye",
+                                cam1[0], cam1[1], cam1[2], N[1][0], N[1][1], N[1][2], w[0], w[1], w[2]); }
+    }
+    const float l = sqrtf(M[1][0] * M[1][0] + M[1][1] * M[1][1] + M[1][2] * M[1][2]);
+    if (l > 1e-3f) { for (int i = 0; i < 3; i++) { gf_o[i] = P[i]; gf_d[i] = M[1][i] / l; } gf_cart = c; gf_ms = hap_ms_now(); }
+    return swapped;
+}
+/* the right gun's ray right now, every frame (not only on a shot): the same tracker -> game mapping as ghost_fire_enter, from rider
+   cart c's camera entry (Bobby 10-28: the VR ring "seems spotty so maybe have it just track all the time even empty space") */
+static bool gun_ray_now(uint32_t c, float o[3], float d[3]) {
+    if (!c || !cur_in.vr || !cur_in.hand.valid || !head_fed.valid) return false;
+    const int idx = (int)(int16_t)mem_readw(c + 3) + (int)(int8_t)mem_readb(0xFCDFA + data_delta);
+    const uint32_t gb = 0x11FF7C + data_delta + (uint32_t)(idx < 0 ? 0 : idx) * 0xAC;
+    float M[3][3], P[3];
+    for (int r = 0; r < 3; r++) for (int i = 0; i < 3; i++) M[r][i] = rd_f(gb + 4 + 0x10 * r + 4 * i);
+    for (int i = 0; i < 3; i++) P[i] = rd_f(gb + 0x34 + 4 * i);
+    static float mpitch = 0, off[3] = {0, 0, -20}; static bool rd = false;
+    if (!rd) { rd = true; float sc; if (const char *e = getenv("VPIX_DUAL_GUN_POSE")) sscanf(e, "%f,%f,%f,%f,%f", &mpitch, &sc, &off[0], &off[1], &off[2]); }
+    const VPIX_Pose &h = cur_in.hand, &hd = head_fed;
+    const VPIX_Pose hp = pitched(h, cur_in.gun_pitch + mpitch);
+    auto tw = [&](const float v[3], float out[3]) {
+        for (int i = 0; i < 3; i++) out[i] = 0;
+        for (int j = 0; j < 3; j++) { const float cj = v[0] * hd.R[j][0] + v[1] * hd.R[j][1] + v[2] * hd.R[j][2];
+            for (int i = 0; i < 3; i++) out[i] += cj * M[j][i]; }
+    };
+    float fwd[3], dv[3], w[3];
+    tw(hp.R[1], fwd);
+    for (int i = 0; i < 3; i++) dv[i] = h.p[i] + off[0] * h.R[0][i] + off[1] * h.R[1][i] + off[2] * h.R[2][i] - hd.p[i];
+    dv[2] -= crouch_fed;   /* from the real head, as ghost_fire_enter */
+    tw(dv, w);
+    const float l = sqrtf(fwd[0] * fwd[0] + fwd[1] * fwd[1] + fwd[2] * fwd[2]); if (l < 1e-3f) return false;
+    for (int i = 0; i < 3; i++) { o[i] = P[i] + world_scale * w[i]; d[i] = fwd[i] / l; }
+    return true;
+}
+/* the ray of this frame's shot by cart c (MallVR's floating targets / pumpkins): false = none recorded */
+static bool ghost_shot_ray(uint32_t c, float o[3], float d[3]) {
+    if (!c || c != gf_cart || hap_ms_now() - gf_ms > 250) return false;
+    memcpy(o, gf_o, sizeof(gf_o)); memcpy(d, gf_d, sizeof(gf_d)); return true;
+}
 /* VPIX_AIM_HEAD: the game aims where the head looks (MISS), so the trim applies to the head */
 static bool aim_head = getenv("VPIX_AIM_HEAD") && atoi(getenv("VPIX_AIM_HEAD")) != 0;
 
@@ -325,11 +515,12 @@ static uint32_t hle_trk_record(uint32_t mask, uint32_t rec, uint32_t mats = 0) {
         const int seat = (s >= 2 && seat2_live()) ? 1 : 0;   /* remote seat 2: its own input, centre, hand state */
         const VPIX_Input &ci = seat ? seat2_in : cur_in;
         const float *cen = cens[seat];
-        const float crouch = ci.crouch_mm;
+        const float crouch = ci.crouch_mm - (seat ? 0.f : seat_lift);   /* VPIX_SEATED lift = a negative crouch */
         bool is_head = (s % 2) == 0;                       /* sensors 1,4 = heads; 2,8 = hands */
         float pos[3];
         if (is_head) {
             VPIX_Pose h = ci.head;
+            if (!seat && attract_lock_now()) for (int r = 0; r < 3; r++) for (int c = 0; c < 3; c++) h.R[r][c] = r == c ? 1.f : 0.f;   /* VPIX_ATTRACT_LOCK */
             /* Pac-Man walks where the head faces: back/strafe turn the head the game sees (the renderer
                gets the same turned pose, so the view stays on the real head) */
             if (ci.walk_yaw != 0) for (int r = 0; r < 3; r++) {
@@ -337,6 +528,11 @@ static uint32_t hle_trk_record(uint32_t mask, uint32_t rec, uint32_t mats = 0) {
                 h.R[r][0] = x * c - y * sn; h.R[r][1] = x * sn + y * c;
             }
             pos[0] = (h.p[0] - cen[0] + ci.loco[0]) * head_xy; pos[1] = (h.p[1] - cen[1] + ci.loco[1]) * head_xy; pos[2] = h.p[2] - crouch;
+            /* VPIX_SEAT_BACK=<mm> (Phantom Freight, Bobby 10-28: "put our character a little further back in the cart so when we jump
+               flip we can see it better"): the game gets the head that much further back (the pod's -y); head_fed (the renderer's
+               reference) is left alone, so the eye simply rides further back with the game camera */
+            static const float seat_back = getenv("VPIX_SEAT_BACK") ? (float)atof(getenv("VPIX_SEAT_BACK")) : 0.f;
+            if (!seat) pos[1] -= seat_back;
             if (aim_head) pose_to_trkrec(pitched(h, ci.gun_pitch), pos, rec);   /* the aim trim tilts the head */
             else pose_to_trkrec(h, pos, rec);
             if (seat) { seat2_head_fed = h; seat2_head_fed.p[2] -= crouch; }   /* seat 2's frame carries its own fed head */
@@ -353,29 +549,63 @@ static uint32_t hle_trk_record(uint32_t mask, uint32_t rec, uint32_t mats = 0) {
                the trigger is sampled as the punch starts, 0x3530D). So feed whichever controller is further forward
                (60 mm hysteresis) and hold the trigger while the LEFT one is out past 340 mm: both real hands box. */
             static const bool two_hands = getenv("VPIX_TWO_HANDS") && atoi(getenv("VPIX_TWO_HANDS"));
+            /* VPIX_BOX_SELECT_FEED="gain,swap_mm,creep" (games.ps1 SelectFeed, Boxing, character select only = seat state word 0xA): sideways
+               moves are the control here, so the ring's touchy punch feed misfired (Bobby 11-01: moving the hand right punches, sometimes
+               in reverse). A hand swung sideways on its arc changes forward distance by ~100 mm, past the ring's 72 mm; the guard low
+               point was stale from before the screen; the other hand drifting 60 mm ahead took over the one arm on show. Forward here
+               is the way the head faces, not the room's y axis: with the view turned, a jab went sideways in the game (Bobby 11-01:
+               'moving hand left and right instead of punching'). A trigger pull is a punch too. */
+            static float sf_gain = 0.f, sf_swap = 60.f, sf_creep = 0.002f; static bool sf_read = false;
+            if (!sf_read) { sf_read = true; const char *e = getenv("VPIX_BOX_SELECT_FEED"); if (e && *e) sscanf(e, "%f,%f,%f", &sf_gain, &sf_swap, &sf_creep); }
+            const bool box_select = two_hands && data_delta && mem_readw(0xFA67C + data_delta + 93 * seat) == 0xA && sf_gain > 0.f;
+            float sfx = 0.f, sfy = 1.f;
+            if (box_select) { const float fl = sqrtf(hd.R[1][0] * hd.R[1][0] + hd.R[1][1] * hd.R[1][1]); if (fl > 1e-3f) { sfx = hd.R[1][0] / fl; sfy = hd.R[1][1] / fl; } }
             bool use_left = false;
             if (two_hands && ci.hand2.valid && ci.hand.valid) {
                 static bool lefts[2] = {false, false}; bool &left = lefts[seat];
-                float fr = ci.hand.p[1] - hd.p[1], fl = ci.hand2.p[1] - hd.p[1];
-                if (!left && fl > fr + 60.f) left = true;
-                else if (left && fr > fl + 60.f) left = false;
+                float fr = (ci.hand.p[0] - hd.p[0]) * sfx + (ci.hand.p[1] - hd.p[1]) * sfy, fl = (ci.hand2.p[0] - hd.p[0]) * sfx + (ci.hand2.p[1] - hd.p[1]) * sfy;
+                const float swap_mm = box_select ? sf_swap : 60.f;
+                if (!left && fl > fr + swap_mm) left = true;
+                else if (left && fr > fl + swap_mm) left = false;
                 use_left = left;
             }
-            const VPIX_Pose &h = use_left ? ci.hand2 : ci.hand;
+            const VPIX_Pose &h = (use_left || (dual_on() && !seat && dual_hand == 1 && ci.hand2.valid)) ? ci.hand2 : ci.hand;
             /* VPIX_BOX_PUNCH_REL="guard,gain" (Boxing, in the ring): a punch is measured from where YOUR fist rests, not from the head.
                Bobby's VR jabs (10-20 log) went 250 -> 400 mm in front of the eyes, the game's punch line is 408 mm: nothing landed.
                Each hand's guard = its slowest-rising low point (drops at once, creeps up over ~5 s); the game gets guard mm +
                (distance past your guard) * gain, so ~7 cm forward from your guard crosses the line at any arm length. */
             static float pr_guard = 0.f, pr_gain = 0.f; static bool pr_read = false;
             if (!pr_read) { pr_read = true; const char *e = getenv("VPIX_BOX_PUNCH_REL"); if (e && *e) sscanf(e, "%f,%f", &pr_guard, &pr_gain); }
-            const float raw_fwd = (h.p[1] - hd.p[1]) * hand_xy * ci.hand_reach;
+            const float raw_fwd = ((h.p[0] - hd.p[0]) * sfx + (h.p[1] - hd.p[1]) * sfy) * hand_xy * ci.hand_reach;
+            float sel_guard = raw_fwd;
             const bool punch_rel = pr_gain > 0.f && box_ring_view && two_hands;
             float rel_fwd = raw_fwd;
             if (punch_rel) {
                 static float gbase[2][2]; static bool ghave[2][2] = {{false, false}, {false, false}};
+                static bool was_select[2] = {false, false};
+                if (box_select != was_select[seat]) {
+                    if (box_select) ghave[seat][0] = ghave[seat][1] = false;
+                    lg("BOX_SELECT seat %d %s at tracker call %lu", seat + 1, box_select ? "on" : "off", trk_calls);
+                    was_select[seat] = box_select;
+                }
                 float &gb = gbase[seat][use_left ? 1 : 0]; bool &gh = ghave[seat][use_left ? 1 : 0];
-                if (!gh || raw_fwd < gb) { gb = raw_fwd; gh = true; } else gb += (raw_fwd - gb) * 0.002f;
-                rel_fwd = pr_guard + (raw_fwd - gb) * pr_gain * ci.punch_gain;   /* punch_gain: player's keyboard adjuster (left / right) */
+                if (!gh || raw_fwd < gb) { gb = raw_fwd; gh = true; } else gb += (raw_fwd - gb) * (box_select ? sf_creep : 0.002f);
+                rel_fwd = pr_guard + (raw_fwd - gb) * (box_select ? sf_gain : pr_gain) * ci.punch_gain;   /* punch_gain: player's keyboard adjuster (left / right) */
+                sel_guard = gb;
+                {   /* select: a fresh trigger pull throws a punch, 60 tracker reads out (~0.25 s); one already held as the screen opens doesn't */
+                    static bool trig_was[2] = {false, false}; static int trig_out[2] = {0, 0};
+                    const bool t = (ci.buttons & VPIX_BTN_TRIGGER) != 0;
+                    if (box_select && t && !trig_was[seat]) trig_out[seat] = 60;
+                    trig_was[seat] = t;
+                    if (!box_select) trig_out[seat] = 0;
+                    else if (trig_out[seat] > 0) { trig_out[seat]--; rel_fwd = (std::max)(rel_fwd, 700.f); }
+                }
+                static bool was_out[2] = {false, false}; static int nout = 0;
+                const bool is_out = rel_fwd > 408.f;
+                if (is_out != was_out[seat]) {
+                    if (is_out && nout++ < 500) lg("BOX_PUNCHLINE seat %d %s out at call %lu: fed %.0f raw %.0f guard %.0f", seat + 1, use_left ? "LEFT" : "right", trk_calls, rel_fwd, raw_fwd, gb);
+                    was_out[seat] = is_out;
+                }
             }
             if (two_hands) {
                 float fwd = punch_rel ? rel_fwd : raw_fwd;
@@ -393,7 +623,8 @@ static uint32_t hle_trk_record(uint32_t mask, uint32_t rec, uint32_t mats = 0) {
             static float xs_sc = 1.f, xs_mm = 0.f; static bool xs_read = false;
             if (!xs_read) { xs_read = true; const char *e = getenv("VPIX_HAND_X_SPREAD"); if (e) sscanf(e, "%f,%f", &xs_sc, &xs_mm); }
             float hx = (h.p[0] - hd.p[0]) * hand_xy * ci.hand_reach;
-            if (box_ring_view && two_hands) hx = hx * xs_sc + (use_left ? -(xs_mm + ci.spread_mm) : xs_mm + ci.spread_mm);   /* + keyboard [ / ] */
+            if (box_select) hx -= (std::max)(0.f, raw_fwd - sel_guard) * sfx;   /* the punch itself doesn't swing the arm sideways; no fist spread here */
+            else if (box_ring_view && two_hands) hx = hx * xs_sc + (use_left ? -(xs_mm + ci.spread_mm) : xs_mm + ci.spread_mm);   /* + keyboard [ / ] */
             pos[0] = (hd.p[0] - cen[0] + ci.loco[0]) * head_xy + hx;
             /* VPIX_HAND_FWD_OFF=<mm> (games.ps1 HandFwdOff, Boxing): the fed hand's forward distance is shifted back by this much.
                Boxing counts a hand more than 600 game units (408 mm) in front of the head as an extended punch and a
@@ -457,10 +688,18 @@ struct VVoice { const VSound *s = NULL; double pos = 0; int vol = 127, pan = 0, 
 static std::map<uint32_t, VSound> sounds;          /* key: card << 16 | sound number */
 static std::map<uint32_t, std::string> sound_names; /* VPIX_SNDLOG: sound number -> file name */
 static VVoice voices[32];
+static VSound door_snd; static std::atomic<bool> door_ready(false);   /* VPIX_ENDING folder's DOOR.wav: the museum's gallery doors */
 static MixerChannel *snd_chan = NULL;
 static const uint32_t SND_RATE = 44100;
 static bool sound_on = true;
 static float snd_gain = 0.35f;              /* VPIX_SOUND_GAIN; several voices overlap */
+static void play_game_sound(uint32_t num, int vol, int semis) {   /* one of the game's own loaded sounds (SND_LoadSound number), on a free voice */
+    const VSound *snd = NULL;
+    for (auto &kv : sounds) if ((kv.first & 0xFFFF) == num) { snd = &kv.second; break; }
+    if (!snd) return;
+    for (int i = 31; i >= 0; i--) if (!voices[i].on) { VVoice &v = voices[i]; v = VVoice(); v.s = snd; v.vol = vol; v.semis = semis; v.on = true; v.sound = num; return; }
+}
+static void play_game_sound(uint32_t num, int vol) { play_game_sound(num, vol, 0); }
 
 static bool parse_wav(const std::vector<uint8_t> &d, VSound &out) {
     if (d.size() < 44 || memcmp(d.data(), "RIFF", 4) || memcmp(d.data() + 8, "WAVE", 4)) return false;
@@ -490,6 +729,7 @@ static size_t cd_pos = 0;
 static bool cd_play = false;
 static float cd_gain = 0.6f;                        /* VPIX_CD_GAIN */
 static uint32_t cd_track = 0;
+static bool cd_loop = false;                        /* VPIX_RIDE_MUSIC: the ride track starts over at its end */
 
 static void snd_mix(Bitu len) {
     static std::vector<int16_t> buf;
@@ -498,7 +738,7 @@ static void snd_mix(Bitu len) {
         if (cd_play) for (Bitu i = 0; i < len && cd_pos + 1 < cd_pcm.size(); i++, cd_pos += 2) {
             buf[2 * i] = (int16_t)(cd_pcm[cd_pos] * cd_gain); buf[2 * i + 1] = (int16_t)(cd_pcm[cd_pos + 1] * cd_gain);
         }
-        if (cd_play && cd_pos + 1 >= cd_pcm.size()) cd_play = false;
+        if (cd_play && cd_pos + 1 >= cd_pcm.size()) { if (cd_loop) cd_pos = 0; else cd_play = false; }
     }
     for (VVoice &v : voices) {
         if (!v.on || !v.s) continue;
@@ -531,6 +771,381 @@ static void snd_mix(Bitu len) {
         uint16_t g[2] = {4, 16}; memcpy(hd + 32, g, 4); memcpy(hd + 36, "data", 4); memcpy(hd + 40, &wav_bytes, 4);
         long here = ftell(wav); fseek(wav, 0, SEEK_SET); fwrite(hd, 1, 44, wav); fseek(wav, here, SEEK_SET);
     }
+}
+
+/* ---- Pac-Man VR prototype v00.00.69 sound: Creative's AWE32 SDK called straight from the game (hooks PACMAN3K.game), no EMU8000 in
+   DOSBox. LoadWAV puts each of the 17 WAVs of its sample table (global awe_samples: { char name[30]; int loop; } x 17, eyes / sirens loop)
+   in user bank n + 1, preset 0, root key 60; a sound = CONTROLLER(ch, 0 = bank select, bank), PROGRAMCHANGE(ch, 0), NOTEON(ch, 60, vel).
+   All Pascal: args pushed left to right, the callee pops them (hook retpop 12 / 8). aweinit loads the WAVs for our mixer instead. */
+static uint32_t hle_awe32(const std::string &n) {
+    struct Chan { int bank = 0, vol = 127, pan = 0, bend = 0; };
+    static Chan ch[16];
+    const uint32_t sp = SegPhys(ss) + reg_esp;
+    auto arg = [&](int k, int nargs) { return (int)mem_readw(sp + 4 + 4 * (nargs - 1 - k)); };   /* k-th argument, left to right */
+    if (n == "aweinit") {
+        if (!snd_chan && sound_on) { snd_chan = MIXER_AddChannel(snd_mix, SND_RATE, "VPIXSND"); snd_chan->Enable(true); }
+        uint32_t t = global_rt("awe_samples"); int nload = 0;
+        for (int i = 0; t && i < 64; i++) {
+            std::string fn = rd_str(t + 0x22 * i); if (fn.empty()) break;
+            VSound s; std::vector<uint8_t> w;
+            if (read_dos_file(fn, w) && parse_wav(w, s)) {
+                s.loop = mem_readd(t + 0x22 * i + 0x1E) != 0;
+                sounds[0xA0000u | (i + 1)] = std::move(s); sound_names[0xA0000u | (i + 1)] = fn; nload++;
+            } else lg("aweinit: %s FAILED", fn.c_str());
+        }
+        lg("aweinit: %d WAVs -> banks 1..%d (HLE mixer %s)", nload, nload, snd_chan ? "on" : "off");
+        return 0;
+    }
+    if (n == "AWE32CONTROLLER") {                         /* (ch, controller, value): 0 bank select, 7 volume, 10 pan */
+        int c = arg(0, 3) & 15, k = arg(1, 3), v = arg(2, 3);
+        if (k == 0) ch[c].bank = v; else if (k == 7) ch[c].vol = v & 127; else if (k == 10) ch[c].pan = (v & 127) - 64;
+        return 0;
+    }
+    if (n == "AWE32PROGRAMCHANGE") return 0;              /* (ch, program): every WAV is preset 0 of its own bank */
+    if (n == "AWE32PITCHBEND") {                          /* (ch, lsb, msb): 14 bits, 8192 = none, +-2 semitones (voice bend: 32 = 1 semitone) */
+        int c = arg(0, 3) & 15, v = (arg(1, 3) & 127) | (arg(2, 3) & 127) << 7;
+        ch[c].bend = (v - 8192) * 64 / 8192;
+        for (VVoice &vo : voices) if (vo.on && (vo.sound >> 8 & 0xFF) == (uint32_t)(0xE0 | c)) vo.bend = ch[c].bend;
+        return 0;
+    }
+    if (n == "AWE32NOTEON" || n == "AWE32NOTEOFF") {      /* (ch, note, velocity) */
+        int c = arg(0, 3) & 15, note = arg(1, 3) & 127, vel = arg(2, 3) & 127;
+        const uint32_t tag = (0xE0u | c) << 8 | note;
+        for (VVoice &vo : voices) if (vo.on && (vo.sound & 0xFFFF) == tag) vo.on = false;   /* the same key again restarts it */
+        if (n == "AWE32NOTEOFF" || !vel) return 0;
+        auto it = sounds.find(0xA0000u | ch[c].bank);
+        if (it == sounds.end()) return 0;
+        for (int i = 31; i >= 0; i--) if (!voices[i].on) {
+            VVoice &v = voices[i]; v = VVoice(); v.s = &it->second; v.semis = note - 60; v.bend = ch[c].bend; v.loop = it->second.loop;
+            v.vol = vel * ch[c].vol / 127; v.pan = ch[c].pan; v.sound = tag; v.on = true; break;
+        }
+        static const bool sndlog = getenv("VPIX_SNDLOG") != NULL; static int nl = 0;
+        if (sndlog || nl++ < 60) lg("AWE32 f=%lu ch %d bank %d %s note %d vel %d", frame, c, ch[c].bank, sound_names[0xA0000u | ch[c].bank].c_str(), note, vel);
+        return 0;
+    }
+    return 0;                                             /* aweclose */
+}
+
+/* ---- Pac-Man VR prototype v00.00.69 levels (Bobby 11-01: "Level 2 = temple stage"). The exe only has stage 1: the last pill -> STAGE CLEAR
+   -> GAME_is_over -> GAME_fade_out_game -> GAME_init + GAME_load_map -> the title. Everything a maze is made of is plain data, so hooks
+   PACMAN3K.game swap it round those calls: junc[43] + link[60][60] + the paths they point at (3D polylines, 5 points at most; the mover
+   already follows z), eye_route[120], the pills (model slots 0x56..), the 4 energizer models, the scenery in the wall slots. Then the game
+   state goes straight to 6 (GAME_start_stage_1) instead of 3, the score kept. Even levels = the temple, odd levels = maze 1.
+   The temple = the cut art: 5 FIFTH wedges round PENTCENT, 8 steps 1500 up and 1515 deep (maze 1's corridors are 1500 wide: a tread is a
+   corridor): rings on treads 1 / 3 / 5 / 7, stairs up the 5 WATERFALs (a second copy 4 steps lower takes each down to the pit), the ghost
+   pen on the pit floor, its door up the stairs of wedge 2. No warps (junctions 17 / 23 teleport in PATH_at_junction: left unlinked).
+   Speeds: the arcade's level 2-4 against level 1 (Pac-Man 90 / 80, ghosts 85 / 75, blue ghosts 55 / 50); blue time 6 : 5 : 4 : 3 s. */
+static struct {
+    float maze_len = 0.f, time_k = 1.f;   /* time_k: the temple's clock bonuses against maze 1's */
+    int level = 1, pending = 0;        /* pending: 1 = stage cleared, -1 = game over (seen in GAME_is_over) */
+    bool snapped = false, temple = false, jump = false, booted = false, dress = false, keep_score = false;
+    uint32_t score = 0;
+    std::vector<uint8_t> junc, link, eyes, recs, ener;
+    std::vector<uint32_t> bufs;
+    std::vector<std::vector<uint8_t>> paths;
+    struct Pill { float x, y; uint32_t slot; bool on; };
+    std::vector<Pill> pills;
+    std::vector<int> show;
+} pac;
+static uint32_t hle_cd(const std::string &n);
+static std::set<uint32_t> pac_water3k;   /* WATERFAL: its textures (WH1sides, 4sand) never shipped, PIX_LoadLWOModel makes those faces white */
+static const uint32_t PAC_RECS_FIRST = 0x2D, PAC_RECS_N = 30;   /* the walls' model slots: 0x2D..0x32 outer, 0x33..0x4A inner */
+
+/* the call log fills up within a minute of play: level changes always get in */
+static void pac_lg(const char *fmt, ...) {
+    if (!flog) return;
+    va_list ap; va_start(ap, fmt); vfprintf(flog, fmt, ap); va_end(ap);
+    fputc('\n', flog); fflush(flog);
+}
+static void pac_wr_f(uint32_t a, float f) { uint32_t u; memcpy(&u, &f, 4); mem_writed(a, u); }
+static float pac_rd_f(uint32_t a) { const uint32_t u = mem_readd(a); float f; memcpy(&f, &u, 4); return f; }
+static void pac_rd(std::vector<uint8_t> &v, uint32_t a, uint32_t n) { v.resize(n); for (uint32_t i = 0; i < n; i++) v[i] = mem_readb(a + i); }
+static void pac_wr(const std::vector<uint8_t> &v, uint32_t a) { for (uint32_t i = 0; i < v.size(); i++) mem_writeb(a + i, v[i]); }
+
+/* a slot in / out of the game's views: what PIX_Add / RemoveModelFromView do to iview */
+static void pac_view(uint32_t slot, uint32_t views, bool on) {
+    for (uint32_t v = 0; v < 32; v++) if (views >> v & 1) {
+        const uint32_t iv = 0x172A00 + data_delta + v * 0xBC, w = iv + 0x40 + (slot >> 5) * 4, b = 1u << (slot & 31);
+        mem_writed(w, on ? mem_readd(w) | b : mem_readd(w) & ~b);
+        for (int k = 0; k < 8; k++) mem_writed(iv + 0x9C + k * 4, mem_readd(iv + 0x9C + k * 4) | 4);
+    }
+}
+
+/* PIX_SetModel's copy for handle + rotation + position (the renderer draws imodel; the game's records are only what it copies from).
+   The game has done its SetModel of the walls at boot, so the scenery needs this */
+static void pac_set_model(uint32_t slot) {
+    const uint32_t r = 0xCEF54 + data_delta + slot * 0x168, m = 0x176FFC + data_delta + slot * 0x20C;
+    mem_writed(m, mem_readd(r));
+    for (uint32_t c = 0; c < 3; c++) for (uint32_t q = 0; q < 3; q++) mem_writed(m + 4 + c * 16 + q * 4, mem_readd(r + 4 + q * 16 + c * 4));
+    for (uint32_t q = 0; q < 3; q++) mem_writed(m + 0x34 + q * 4, mem_readd(r + 0x34 + q * 4));
+    for (uint32_t q = 0; q < 8; q++) mem_writed(m + 0x1EC + q * 4, mem_readd(m + 0x1EC + q * 4) | 7);
+}
+
+static void pac_snapshot() {
+    const uint32_t LINK = 0x169234 + data_delta;
+    pac_rd(pac.junc, 0x9C9E4 + data_delta, 43 * 0x28);
+    pac_rd(pac.link, LINK, 60 * 60 * 8);
+    pac_rd(pac.eyes, 0x9DE64 + data_delta, 120 * 0x34);
+    pac_rd(pac.recs, 0xCEF54 + data_delta + PAC_RECS_FIRST * 0x168, PAC_RECS_N * 0x168);
+    pac_rd(pac.ener, 0xCEF54 + data_delta + 0x1A0 * 0x168, 4 * 0x168);
+    for (uint32_t i = 0; i < 60 * 60; i++) if (mem_readd(LINK + i * 8) == 2) {
+        const uint32_t b = mem_readd(LINK + i * 8 + 4);
+        pac.bufs.push_back(b); std::vector<uint8_t> v; pac_rd(v, b, 0x58); pac.paths.push_back(v);
+    }
+    pac.snapped = true;
+    pac.maze_len = 0.f;
+    for (uint32_t b : pac.bufs) for (uint32_t n = 0; n < mem_readd(b + 4); n++) pac.maze_len += pac_rd_f(b + 8 + n * 16 + 12);
+    pac_lg("Pac-Man levels: maze 1 saved, %u path buffers, %.0f long; door junc 14 exits %u: %u %u %u %u, pen junc 20 exits %u: %u %u %u %u", (unsigned)pac.bufs.size(), pac.maze_len,
+        mem_readd(0x9C9E4 + data_delta + 14 * 0x28 + 0x14), mem_readd(0x9C9E4 + data_delta + 14 * 0x28 + 0x18), mem_readd(0x9C9E4 + data_delta + 14 * 0x28 + 0x1C), mem_readd(0x9C9E4 + data_delta + 14 * 0x28 + 0x20), mem_readd(0x9C9E4 + data_delta + 14 * 0x28 + 0x24),
+        mem_readd(0x9C9E4 + data_delta + 20 * 0x28 + 0x14), mem_readd(0x9C9E4 + data_delta + 20 * 0x28 + 0x18), mem_readd(0x9C9E4 + data_delta + 20 * 0x28 + 0x1C), mem_readd(0x9C9E4 + data_delta + 20 * 0x28 + 0x20), mem_readd(0x9C9E4 + data_delta + 20 * 0x28 + 0x24));
+}
+
+static void pac_restore_maze1() {
+    pac_wr(pac.junc, 0x9C9E4 + data_delta); pac_wr(pac.link, 0x169234 + data_delta); pac_wr(pac.eyes, 0x9DE64 + data_delta);
+    pac_wr(pac.recs, 0xCEF54 + data_delta + PAC_RECS_FIRST * 0x168); pac_wr(pac.ener, 0xCEF54 + data_delta + 0x1A0 * 0x168);
+    for (size_t i = 0; i < pac.bufs.size(); i++) pac_wr(pac.paths[i], pac.bufs[i]);
+    for (uint32_t s = PAC_RECS_FIRST; s < PAC_RECS_FIRST + PAC_RECS_N; s++) pac_set_model(s);
+    for (uint32_t s = 0x1A0; s < 0x1A4; s++) pac_set_model(s);
+    pac.temple = false; pac.pills.clear(); pac.show.clear();
+}
+
+static void pac_build_temple() {
+    const uint32_t JUNC = 0x9C9E4 + data_delta, LINK = 0x169234 + data_delta, EYES = 0x9DE64 + data_delta;
+    const uint32_t MODEL = 0xCEF54 + data_delta, HANDLE = 0x128F54 + data_delta;
+    struct V { float x, y, z; };
+    const double D = 3.14159265358979 / 180.0;
+    static const float h[4] = {1510.f, 4510.f, 7510.f, 10510.f}, ap[4] = {6761.f, 9791.f, 12821.f, 15851.f};   /* treads 1, 3, 5, 7: height, middle */
+    auto mid = [&](float a, int k, float z) { const double t = 72.0 * k * D; return V{(float)(a * sin(t)), (float)(-a * cos(t)), z}; };
+    auto corner = [&](int r, int k) { const double t = (72.0 * k + 36.0) * D; const float c = ap[r] / (float)cos(36.0 * D); return V{(float)(c * sin(t)), (float)(-c * cos(t)), h[r]}; };
+    /* junctions: 14 = maze 1's pen door, 20 / 24 / 25 = its pen (ghost_start_junc), 27 = where PLAYER_init starts */
+    int id[4][5], next = 0;
+    for (int r = 0; r < 4; r++) for (int k = 0; k < 5; k++) {
+        if (r == 0 && k == 2) { id[r][k] = 14; continue; }
+        if (r == 1 && k == 0) { id[r][k] = 27; continue; }
+        while (next == 14 || next == 17 || next == 20 || next == 23 || next == 24 || next == 25 || next == 27) next++;
+        id[r][k] = next++;
+    }
+    V jp[43]; int jt[43];
+    for (int j = 0; j < 43; j++) { jp[j] = V{0.f, 0.f, -20000.f}; jt[j] = 4; }
+    /* a ramp's straight top: rim (18123, 13520) to (10544, 6020), the lower copy on down. The junctions sit on it: the player and the ghosts walk the ramps' surface,
+       and over the ramp where a ring crosses it */
+    auto ramp_z = [](float a) { return 13520.f - (18123.f - a) * 0.9896f; };
+    for (int r = 0; r < 4; r++) for (int k = 0; k < 5; k++) { jp[id[r][k]] = mid(ap[r], k, ramp_z(ap[r])); jt[id[r][k]] = 1; }
+    jp[20] = V{0.f, 750.f, 0.f}; jp[24] = V{-2250.f, -750.f, 0.f}; jp[25] = V{2250.f, -750.f, 0.f}; jt[20] = jt[24] = jt[25] = 2;
+    struct P { int a, b; std::vector<V> via; bool pills; };
+    std::vector<P> ps;
+    for (int r = 0; r < 4; r++) for (int k = 0; k < 5; k++) {   /* down off the ramp to the tread, the corner, up onto the next ramp: 5 points */
+        const V a = mid(ap[r], k, h[r]), b = mid(ap[r], (k + 1) % 5, h[r]), c = corner(r, k);
+        auto off = [&](const V &m) { const float dx = c.x - m.x, dy = c.y - m.y, L = sqrtf(dx * dx + dy * dy); return V{m.x + dx / L * 1000.f, m.y + dy / L * 1000.f, h[r]}; };
+        ps.push_back({id[r][k], id[r][(k + 1) % 5], {off(a), c, off(b)}, true});
+    }
+    for (int r = 0; r < 3; r++) for (int k = 0; k < 5; k++) ps.push_back({id[r][k], id[r + 1][k], {}, true});
+    ps.push_back({14, 20, {mid(5000.f, 2, 0.f)}, false});
+    ps.push_back({20, 24, {V{-2250.f, 750.f, 0.f}}, false});
+    ps.push_back({20, 25, {V{2250.f, 750.f, 0.f}}, false});
+    ps.push_back({24, 25, {}, false});
+    /* paths and links, in the buffers PATH_create_stage_1_links malloc'ed (0x58 bytes: 5 points) */
+    for (uint32_t i = 0; i < 60 * 60; i++) { mem_writed(LINK + i * 8, 1); mem_writed(LINK + i * 8 + 4, 0); }
+    std::vector<int> adj[43];
+    auto polyline = [&](const P &p) { std::vector<V> pt; pt.push_back(jp[p.a]); for (const V &v : p.via) pt.push_back(v); pt.push_back(jp[p.b]); return pt; };
+    auto dist = [](const V &a, const V &b) { const float dx = b.x - a.x, dy = b.y - a.y, dz = b.z - a.z; return sqrtf(dx * dx + dy * dy + dz * dz); };
+    float temple_len = 0.f;
+    for (size_t i = 0; i < ps.size() && i < pac.bufs.size(); i++) {
+        const P &p = ps[i]; const uint32_t b = pac.bufs[i]; const std::vector<V> pt = polyline(p);
+        for (size_t n = 0; n + 1 < pt.size(); n++) temple_len += dist(pt[n], pt[n + 1]);
+        mem_writed(b, 1); mem_writed(b + 4, (uint32_t)pt.size());
+        for (size_t n = 0; n < pt.size(); n++) {
+            const uint32_t q = b + 8 + (uint32_t)n * 16;
+            pac_wr_f(q, pt[n].x); pac_wr_f(q + 4, pt[n].y); pac_wr_f(q + 8, pt[n].z); pac_wr_f(q + 12, n + 1 < pt.size() ? dist(pt[n], pt[n + 1]) : 0.f);
+        }
+        const uint32_t ab = LINK + p.a * 0x1E0 + p.b * 8, ba = LINK + p.b * 0x1E0 + p.a * 8;
+        mem_writed(ab, 2); mem_writed(ab + 4, b); mem_writed(ba, 3); mem_writed(ba + 4, b);
+        adj[p.a].push_back(p.b); adj[p.b].push_back(p.a);
+    }
+    /* the pen's door: the player picks among a junction's exits by direction only, so the way in must not be listed at 14. Ghosts go home by
+       eye_route over the links, and out through 20's own list */
+    adj[14].erase(std::remove(adj[14].begin(), adj[14].end(), 20), adj[14].end());
+    for (int j = 0; j < 43; j++) {
+        const uint32_t q = JUNC + j * 0x28; const int ne = (int)adj[j].size();
+        mem_writed(q, j); pac_wr_f(q + 4, jp[j].x); pac_wr_f(q + 8, jp[j].y); pac_wr_f(q + 12, jp[j].z); mem_writed(q + 0x10, jt[j]); mem_writed(q + 0x14, ne);
+        for (int e = 0; e < 4; e++) mem_writed(q + 0x18 + e * 4, e < ne ? adj[j][e] : 0);
+    }
+    /* eye_route: { from, to, junctions from 'to' to the pen, -1 } per direction: the shortest way home */
+    int back[43]; for (int j = 0; j < 43; j++) back[j] = -1;
+    { std::vector<int> q(1, 20); back[20] = 20; for (size_t i = 0; i < q.size(); i++) for (int n : adj[q[i]]) if (back[n] < 0) { back[n] = q[i]; q.push_back(n); } }   /* from 20: its list has 14 */
+    uint32_t nroute = 0;
+    for (const P &p : ps) for (int d = 0; d < 2 && nroute < 120; d++) {
+        const int from = d ? p.b : p.a, to = d ? p.a : p.b;
+        const uint32_t q = EYES + nroute++ * 0x34;
+        mem_writed(q, from); mem_writed(q + 4, to);
+        int k = 0; for (int j = to; j != 20 && k < 10; j = back[j]) mem_writed(q + 8 + k++ * 4, back[j]);
+        mem_writed(q + 8 + k * 4, 0xFFFFFFFFu);
+    }
+    for (uint32_t i = nroute; i < 120; i++) { mem_writed(EYES + i * 0x34, 0xFFFFFFFFu); mem_writed(EYES + i * 0x34 + 4, 0xFFFFFFFFu); }
+    /* energizers: on the ring below the outer one, in 4 of its corners (GAME_eat_energizers reads the models' x y) */
+    static const int ecorn[4] = {0, 1, 3, 4};
+    V en[4];
+    for (int i = 0; i < 4; i++) {
+        const uint32_t m = MODEL + (0x1A0 + i) * 0x168; uint32_t uz; memcpy(&uz, pac.ener.data() + i * 0x168 + 0x3C, 4); float z0; memcpy(&z0, &uz, 4);
+        en[i] = corner(2, ecorn[i]);
+        pac_wr_f(m + 0x34, en[i].x); pac_wr_f(m + 0x38, en[i].y); pac_wr_f(m + 0x3C, en[i].z + z0);
+        pac_set_model(0x1A0 + i);
+    }
+    /* pills: evenly along the paths + one on each junction, 242 at most (the slots maze 1 initialised; 181 needed for the 3 clock bonuses) */
+    struct PP { float x, y, z; };
+    std::vector<PP> pp;
+    for (float sp = 1500.f; ; sp += 50.f) {
+        pp.clear();
+        auto near_en = [&](float x, float y) { for (const V &e : en) if (fabsf(e.x - x) < 800.f && fabsf(e.y - y) < 800.f) return true; return false; };
+        for (int r = 0; r < 4; r++) for (int k = 0; k < 5; k++) if (id[r][k] != 27) pp.push_back({jp[id[r][k]].x, jp[id[r][k]].y, jp[id[r][k]].z});
+        for (const P &p : ps) if (p.pills) {
+            const std::vector<V> pt = polyline(p);
+            float L = 0.f; for (size_t n = 0; n + 1 < pt.size(); n++) L += dist(pt[n], pt[n + 1]);
+            const int cnt = (std::max)(1, (int)(L / sp + 0.5f));
+            for (int i = 1; i < cnt; i++) {
+                float s = L * i / cnt; size_t n = 0;
+                while (n + 2 < pt.size() && s > dist(pt[n], pt[n + 1])) { s -= dist(pt[n], pt[n + 1]); n++; }
+                const float t = s / dist(pt[n], pt[n + 1]);
+                const V q{pt[n].x + (pt[n + 1].x - pt[n].x) * t, pt[n].y + (pt[n + 1].y - pt[n].y) * t, pt[n].z + (pt[n + 1].z - pt[n].z) * t};
+                if (!near_en(q.x, q.y)) pp.push_back({q.x, q.y, q.z});
+            }
+        }
+        if (pp.size() <= 242) { pac_lg("Pac-Man temple: %u paths, %u pills every %.0f", (unsigned)ps.size(), (unsigned)pp.size(), sp); break; }
+    }
+    pac.pills.clear();
+    for (size_t i = 0; i < 242; i++) {
+        const uint32_t slot = 0x56 + (uint32_t)i, m = MODEL + slot * 0x168;
+        if (i < pp.size()) {    /* on the step under it; on a ramp (Bobby 11-01: sunken, clipping) above its straight top */
+            float a = 0.f, lat = 0.f;
+            for (int k = 0; k < 5; k++) { const float s = (float)sin(72.0 * k * D), c = (float)cos(72.0 * k * D), o = pp[i].x * s - pp[i].y * c; if (o > a) { a = o; lat = pp[i].x * c + pp[i].y * s; } }
+            const bool ramp = fabsf(lat) < 800.f;   /* a ball on a 45 degree slope needs more height to clear it than on a floor */
+            const float floor_z = ramp ? ramp_z(a) + 400.f : 1510.f + 1500.f * floorf((a - 6004.f) / 1515.f);
+            pac_wr_f(m + 0x34, pp[i].x); pac_wr_f(m + 0x38, pp[i].y); pac_wr_f(m + 0x3C, floor_z + 600.f); pac.pills.push_back({pp[i].x, pp[i].y, slot, true}); }
+        else pac_wr_f(m + 0x3C, -100000.f);
+        pac_set_model(slot);
+    }
+    /* the scenery, in wall slots (not 0x3C, 0x3D, 0x3F, 0x43: GAME_start_stage_1 takes those out again): LWO_ReadPNTSChunk swaps the file's y and z, so a model is z up already, wedge 0 out along -y; wedge k turned 72 k degrees.
+       M[n] = where the model's axis n goes = row n of a PIXMODEL's rotation */
+    static const int slots[16] = {0x2D, 0x2E, 0x2F, 0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3A, 0x3B, 0x3E};
+    pac.show.clear();
+    for (int i = 0; i < 16; i++) {
+        const int k = i == 0 ? 0 : (i - 1) % 5, kind = i == 0 ? 0 : 1 + (i - 1) / 5;   /* 0 PENTCENT, 1 FIFTH, 2 WATERFAL, 3 its lower copy */
+        const uint32_t sym = kind == 0 ? 0x58 : kind == 1 ? 0x59 + k : 0x5E + k;
+        const uint32_t m = MODEL + slots[i] * 0x168;
+        const double t = 72.0 * k * D; const float c = (float)cos(t), s = (float)sin(t);
+        const float M[3][3] = {{c, s, 0.f}, {-s, c, 0.f}, {0.f, 0.f, 1.f}};
+        mem_writed(m, mem_readd(HANDLE + sym * 4));
+        if (kind >= 2) pac_water3k.insert(mem_readd(HANDLE + sym * 4));
+        for (int r = 0; r < 3; r++) for (int q = 0; q < 3; q++) pac_wr_f(m + 4 + r * 16 + q * 4, M[r][q]);
+        const float dn = kind == 3 ? -6000.f : 0.f, in = kind == 3 ? 6060.f : 0.f;
+        pac_wr_f(m + 0x34, in * M[1][0]); pac_wr_f(m + 0x38, in * M[1][1]); pac_wr_f(m + 0x3C, dn);
+        pac_set_model(slots[i]);
+        pac.show.push_back(slots[i]);
+    }
+    /* the clock: 60 s + 20 + 15 + 10 for maze 1. Bobby 11-01: the clock ran out in the temple, longer walks and every ramp out of the way: the same
+       time per length, then a quarter more */
+    pac.time_k = (std::max)(1.f, temple_len / pac.maze_len * 1.25f);
+    pac_lg("Pac-Man temple: %.0f long, maze 1 %.0f: clock bonuses x %.2f", temple_len, pac.maze_len, pac.time_k);
+    pac.temple = true;
+}
+
+/* blue time, Pac-Man's and the ghosts' speeds = immediates in the code */
+static void pac_set_speeds(int level) {
+    static const uint32_t ghost[9] = {0x1BEE2, 0x1BFFC, 0x1C7E7, 0x1C932, 0x1C93C, 0x1CA1C, 0x1CB60, 0x1CCA4, 0x1CDE8};
+    static const uint32_t blue[8] = {0x250DE, 0x250EB, 0x25169, 0x25176, 0x251F4, 0x25201, 0x2527F, 0x2528C};
+    const bool lv1 = level <= 1;
+    const float blue_s = (std::max)(5.f, 15.f - 2.5f * (level - 1));
+    for (uint32_t a : ghost) pac_wr_f(a + code_delta, lv1 ? 150.f : 170.f);
+    for (uint32_t a : blue) pac_wr_f(a + code_delta, lv1 ? 75.f : 82.5f);
+    pac_wr_f(0x183D3 + code_delta, lv1 ? 250.f : 281.f);
+    pac_wr_f(0x25064 + code_delta, blue_s);
+    const float tk = pac.temple ? pac.time_k : 1.f;   /* GAME_run_game's EXTRA TIME at 60, 121, 181 pills: seconds = immediates */
+    pac_wr_f(0x235C9 + code_delta, 20.f * tk); pac_wr_f(0x236E3 + code_delta, 15.f * tk); pac_wr_f(0x237EB + code_delta, 10.f * tk);
+    pac_lg("Pac-Man level %d: %s, Pac-Man %.0f, ghosts %.0f, blue %.1f s", level, !(level & 1) ? "temple" : "maze 1", lv1 ? 250.f : 281.f, lv1 ? 150.f : 170.f, blue_s);
+}
+
+/* dev: VPIX_PAC_WD=1: the game has stopped calling GAME_eat_pills etc. for a second -> where is it */
+static unsigned long pac_wd_calls = 0;
+static void pac_wd(Bitu) {
+    static unsigned long last = 0; static int same = 0;
+    if (pac_wd_calls == last && ++same < 20) { lg("Pac-Man watchdog: no hook for %d s: eip %X (code %X) esp %X eax %X state %u", same, reg_eip, reg_eip - code_delta, reg_esp, reg_eax, mem_readd(0x13FB90 + data_delta)); if (flog) fflush(flog); }
+    else if (pac_wd_calls != last) same = 0;
+    last = pac_wd_calls;
+    PIC_AddEvent(pac_wd, 1000.f);
+}
+
+/* true = skip the game's function */
+static bool pac_hook(const std::string &n) {
+    const uint32_t G = 0x13FB90 + data_delta;
+    pac_wd_calls++;
+    {   static bool wd = false; if (!wd) { wd = true; if (getenv("VPIX_PAC_WD")) PIC_AddEvent(pac_wd, 1000.f); } }
+    if (n == "pac_is_over") {          /* the last pill or the clock ran out; GAME_init clears stage_clear before we would see it */
+        if (!pac.pending) { pac.pending = mem_readd(0x1659C4 + data_delta) ? 1 : -1; pac.score = mem_readd(G + 0x2DC) + mem_readd(G + 0x2E0);
+            pac_lg("Pac-Man level %d over: %s, %u pills left, score %u", pac.level, pac.pending > 0 ? "cleared" : "clock ran out", mem_readd(G + 0x1E0), pac.score); }   /* player's score: points waiting + shown; PLAYER_init zeroes it */
+        return false;
+    }
+    if (n == "pac_init") {             /* before the player and the ghosts start from junc[] */
+        if (!pac.booted) { pac.booted = true; pac_snapshot(); return false; }
+        const int was = pac.level;
+        if (pac.pending == 1) pac.level++; else if (pac.pending == -1) pac.level = 1;
+        pac.jump = pac.pending == 1;
+        pac.pending = 0;
+        if (pac.level != was || pac.jump) {
+            if (pac.temple) pac_restore_maze1();
+            if (!(pac.level & 1)) pac_build_temple();
+            pac_set_speeds(pac.level);
+        }
+        return false;
+    }
+    if (n == "pac_load_map") {         /* GAME_init has run */
+        mem_writed(0x16599C + data_delta, 0);   /* dots_to_go: the game never resets it */
+        if (pac.jump) {
+            pac.jump = false;
+            mem_writed(G, 6);                   /* GAME_start_stage_1, not the title */
+            pac.keep_score = true;
+            if (getenv("VPIX_CD_DIR")) { const uint32_t a = reg_eax, d = reg_edx; reg_eax = (pac.level & 1) ? 1 : 2; reg_edx = 0; hle_cd("CD_playTrack"); reg_eax = a; reg_edx = d; }   /* music 2 is otherwise never played */
+        }
+        if (!pac.temple) return false;
+        mem_writed(G + 0x1E0, (uint32_t)pac.pills.size()); mem_writed(0x16599C + data_delta, (uint32_t)pac.pills.size()); mem_writed(0x1659A0 + data_delta, (uint32_t)pac.pills.size());
+        pac.dress = true;
+        return true;
+    }
+    if (n == "pac_fade_in") {          /* GAME_start_stage_1 has added the walls, the floor, the warps and every pill slot */
+        if (pac.keep_score) { pac.keep_score = false; mem_writed(G + 0x2E0, pac.score); }
+        if (pac.dress) {
+            pac.dress = false;
+            pac_view(0, 0xFFFFFFFFu, false); pac_view(9, 0xFFFFFFFFu, false); pac_view(10, 0xFFFFFFFFu, false); pac_view(0x2A, 0xFFFFFFFFu, false); pac_view(0x2B, 0xFFFFFFFFu, false);
+            for (uint32_t s = PAC_RECS_FIRST; s < PAC_RECS_FIRST + PAC_RECS_N; s++) pac_view(s, 0xFFFFFFFFu, false);
+            for (int s : pac.show) pac_view((uint32_t)s, 0x18, true);
+            if (getenv("VPIX_PAC_WD")) for (int s : pac.show) {
+                const uint32_t m = 0x176FFC + data_delta + s * 0x20C, iv = 0x172A00 + data_delta + 4 * 0xBC;
+                pac_lg("temple slot %X handle %08X T (%.0f %.0f %.0f) S (%.2f %.2f %.2f) view4 %d", s, mem_readd(m), pac_rd_f(m + 0x34), pac_rd_f(m + 0x38), pac_rd_f(m + 0x3C), pac_rd_f(m + 0x84), pac_rd_f(m + 0x88), pac_rd_f(m + 0x8C), (int)(mem_readd(iv + 0x40 + (s >> 5) * 4) >> (s & 31) & 1));
+            }
+            for (uint32_t s = 0x56 + (uint32_t)pac.pills.size(); s < 0x1A0; s++) pac_view(s, 0xFFFFFFFFu, false);
+        }
+        return false;
+    }
+    if (n == "pac_eat_pills") {        /* each frame of the game; the temple's pills are not on GAME_load_map's 500-unit grid */
+                                    /* dev: keep walking */
+        if (!pac.temple) return false;
+        {   static bool in_pit = false; const bool now = pac_rd_f(G + 0x5AC) < 3000.f;   /* the rings' eye is 3510 up at the least */
+            if (now != in_pit) { in_pit = now; if (now) pac_lg("Pac-Man temple: player on the pit floor at (%.0f %.0f)", pac_rd_f(G + 0x5A4), pac_rd_f(G + 0x5A8)); } }
+        if (mem_readd(G + 0x23C) == 3) return true;
+        const float x = pac_rd_f(G + 0x5A4), y = pac_rd_f(G + 0x5A8);
+        for (auto &p : pac.pills) if (p.on && fabsf(p.x - x) < 350.f && fabsf(p.y - y) < 350.f) {
+            p.on = false;
+            pac_view(p.slot, 0xFFFFFFFFu, false);
+            /* the game's bite: bank 1 on channel 15 */
+            const uint32_t sp = SegPhys(ss) + reg_esp;
+            mem_writed(sp - 16, 1); mem_writed(sp - 12, 0); mem_writed(sp - 8, 15); reg_esp -= 20; hle_awe32("AWE32CONTROLLER"); reg_esp += 20;
+            mem_writed(sp - 16, 127); mem_writed(sp - 12, 60); mem_writed(sp - 8, 15); reg_esp -= 20; hle_awe32("AWE32NOTEON"); reg_esp += 20;
+            mem_writed(G + 0x2DC, mem_readd(G + 0x2DC) + 10);
+            mem_writed(G + 0x1E4, mem_readd(G + 0x1E4) + 1);
+            mem_writed(G + 0x1E0, mem_readd(G + 0x1E0) - 1);
+        }
+        return true;
+    }
+    return false;
 }
 
 /* ---- Total Recoil (SU3000) sound: the game's AWE_ module drove an AWE32 through Creative's 3D audio library (C3DA*); DOSBox has
@@ -712,7 +1327,19 @@ static uint32_t hle_cd(const std::string &n) {
     static const char *dir = getenv("VPIX_CD_DIR");
     static bool init = false;
     if (!init) { init = true; if (getenv("VPIX_CD_GAIN")) cd_gain = (float)atof(getenv("VPIX_CD_GAIN")); }
-    if (n == "CD_PlayTrack") {
+    /* VPIX_CD_MAP="1:4,2:6" (run_su3k.sh pacman): the game's own CD_playTrack(n) (Pac-Man VR v00.00.69: music 1 or 2, numbered from
+       its audio track list) -> the disc's real track, looped like background music. The released game's CD: tracks 4 and 6 are
+       its two 3-minute pieces, the rest 8-second stings (Bobby 11-01: "Yes, add the music") */
+    bool wrap = false;
+    if (n == "CD_playTrack") {
+        static std::map<uint32_t, uint32_t> map; static bool rd = false;
+        if (!rd) { rd = true; if (const char *e = getenv("VPIX_CD_MAP")) for (const char *q = e; *q;) {
+            unsigned a, b; int used = 0; if (sscanf(q, "%u:%u%n", &a, &b, &used) == 2) map[a] = b; else break;
+            q += used; if (*q == ',') q++; } }
+        auto it = map.find(reg_eax); if (it == map.end()) return 0;
+        reg_edx = it->second; wrap = true;
+    }
+    if (n == "CD_PlayTrack" || wrap) {
         uint32_t t = reg_edx;
         char fn[1024]; snprintf(fn, sizeof(fn), "%s/TRACK%02u.WAV", dir, t);
         std::vector<int16_t> pcm;
@@ -739,6 +1366,7 @@ static uint32_t hle_cd(const std::string &n) {
         lg("CD_PlayTrack drive=%u track=%u -> %s (%.1f s)", reg_eax, t, pcm.empty() ? "NO FILE" : fn, pcm.size() / 2.0 / 44100.0);
         std::lock_guard<std::mutex> lk(cd_mtx);
         cd_pcm.swap(pcm); cd_pos = 0; cd_play = !cd_pcm.empty(); cd_track = t;
+        if (wrap) cd_loop = true;
         return 0;
     }
     std::lock_guard<std::mutex> lk(cd_mtx);
@@ -769,6 +1397,104 @@ static void haptic_for_sound(std::string fn) {
         if (r.hand == 3) { if (trigger_held || hap_ms_now() - trigger_down_ms < 250) VPIX_Haptic(0, r.secs, r.amp); }
         else VPIX_Haptic(r.hand, r.secs, r.amp);
         break; }
+}
+
+/* VPIX_RIDE_MUSIC="file;file;..." (Phantom Freight, dev, Bobby 10-27: "there was no music ... we have the patches song and there are a
+   few other spooky ones on our website you can alternate ... or that synth score ... maybe patches plays at game over"): Ghost Train
+   plays no music of its own (no CD library calls). Each ride gets the next track of the list, looped under the ride sounds at
+   VPIX_RIDE_MUSIC_GAIN (0.35), faded in over 2 s; when the ride ends it fades out and VPIX_END_MUSIC (Patch's Halloween song) plays
+   once over the game over, the initials and the Happy Halloween card. A new ride stops it. Any format ffmpeg reads, through the CD
+   audio stream (decoded on a worker thread). ride_music_bpm(): the playing track's beats per minute ("file|bpm" in the list; 0 =
+   none given) and seconds into it, for the beat-synced sky lights. */
+static float rm_bpm = 0.f; static unsigned long long rm_start_ms = 0;
+/* the playing track's kick right now (Bobby 10-27: "have sky lights go with the music more, as another layer"): bass energy of the
+   last ~23 ms (a 2-pole low-pass at ~120 Hz over 1024 stereo frames before the play position) against its own slow average; 0..1 */
+static float ride_music_kick() {
+    std::lock_guard<std::mutex> lk(cd_mtx);
+    if (!cd_play || cd_pcm.size() < 4096 || cd_pos < 2048) return 0.f;
+    float lp1 = 0, lp2 = 0, e = 0; const float a = 0.017f;   /* ~120 Hz at 44.1 kHz */
+    for (size_t i = cd_pos - 2048; i + 1 < cd_pos; i += 2) {
+        const float x = (cd_pcm[i] + cd_pcm[i + 1]) * (0.5f / 32768.f);
+        lp1 += a * (x - lp1); lp2 += a * (lp1 - lp2); e += lp2 * lp2;
+    }
+    e = sqrtf(e / 1024.f);
+    static float avg = 0.02f; avg += (e - avg) * 0.01f;
+    const float k = (e / (avg + 1e-4f) - 1.f) * 1.4f;
+    return k < 0.f ? 0.f : k > 1.f ? 1.f : k;
+}
+static float ride_music_beat(float &bpm) { bpm = rm_bpm; return rm_start_ms ? (hap_ms_now() - rm_start_ms) / 1000.f : -1.f; }
+/* VPIX_STAGE_MUSIC="<stage>=file|bpm;..." (hell + mall slice, Bobby 10-28: hell + mall ride music): while the cart is in one of these
+   stages (0-based, cart +5) its own track plays instead of the ride's VPIX_RIDE_MUSIC track, faded in; leaving it goes back. */
+static void ride_music_tick(bool riding, int stage) {
+    static const char *list = getenv("VPIX_RIDE_MUSIC"), *endm = getenv("VPIX_END_MUSIC");
+    if (!(list && *list) && !(endm && *endm)) return;
+    static unsigned long long last_ride = 0;   /* a gap under 3 s (between sections) is still the same ride */
+    if (riding) last_ride = hap_ms_now(); else riding = last_ride && hap_ms_now() - last_ride < 3000;
+    static std::vector<std::pair<std::string, float>> tracks; static bool parsed = false; static size_t next = 0;
+    static float gain = 0.35f; static bool was = false; static float fade = 0.f; static int mode = 0;   /* 0 quiet, 1 ride, 2 end song */
+    if (!parsed) {
+        parsed = true;
+        if (const char *g = getenv("VPIX_RIDE_MUSIC_GAIN")) gain = (float)atof(g);
+        std::string all = list ? list : ""; size_t p = 0;
+        while (p < all.size()) { size_t q = all.find(';', p); if (q == std::string::npos) q = all.size();
+            std::string it = all.substr(p, q - p); float bpm = 0; size_t bar = it.find('|');
+            if (bar != std::string::npos) { bpm = (float)atof(it.c_str() + bar + 1); it = it.substr(0, bar); }
+            if (!it.empty()) tracks.push_back({it, bpm}); p = q + 1; }
+        lg("HLE: VPIX_RIDE_MUSIC %u tracks, end song %s, gain %.2f", (unsigned)tracks.size(), endm ? endm : "-", gain);
+    }
+    static std::map<int, std::pair<std::string, float>> stage_tracks; static bool sparsed = false; static int cur_key = -1;
+    if (!sparsed) {
+        sparsed = true;
+        if (const char *sm = getenv("VPIX_STAGE_MUSIC")) { std::string all = sm; size_t p = 0;
+            while (p < all.size()) { size_t q = all.find(';', p); if (q == std::string::npos) q = all.size();
+                std::string it = all.substr(p, q - p); size_t eq = it.find('=');
+                if (eq != std::string::npos) { const int st = atoi(it.c_str()); std::string fb = it.substr(eq + 1); float bpm = 0; size_t bar = fb.find('|');
+                    if (bar != std::string::npos) { bpm = (float)atof(fb.c_str() + bar + 1); fb = fb.substr(0, bar); }
+                    if (!fb.empty()) stage_tracks[st] = {fb, bpm}; }
+                p = q + 1; }
+            lg("HLE: VPIX_STAGE_MUSIC %u stages", (unsigned)stage_tracks.size()); }
+    }
+    auto load = [&](const std::string path, bool loop, float bpm) {
+        if (!snd_chan && sound_on) { snd_chan = MIXER_AddChannel(snd_mix, SND_RATE, "VPIXSND"); snd_chan->Enable(true); }
+        std::thread([path, loop, bpm]() {
+            static const char *ff = getenv("VPIX_FFMPEG") ? getenv("VPIX_FFMPEG") : "ffmpeg";
+            char cmd[2048]; snprintf(cmd, sizeof(cmd), "\"%s\" -v quiet -i \"%s\" -vn -f s16le -ac 2 -ar 44100 -", ff, path.c_str());
+            std::vector<int16_t> pcm;
+            if (void *pa = VPIX_PipeOpen(cmd)) { std::vector<int16_t> chunk(65536); size_t r;
+                while ((r = VPIX_PipeRead(pa, chunk.data(), chunk.size() * 2)) > 0) pcm.insert(pcm.end(), chunk.begin(), chunk.begin() + r / 2);
+                VPIX_PipeClose(pa); }
+            lg("RIDE_MUSIC %s: %.1f s%s", path.c_str(), pcm.size() / 88200.0, pcm.empty() ? " ** NOT DECODED" : "");
+            std::lock_guard<std::mutex> lk(cd_mtx); cd_pcm.swap(pcm); cd_pos = 0; cd_play = !cd_pcm.empty(); cd_loop = loop;
+            rm_bpm = bpm; rm_start_ms = hap_ms_now();
+        }).detach();
+    };
+    if (riding && !was && !tracks.empty()) {   /* a ride starts: the next track */
+        const auto &t = tracks[next++ % tracks.size()];
+        cd_gain = 0.f; fade = 0.f; mode = 1; rm_start_ms = 0; cur_key = -1;
+        if (stage >= 0 && stage_tracks.count(stage)) { cur_key = stage; load(stage_tracks[stage].first, true, stage_tracks[stage].second); }   /* starting in a stage with its own track */
+        else load(t.first, true, t.second);
+    }
+    /* stage < 0 = the rider's stage not read this tick: keep what plays (it blinked to -1 and swapped the Halloween techno in over
+       the museum narration, Bobby 10-29 "the halloween song ... starts to soon during the narration") */
+    if (riding && mode == 1 && !stage_tracks.empty() && stage >= 0) {   /* VPIX_STAGE_MUSIC: this stage's own track, or back to the ride's */
+        const int want = stage_tracks.count(stage) ? stage : -1;
+        if (want != cur_key) {
+            cur_key = want; cd_gain = 0.f; fade = 0.f; rm_start_ms = 0;
+            if (want >= 0) load(stage_tracks[want].first, true, stage_tracks[want].second);
+            else if (!tracks.empty()) { const auto &t = tracks[(next + tracks.size() - 1) % tracks.size()]; load(t.first, true, t.second); }
+        }
+    }
+    if (!riding && was) { mode = endm && *endm ? 3 : 0; }   /* the ride ends: fade the ride track out, then the end song */
+    was = riding;
+    /* VPIX_ATTRACT_MUSIC=<file> (Bobby 10-28: "use unused song from hell or mall at the opening attract"): loops, faded in, whenever no
+       ride is on and the end song isn't playing (the boot / attract, and again after the end song finishes) */
+    static const char *am = getenv("VPIX_ATTRACT_MUSIC");
+    if (!riding && am && *am && (mode == 0 || (mode == 2 && !cd_play))) { mode = 4; fade = 0.f; cd_gain = 0.f; rm_start_ms = 0; load(am, true, 0.f); }
+    if (mode == 4) { fade = (std::min)(1.f, fade + 0.01f); cd_gain = gain * fade; }
+    if (mode == 1) { fade = (std::min)(1.f, fade + 0.01f); cd_gain = gain * fade * narr_duck; }
+    else if (mode == 3) { fade -= 0.02f; cd_gain = gain * (std::max)(0.f, fade);
+        if (fade <= 0.f) { mode = 2; cd_gain = gain * 1.4f; rm_start_ms = 0; load(endm, false, 0.f); } }
+    else if (mode == 0 && cd_play && cd_loop) { fade -= 0.02f; cd_gain = gain * (std::max)(0.f, fade); if (fade <= 0.f) { std::lock_guard<std::mutex> lk(cd_mtx); cd_play = false; } }
 }
 
 /* VPIX_MUZZLE="model=sound:ms" (games.ps1 Muzzle, Zone Hunter 'kickw\gun.bin=pulse1:120'): the first gun's muzzle flash polygons
@@ -839,6 +1565,7 @@ static void snd_apply(int op, uint32_t ch, uint32_t edx, uint32_t ebx, int semis
     if (op == 1) {
         auto it = sounds.find(1u << 16 | edx);
         if (it == sounds.end()) return;
+        if (mall_now) return;   /* the mall ride: only the music + the narrator (Bobby 10-28: "suddle music and voicover only", no wind) */
         v.s = &it->second; v.sound = edx; v.pos = 0; v.on = true; v.bend = 0;
         v.loop = it->second.loop; v.vol = (int)(ebx & 0x7F);
         v.semis = semis;
@@ -1015,13 +1742,16 @@ static void poll_textures() {
        PLAYER_do_explosion; material 4 'mater5' = light blue 64,64,FF opacity 0x96 = the temple's glass walls qtr1-4.bin,
        which drew black). Colour bytes R,G,B at +8. */
     const bool mat28 = model_stride == 0x8C;
-    static const bool mats = (getenv("VPIX_MATERIALS") && atoi(getenv("VPIX_MATERIALS"))) || mat28;
+    /* VPIX_SNOW (Dactyls): the portal material's texture number is needed; the other materials stay as they were (renderer: snow_slot) */
+    static const bool snow = getenv("VPIX_SNOW") && atoi(getenv("VPIX_SNOW"));
+    static const bool mat_env = getenv("VPIX_MATERIALS") && atoi(getenv("VPIX_MATERIALS"));
+    static const bool mats = mat_env || mat28 || snow;
     uint32_t mt = mats ? region_rt("material") : 0;
     for (uint32_t n = 0; mt && n < 32; n++) {
         uint32_t e = mt + n * 0x14, tex = mem_readd(e + 0xC);
         /* type 1 + u16 @+4 = translucent, opacity value/255 (blue_ghost 0xA0, pen_gate 0xC8: both meant to be see-through) */
         uint32_t ty = mem_readd(e), op = mem_readw(e + 4);
-        VPIX_Render_SetMaterial(n, !mat28 && (mem_readd(e + 0x10) & 8) && tex < 0x400 ? (int)tex : -1, ty == 1 && op < 255 ? op / 255.f : 1.f);
+        VPIX_Render_SetMaterial(n, (!mat28 || snow) && (mem_readd(e + 0x10) & 8) && tex < 0x400 ? (int)tex : -1, ty == 1 && op < 255 && (mat_env || mat28) ? op / 255.f : 1.f);
         if (mat28) VPIX_Render_SetMaterialColour(n, ((uint32_t)mem_readb(e + 8) << 16) | ((uint32_t)mem_readb(e + 9) << 8) | mem_readb(e + 10));
     }
 }
@@ -1038,14 +1768,22 @@ static std::vector<uint32_t> own_glove_slots, own_arm_slots;
    on your controllers, Bobby 10-20 'our arms are swapping'); submit_frame takes the shown view's lists */
 static std::map<uint32_t, std::vector<uint32_t>> own_glove_by_view, own_arm_by_view;
 static std::set<uint32_t> blit_under;   /* VPIX_BLIT_UNDER bitmap handles */
+/* VPIX_SPRITE_TOP bitmap handles: Olin Shotgun's QUALIFIED sign (Bobby 10-27: the leading '000' score digits drew over it; their card
+   priority sits above the sign, harmless on the card where those cards fell below the screen edge, but our picture is taller) */
+static std::set<uint32_t> sprite_top;
+/* VPIX_SKY_SPRITE bitmap handles: Missile Command's moons (moon2/moon4.vst), see the blit loop */
+static std::set<uint32_t> sky_sprite;
 struct ClampY { std::string name; float ymin, ymax; std::string anchor; float yscale = 1.f; };   /* yscale: 'name:*k' form */
 static std::vector<ClampY> clamp_y;   /* VPIX_CLAMP_Y entries */
 /* VPIX_ARM_TO_GUN: the intro forearm and its place in the gun's frame (drawn on your gun in play) */
 static VPIX_Instance arm_tmpl; static bool arm_have = false; static float arm_rel_T[3], arm_rel_R[3][3];
 static VPIX_Instance up_tmpl; static bool up_have = false; static float up_len = 0;   /* the intro's right upper arm (larm.bin) + shoulder->elbow length */
+/* your own boxer's glove slots in any view, ring pan included (object kind 0 = seat 1, 1 = seat 2 when linked): the game gives
+   the same gloves red at select and on the stats card but its blue palette in the ring, so they changed colour (Bobby 11-01: always red) */
+static std::set<uint32_t> red_glove_slots;
 static void force_box_gloves() {
     static const bool on = getenv("VPIX_BOX_FORCEGLOVE") && atoi(getenv("VPIX_BOX_FORCEGLOVE"));
-    own_glove_slots.clear(); own_arm_slots.clear(); own_glove_by_view.clear(); own_arm_by_view.clear();
+    own_glove_slots.clear(); own_arm_slots.clear(); own_glove_by_view.clear(); own_arm_by_view.clear(); red_glove_slots.clear();
     if (!on) return;
     uint32_t vw = region_rt("view"), md = region_rt("model");
     if (!vw || !md) return;
@@ -1068,6 +1806,7 @@ static void force_box_gloves() {
         if (!ob || mem_readw(ob) != 0 || kind_of(mem_readd(ob + 8)) != 1) continue;
         uint32_t sl = mem_readd(ob + 0x14); if (sl < 512) slot_kind[sl] = mem_readw(ob + 3);
     }
+    for (auto &sk : slot_kind) if (sk.second == 0 || (sk.second == 1 && seat2_live())) red_glove_slots.insert(sk.first);
     /* each boxer's real glove palette, seen in any card slot where the game set it (the forced slot's own can be empty: black gloves, 2nd match) */
     static std::map<uint64_t, std::array<uint32_t, 16>> pal_cache;
     for (uint32_t sl = 0; sl < 512; sl++) {
@@ -1170,11 +1909,13 @@ static float ppc_rdf(uint32_t a) { uint32_t u = ppc_rd(a); float f; memcpy(&f, &
    with no PowerPC firmware we run the copy ourselves into gigi[]. The texture handle is the PowerPC address of a
    0x18-byte descriptor: +0 format, +2 width, +4 height (big-endian words), +6/+7 log2 sizes, +0xC GiGi address. */
 static std::vector<uint8_t> gigi;
-static uint32_t gigi_rd = 0;   /* the ring offset starts at 0 here (no PowerPC firmware sets it up), wraps to +0x11000 */
+static uint32_t gigi_rd = 0;
+/* the museum's recorded track centre line (VPIX_TRACK_FILE), kept for the hall's curtains: they line up on it like the exhibits */
+static std::vector<std::array<float, 3>> museum_line;   /* the ring offset starts at 0 here (no PowerPC firmware sets it up), wraps to +0x11000 */
 void VPIX_Pix3K_Service(void) {
     uint32_t pc = global_rt("pixConfig");
     if (!pc) return;
-    uint32_t dev = mem_readd(pc + 0x1DA);
+    uint32_t dev = mem_readd(pc + ppcdev_off);
     if (!dev) return;
     uint32_t win = mem_readd(dev) - 0xC0000000u, wr = mem_readd(dev + 0xC);
     static int nl = 0, ns = 0;
@@ -1183,7 +1924,9 @@ void VPIX_Pix3K_Service(void) {
     while (gigi_rd != wr) {
         uint32_t cmd = ppc_rd(win + gigi_rd);
         auto next = [&]() { gigi_rd += 4; if (gigi_rd >= 0x19000) gigi_rd = 0x11000; };
-        if (cmd != 2) { if (nl++ < 40) lg("PIX3K ring: unknown command %08X at +%05X, skipped to +%05X", cmd, gigi_rd, wr); gigi_rd = wr; break; }
+        /* an unknown word is stepped over, not the rest of the ring: Pac-Man VR opens with command 0x31 and its PAC-MAN banner's first
+           upload (bottom 34 rows) came right after it; skipping to the write offset cut the banner off at line 128 (Bobby 11-01) */
+        if (cmd != 2) { if (nl++ < 40) lg("PIX3K ring: unknown command %08X at +%05X, stepped over", cmd, gigi_rd); next(); continue; }
         next(); uint32_t dst = ppc_rd(win + gigi_rd);
         next(); uint32_t len = ppc_rd(win + gigi_rd);
         next();
@@ -1225,6 +1968,11 @@ static std::string tex3k_name(uint32_t d) {
     }
     return "";
 }
+/* PIX 1.34 (Pac-Man VR) uploads its texels through the ring as 32-bit words with the pixels in each word the other way round: read
+   as stored, every pair of 16-bit texels was swapped (texel i is at i ^ 1, 8-bit at i ^ 3). It combed every edge of the 2D art by a
+   pixel row after row and blurred the 3D textures (Bobby 11-01: "lenticular distortion", "fuzzier graphics"); BELLS.TGA matches
+   texel for texel with the swap. Other PIX versions store them in order */
+static size_t swap3k(int bytes_per_texel) { return ppcdev_off == 0x1D6 ? (bytes_per_texel == 2 ? 1 : bytes_per_texel == 1 ? 3 : 0) : 0; }
 static bool build_tex3k(uint32_t d) {    /* d = the descriptor's PowerPC address */
     auto it = tex3k.find(d);
     if (it != tex3k.end()) return it->second;
@@ -1239,25 +1987,27 @@ static bool build_tex3k(uint32_t d) {    /* d = the descriptor's PowerPC address
         std::vector<uint32_t> rgba((size_t)w * h);
         const uint8_t *s = &gigi[ga];
         unsigned na0 = 0;
+        const size_t sw = swap3k(bp);
         for (size_t i = 0; i < rgba.size(); i++) {
             uint32_t r, g, b;
             if (bp == 4) { const uint8_t *q = s + 4 * i; r = q[1]; g = q[2]; b = q[3]; }
             else if (bp == 2) {
-                uint32_t v = (uint32_t)s[2 * i] << 8 | s[2 * i + 1];
+                const size_t j = (i ^ sw) < rgba.size() ? i ^ sw : i;   /* odd texel count: the last one has no partner */
+                uint32_t v = (uint32_t)s[2 * j] << 8 | s[2 * j + 1];
                 if (fmt == 1) { r = (v >> 10 & 31) * 255 / 31; g = (v >> 5 & 31) * 255 / 31; b = (v & 31) * 255 / 31; }
                 else { r = (v >> 8 & 15) * 17; g = (v >> 4 & 15) * 17; b = (v & 15) * 17; }
             } else {
-                uint32_t v = s[i];
+                uint32_t v = s[(i ^ sw) < rgba.size() ? i ^ sw : i];
                 if (fmt == 5) { r = (v >> 5) * 255 / 7; g = (v >> 2 & 7) * 255 / 7; b = (v & 3) * 85; }
                 else { r = (v >> 5 & 3) * 85; g = (v >> 2 & 7) * 255 / 7; b = (v & 3) * 85; }
             }
             rgba[i] = 0xFF000000u | b << 16 | g << 8 | r;
-            if (bp == 2 && fmt == 1 && !(s[2 * i] & 0x80)) na0++;
+            if (bp == 2 && fmt == 1 && !(s[2 * ((i ^ sw) < rgba.size() ? i ^ sw : i)] & 0x80)) na0++;
         }
         /* ARGB1555 mask textures (the tree cards: blue background, MASK_GROUP in GFX.DAT): alpha bit 0 = see-through. A texture
            without a mask has the bit clear on every texel, so only one that mixes both is cut out. */
         if (na0 && na0 < rgba.size()) {
-            for (size_t i = 0; i < rgba.size(); i++) if (!(gigi[ga + 2 * i] & 0x80)) rgba[i] = 0;   /* black, so filtering at the edge does not bleed the blue key */
+            for (size_t i = 0; i < rgba.size(); i++) if (!(gigi[ga + 2 * ((i ^ sw) < rgba.size() ? i ^ sw : i)] & 0x80)) rgba[i] = 0;   /* black, so filtering at the edge does not bleed the blue key */
             if (nl < 200) lg("SU3K texture %06X: masked, %u of %u texels clear", d, na0, (unsigned)rgba.size());
         }
         ok = VPIX_Render_AddTextureRGBA(0x80000000u | d, (int)w, (int)h, rgba.data());
@@ -1276,8 +2026,28 @@ static bool build_tex3k(uint32_t d) {    /* d = the descriptor's PowerPC address
 static std::map<uint64_t, uint32_t> bmp3k;   /* (descriptor, colour key + 1) -> renderer bitmap handle (0 = failed) */
 static uint32_t build_bmp3k(uint32_t d, int key) {   /* key = raw 16-bit texel value drawn see-through, -1 = none */
     uint64_t id = (uint64_t)d << 32 | (uint32_t)(key + 1);
+    /* a picture read while the game is still filling it is read again once it changes (for 10 s, checked every half second): Pac-Man VR's
+       PAC-MAN banner was read on frame 2, half loaded, and stayed cut off below line 128 (Bobby 11-01) */
+    struct Watch { uint64_t sum; unsigned long built, next; };
+    static std::map<uint64_t, Watch> watch;
+    auto texsum = [&]() -> uint64_t {
+        if (!d || d >= 0x2000000) return 0;
+        uint32_t w0 = ppc_rd(d), w = w0 & 0xFFFF, fmt = w0 >> 24, h = ppc_rd(d + 4) >> 16, ga = ppc_rd(d + 0xC);
+        size_t n = (size_t)w * h * (fmt == 0 ? 4 : 2);
+        if (!w || !h || w > 2048 || h > 2048 || (size_t)ga + n > gigi.size()) return 0;
+        uint64_t x = 1469598103934665603ull; for (size_t i = 0; i < n; i++) x = (x ^ gigi[ga + i]) * 1099511628211ull;
+        return x;
+    };
     auto it = bmp3k.find(id);
-    if (it != bmp3k.end()) return it->second;
+    if (it != bmp3k.end()) {
+        auto wt = watch.find(id);
+        if (wt == watch.end() || frame < wt->second.next) return it->second;
+        if (frame - wt->second.built > 500) { watch.erase(wt); return it->second; }
+        wt->second.next = frame + 25;
+        if (texsum() == wt->second.sum) return it->second;
+        bmp3k.erase(it); watch.erase(wt);   /* changed: build it again (new handle) */
+    }
+    watch[id] = {texsum(), frame, frame + 25};
     static uint32_t next_h = 0xA0000000u;
     uint32_t hnd = next_h++;
     bool ok = false;
@@ -1286,11 +2056,13 @@ static uint32_t build_bmp3k(uint32_t d, int key) {   /* key = raw 16-bit texel v
         int bp = fmt == 0 ? 4 : fmt == 1 || fmt == 2 ? 2 : 0;
         if (bp && w && h && w <= 2048 && h <= 2048 && (size_t)ga + (size_t)w * h * bp <= gigi.size()) {
             std::vector<uint32_t> rgba((size_t)w * h); const uint8_t *s = &gigi[ga]; size_t nz = 0;
+            const size_t sw = swap3k(bp);
             for (size_t i = 0; i < rgba.size(); i++) {
                 uint32_t a, r, g, b;
                 if (bp == 4) { const uint8_t *q = s + 4 * i; a = q[0]; r = q[1]; g = q[2]; b = q[3]; }
                 else {
-                    uint32_t v = (uint32_t)s[2 * i] << 8 | s[2 * i + 1];
+                    const size_t j = (i ^ sw) < rgba.size() ? i ^ sw : i;   /* odd texel count: the last one has no partner */
+                    uint32_t v = (uint32_t)s[2 * j] << 8 | s[2 * j + 1];
                     if (key >= 0 && (v & 0x7FFF) == (uint32_t)key) { rgba[i] = 0; continue; }   /* colour key (alpha bit ignored) */
                     if (fmt == 1) { a = v & 0x8000 ? 255 : 0; r = (v >> 10 & 31) * 255 / 31; g = (v >> 5 & 31) * 255 / 31; b = (v & 31) * 255 / 31; }
                     else { a = (v >> 12) * 17; r = (v >> 8 & 15) * 17; g = (v >> 4 & 15) * 17; b = (v & 15) * 17; }
@@ -1344,8 +2116,39 @@ static uint32_t build_bmp3k(uint32_t d, int key) {   /* key = raw 16-bit texel v
 static int64_t prio3k_key(int32_t p) { return p >= 0 ? -(int64_t)p : (int64_t)1000000000 + p; }   /* draw order key, low first */
 /* direct = ZENECA PIX_DrawBitmap: ma = the PIXBITMAP record - 0x1A0 (the same 0x31 bytes PIX_SetModel copies to imodel +1A0);
    no slot priority, drawn on top */
-static void blit3k(VPIX_Frame &f, uint32_t ma, uint32_t slot, bool direct = false) {
+static void blit3k(VPIX_Frame &f, uint32_t ma, uint32_t slot, bool direct = false, bool world = false) {
     uint32_t d = mem_readd(ma + 0x1A4) & 0xFFFFFF;
+    if (world) {   /* handle 0x20000000: a bitmap standing in the 3D world (Zero Hour's explosions + the looping fire after them, EXPLO.DBS
+                      bitmaps 20-42: Bobby's burning roof was missing) at the slot's position, turned to face the eye. Same 0x31-byte
+                      PIXBITMAP as the screen ones, but +1C8/+1CC = size in world units and +1D0/+1D4 = the anchor point from the
+                      top-left (floats; a 64 x 64 one: 64, 64, 32, 32 = centred; EXP_ORIGIN 0.5 1.0 = the foot), times the slot scale */
+        static std::set<uint32_t> seenw;
+        if (seenw.insert(d).second && seenw.size() < 60) {
+            std::string fs; for (int o = 0x1A0; o < 0x1E8; o += 4) { char t[12]; snprintf(t, sizeof(t), " %X", mem_readd(ma + o)); fs += t; }
+            lg("SU3K world bitmap f=%lu slot %u tex %06X '%s' T=(%.0f %.0f %.0f) S=(%.2f %.2f %.2f) +1A0:%s", frame, slot, d, tex3k_name(d).c_str(),
+               rd_f(ma + 0x34), rd_f(ma + 0x38), rd_f(ma + 0x3C), rd_f(ma + 0x84), rd_f(ma + 0x88), rd_f(ma + 0x8C), fs.c_str());
+        }
+        uint32_t fl = mem_readd(ma + 0x1A0);
+        uint32_t hnd = build_bmp3k(d, fl & 0x1000 ? (int)(mem_readd(ma + 0x1D8) & 0x7FFF) : -1);
+        if (!hnd) return;
+        VPIX_Blit b; b.handle = hnd; b.world = true; b.key = -1; b.alpha = 1.f;
+        b.sx = (int)mem_readd(ma + 0x1A8); b.sy = (int)mem_readd(ma + 0x1AC); b.sw = (int)mem_readd(ma + 0x1B0); b.sh = (int)mem_readd(ma + 0x1B4);
+        if (b.sw <= 0 || b.sh <= 0 || b.sw > 4096 || b.sh > 4096) return;
+        float dw = rd_f(ma + 0x1C8), dh = rd_f(ma + 0x1CC), px = rd_f(ma + 0x1D0), py = rd_f(ma + 0x1D4);
+        if (!(dw > 0.f && dw < 1e6f)) dw = (float)b.sw;
+        if (!(dh > 0.f && dh < 1e6f)) dh = (float)b.sh;
+        if (!(fabsf(px) < 1e6f)) px = 0.5f * dw;
+        if (!(fabsf(py) < 1e6f)) py = 0.5f * dh;
+        float sx = rd_f(ma + 0x84), sy = rd_f(ma + 0x88);
+        if (!(sx > 0.f && sx < 1e4f)) sx = 1.f;
+        if (!(sy > 0.f && sy < 1e4f)) sy = sx;
+        b.dw = dw * sx; b.dh = dh * sy;
+        for (int c = 0; c < 3; c++) b.pos[c] = rd_f(ma + 0x34 + 4 * c);
+        b.pivot[0] = px * sx; b.pivot[1] = py * sy;       /* from the top-left, y down (draw_sprites) */
+        b.prio = (int32_t)mem_readd(ma + 0x94);
+        f.blits.push_back(b);
+        return;
+    }
     if (getenv("VPIX_VIEWLOG")) {
         static std::set<uint64_t> seen;
         if (seen.insert((uint64_t)slot << 32 | d).second && seen.size() < 400) {
@@ -1388,6 +2191,35 @@ static void blit3k(VPIX_Frame &f, uint32_t ma, uint32_t slot, bool direct = fals
     if (by_prio) f.blits.insert(std::upper_bound(f.blits.begin(), f.blits.end(), b, [](const VPIX_Blit &x, const VPIX_Blit &y) { return prio3k_key(x.prio) < prio3k_key(y.prio); }), b);
     else f.blits.push_back(b);
 }
+/* PIX 1.34 (Pac-Man VR v00.00.69): PIX_DrawBitmap(eax window mask, edx PIXBITMAP *). The same fields as above, packed: +0 flags, +4 texture
+   descriptor, +8/+A source x/y, +C/+E width/height, +10/+12 screen x/y (16-bit), +14/+18 drawn size (floats), +24 colour key (flags 0x1000),
+   +28 tint. The alarm clock (64 x 67 at 232,19 + its 18 x 25 time digits) and the score: drawn on top of the 3D (Bobby 11-01: the clock
+   was invisible / behind the level) */
+static void blit134(VPIX_Frame &f, uint32_t bm) {
+    uint32_t fl = mem_readd(bm), d = mem_readd(bm + 4) & 0xFFFFFF;
+    static const uint32_t rtt_d = getenv("VPIX_RTT3K") && strchr(getenv("VPIX_RTT3K"), ':') ? (uint32_t)strtoul(strchr(getenv("VPIX_RTT3K"), ':') + 1, NULL, 16) : 0;
+    const bool rtt = rtt_d && d == rtt_d;   /* the picture a view renders into: ours, drawn by vpix_render (right way up: no mirror) */
+    uint32_t hnd = rtt ? VPIX_RTT_HANDLE : build_bmp3k(d, fl & 0x1000 ? (int)(mem_readd(bm + 0x24) & 0x7FFF) : -1);
+    if (getenv("VPIX_BMPLOG")) { static std::set<uint32_t> seen; if (seen.insert(d).second)
+        lg("blit134 f=%lu desc %06X: w0 %08X h %08X +8 %08X ga %08X | src %d,%d %dx%d at %d,%d", frame, d, ppc_rd(d), ppc_rd(d + 4), ppc_rd(d + 8), ppc_rd(d + 0xC),
+           mem_readw(bm + 8), mem_readw(bm + 0xA), mem_readw(bm + 0xC), mem_readw(bm + 0xE), (int16_t)mem_readw(bm + 0x10), (int16_t)mem_readw(bm + 0x12)); }
+    if (!hnd) return;
+    VPIX_Blit b; b.handle = hnd; b.key = -1; b.alpha = 1.f; b.world = false;
+    b.sx = mem_readw(bm + 8); b.sy = mem_readw(bm + 0xA); b.sw = mem_readw(bm + 0xC); b.sh = mem_readw(bm + 0xE);
+    b.x = (int16_t)mem_readw(bm + 0x10); b.y = (int16_t)mem_readw(bm + 0x12);
+    float dw = rd_f(bm + 0x14), dh = rd_f(bm + 0x18);
+    if (b.sw <= 0 || b.sh <= 0) return;
+    /* a negative drawn size = mirrored: the alarm clock's third layer comes at height -67 (Bobby 11-01: "needs its bell and
+       needle"); the source rectangle runs backwards from its far edge (the blitter maps it to texture coordinates linearly) */
+    if (dw < 0.f) { dw = -dw; if (!rtt) { b.sx += b.sw; b.sw = -b.sw; } }
+    if (dh < 0.f) { dh = -dh; if (!rtt) { b.sy += b.sh; b.sh = -b.sh; } }
+    if (!(dw > 0.f && dw < 4096.f) || !(dh > 0.f && dh < 4096.f)) return;
+    b.dw = floorf(dw + 0.5f); b.dh = floorf(dh + 0.5f);
+    if ((fl & 0x2000) && (mem_readd(bm + 0x28) & 0xFFFFFF)) { uint32_t c = mem_readd(bm + 0x28);
+        b.tint[0] = (c & 0xFF) / 255.f; b.tint[1] = (c >> 8 & 0xFF) / 255.f; b.tint[2] = (c >> 16 & 0xFF) / 255.f; }
+    b.prio = -100000;
+    f.blits.push_back(b);
+}
 static bool build_mesh3k(uint32_t h) {
     uint32_t ob = h & 0xFFFFFF;
     uint32_t nv = ppc_rd(ob + 4), va = ppc_rd(ob + 8), np = ppc_rd(ob + 0x14), pa = ppc_rd(ob + 0x18);
@@ -1412,6 +2244,8 @@ static bool build_mesh3k(uint32_t h) {
         for (uint32_t i = 0; i < n; i++) ci[i] = ppc_rd(ix + 4 * i);
         VPIX_MeshPoly p;
         p.nx = ppc_rdf(q + 0x1C); p.ny = ppc_rdf(q + 0x20); p.nz = ppc_rdf(q + 0x24);
+        /* the file's colours (0xBBGGRR here): sand sides, blue water. Bobby 11-01 wants the ramps' sides, though the rings' walkways pass through them */
+        if (pac_water3k.count(h) && !tex) col = fabsf(p.nx) > 0.5f ? 0x51B3DE : 0xDF5B41;
         /* textured (flags 0x10): +0xC = the texture descriptor's PowerPC address; the video screens (0x815) leave it 0 and
            give the texture number at +0x18 instead */
         uint32_t td = (fl & 0x10) ? ppc_rd(q + 0xC) & 0xFFFFFF : 0;
@@ -1432,6 +2266,55 @@ static bool build_mesh3k(uint32_t h) {
         if (!(fl & 0x10)) { char cb[12]; snprintf(cb, sizeof(cb), " c%06X", col); if (tnames.find(cb) == std::string::npos && tnames.size() < 200) tnames += cb; }
         p.flags = 0x20000000u | col;
         (void)fl;
+        /* concave outlines (Zero Hour: the PIX library merges a building's .3DS roof triangles into one 13-corner outline with a
+           notch; Bobby: 'a roof made of 13 points' missing): GL_POLYGON / a fan only fill convex shapes, so pieces of the roof were
+           missing or spilled past its edge. Cut those into triangles by ear clipping in the polygon's own plane */
+        std::vector<uint32_t> tri;
+        if (n > 3) {
+            bool okv = true; for (uint32_t i = 0; i < n; i++) okv = okv && ci[i] < nv;
+            float N[3] = {0.f, 0.f, 0.f};                /* Newell normal */
+            for (uint32_t i = 0; okv && i < n; i++) {
+                const float *a = &v[3 * ci[i]], *b = &v[3 * ci[(i + 1) % n]];
+                N[0] += (a[1] - b[1]) * (a[2] + b[2]); N[1] += (a[2] - b[2]) * (a[0] + b[0]); N[2] += (a[0] - b[0]) * (a[1] + b[1]);
+            }
+            const int ax = fabsf(N[0]) > fabsf(N[1]) ? (fabsf(N[0]) > fabsf(N[2]) ? 0 : 2) : (fabsf(N[1]) > fabsf(N[2]) ? 1 : 2);
+            const int ua = (ax + 1) % 3, va = (ax + 2) % 3; const float sg = N[ax] < 0.f ? -1.f : 1.f;
+            auto P = [&](uint32_t c, int a) { return v[3 * ci[c] + a]; };
+            auto cross = [&](uint32_t a, uint32_t b, uint32_t c) {     /* > 0: left turn in the projected plane */
+                return sg * ((P(b, ua) - P(a, ua)) * (P(c, va) - P(a, va)) - (P(b, va) - P(a, va)) * (P(c, ua) - P(a, ua))); };
+            bool concave = false;
+            for (uint32_t i = 0; okv && i < n && !concave; i++) concave = cross(i, (i + 1) % n, (i + 2) % n) < -1e-3f * (fabsf(N[ax]) + 1.f) / n;
+            if (okv && concave && fabsf(N[ax]) > 1e-6f) {
+                std::vector<uint32_t> ring(n); for (uint32_t i = 0; i < n; i++) ring[i] = i;
+                for (int guard = 0; ring.size() > 3 && guard < (int)(n * n); guard++) {
+                    bool cut = false;
+                    for (size_t i = 0; i < ring.size() && !cut; i++) {
+                        const uint32_t a = ring[(i + ring.size() - 1) % ring.size()], b = ring[i], c = ring[(i + 1) % ring.size()];
+                        if (cross(a, b, c) <= 0.f) continue;  /* reflex corner */
+                        bool inside = false;
+                        for (uint32_t r : ring) {
+                            if (r == a || r == b || r == c) continue;
+                            if (cross(a, b, r) >= 0.f && cross(b, c, r) >= 0.f && cross(c, a, r) >= 0.f) { inside = true; break; }
+                        }
+                        if (inside) continue;
+                        tri.push_back(a); tri.push_back(b); tri.push_back(c); ring.erase(ring.begin() + i); cut = true;
+                    }
+                    if (!cut) break;
+                }
+                if (ring.size() == 3) { tri.push_back(ring[0]); tri.push_back(ring[1]); tri.push_back(ring[2]); }
+                else tri.clear();                        /* gave up: keep the fan */
+                static int nc = 0;
+                if (nc++ < 40) lg("SU3K mesh %08X poly %u: %u corners, concave -> %u triangles%s", h, k, n, (unsigned)tri.size() / 3, tri.empty() ? " (ear clip failed, fan kept)" : "");
+            }
+        }
+        if (!tri.empty()) {
+            for (size_t t = 0; t + 2 < tri.size(); t += 3) {
+                VPIX_MeshPoly q2 = p; q2.n = 3;
+                for (int i = 0; i < 3; i++) { uint32_t c = tri[t + i]; q2.idx[i] = ci[c]; q2.uv[i][0] = cuv[2 * c]; q2.uv[i][1] = cuv[2 * c + 1]; }
+                ps.push_back(q2);
+            }
+            continue;
+        }
         /* corners 0, s .. s+14: consecutive pieces share an edge so the fan has no gaps */
         for (uint32_t s = 1; s + 1 < n; s += 14) {
             uint32_t m = (std::min)(n - s, 15u);
@@ -1440,6 +2323,11 @@ static bool build_mesh3k(uint32_t h) {
             ps.push_back(q2);
         }
     }
+    /* a loaded model can list junk points no polygon uses (Pac-Man VR's FIFTH: up to 1e31, it made the temple's gold wedges "flat cards" off the map in the top view, Bobby 11-01):
+       they go on a real corner, so nothing that measures a mesh sees them */
+    { std::vector<char> used(nv, 0); for (const VPIX_MeshPoly &q : ps) for (int i = 0; i < q.n; i++) if ((uint32_t)q.idx[i] < nv) used[q.idx[i]] = 1;
+      uint32_t first = 0; while (first < nv && !used[first]) first++;
+      if (first < nv) for (uint32_t i = 0; i < nv; i++) if (!used[i]) for (int c = 0; c < 3; c++) v[3 * i + c] = v[3 * first + c]; }
     bool ok = VPIX_Render_AddMesh(h, v, ps);
     if (ntex && ncloud == ntex) backdrop3k.insert(h);
     static int nl = 0;
@@ -1511,6 +2399,7 @@ static void zeneca_sound(const VPIX_Frame &f) {
 
 static void submit_frame_su3k(uint32_t iv, uint32_t im) {
     int best = -1, v = -1;
+    static const int rtt_view = getenv("VPIX_RTT3K") ? atoi(getenv("VPIX_RTT3K")) : -1;
     for (int k = 0; k < 32; k++) {
         uint32_t va = iv + k * 0xBC; int n = 0;
         for (int w = 0; w < 16; w++) { uint32_t b = mem_readd(va + 0x40 + 4 * w); while (b) { n += b & 1; b >>= 1; } }
@@ -1518,11 +2407,23 @@ static void submit_frame_su3k(uint32_t iv, uint32_t im) {
         if (getenv("VPIX_VIEWLOG") && frame % 300 == 0 && (n || fy * fy + fyy * fyy + fz * fz >= 0.5f))   /* dev: every live view, camera set or not */
             lg("SU3K f=%lu raw view %d: %d models, fwd=(%.2f %.2f %.2f) T=(%.0f %.0f %.0f) fog +80 %g %g +88 %g %g %g col %06X flags+9C %X", frame, k, n, fy, fyy, fz, rd_f(va + 0x30), rd_f(va + 0x34), rd_f(va + 0x38),
                rd_f(va + 0x80), rd_f(va + 0x84), rd_f(va + 0x88), rd_f(va + 0x8C), rd_f(va + 0x90), mem_readd(va + 0x94) & 0xFFFFFF, mem_readd(va + 0x9C));
+        if (getenv("VPIX_VIEWLOG") && frame % 300 == 0 && n) lg("SU3K f=%lu view %d record: %s", frame, k, rd_hex(va, 0xBC).c_str());
         if (fy * fy + fyy * fyy + fz * fz < 0.5f) continue;
+        if (k == rtt_view) continue;   /* VPIX_RTT3K: drawn into a picture, never the screen (Pac-Man's title showed the clock view full screen: grey) */
         if (n > best) { best = n; v = k; }
     }
+    /* VPIX_VIEW3K=<view> (run_su3k.sh pacman): the game's main view by number, when the busiest one is not it. Pac-Man VR v00.00.69
+       draws Pac-Man's eye view (4) full screen and the same maze again in aerial_view (3, a second window from 470000 up), one model more */
+    { static const int want = getenv("VPIX_VIEW3K") ? atoi(getenv("VPIX_VIEW3K")) : -1;
+      if (want >= 0 && want < 32) { uint32_t vw = iv + want * 0xBC; float a = rd_f(vw + 0x10), b2 = rd_f(vw + 0x14), c2 = rd_f(vw + 0x18);
+          int n = 0; for (int w = 0; w < 16; w++) { uint32_t b = mem_readd(vw + 0x40 + 4 * w); while (b) { n += b & 1; b >>= 1; } }
+          if (n && a * a + b2 * b2 + c2 * c2 >= 0.5f) v = want; } }   /* title/attract (view 5) still shows: view 4 is empty there */
     VPIX_Frame f; f.frame = frame;
     f.blits.swap(drawbmp3k.blits); drawbmp3k.blits.clear();   /* this frame's PIX_DrawBitmap pictures (ZENECA title screen) */
+    /* a frame without them keeps the last set a few frames: Pac-Man VR's HUD (score, power meter, alarm clock) is not drawn into every
+       frame we pick up, and flickered (Bobby 11-01) */
+    { static std::vector<VPIX_Blit> last; static unsigned long last_f = 0;
+      if (!f.blits.empty()) { last = f.blits; last_f = frame; } else if (frame - last_f < 8) f.blits = last; }
     if (v < 0) { zeneca_sound(f); VPIX_Render_Submit(f); return; }
     uint32_t va = iv + v * 0xBC;
     rd_mat(va, f.cam_R, f.cam_T);
@@ -1537,11 +2438,16 @@ static void submit_frame_su3k(uint32_t iv, uint32_t im) {
         float foc = rd_f(iw + 0x50); uint32_t sw = mem_readd(iw + 0x20) + 1;
         if (foc > 10.f && sw > 16 && sw < 4096) f.fov_deg = 2.f * atanf(0.5f * sw / foc) * 57.29578f;
     }
+    /* VPIX_SKY3K=RRGGBB (run_su3k.sh pacman = 0062C5): the sky when the game leaves the window unset. Pac-Man VR's cloud cards are painted
+       on that solid blue (CLOUD1-3.TGA edges 0,98,197) to melt into the sky; PIX 1.34 keeps its colour where we don't read it (Bobby 11-01:
+       "sky still needs work" - black between the cards) */
+    { static const char *sky3k = getenv("VPIX_SKY3K");   /* the game left it black (window unset or set to 0) */
+      if (sky3k && !f.clear[0] && !f.clear[1] && !f.clear[2]) { uint32_t c = (uint32_t)strtoul(sky3k, NULL, 16); f.clear[0] = c >> 16 & 0xFF; f.clear[1] = c >> 8 & 0xFF; f.clear[2] = c & 0xFF; } }
     /* the game camera follows the fed head (Total Recoil: view = gun axis = tracked head): the renderer must only late-correct it.
        in_head = false made it add the whole eye rotation ON TOP (free look), so the view turned ~2x the gun and the aim drifted off
        to the side (Bobby 10-18: 'to aim center I have to look all the way right'). The renderer's own pitch test still falls back
        to free look while the camera doesn't follow (attract, menus). */
-    f.in_head = track_on; f.head_fed = head_fed; f.crouch_mm = crouch_fed;
+    f.in_head = track_on; f.head_fed = head_fed; f.crouch_mm = crouch_fed; f.lock_view = attract_lock_now();
     if (getenv("VPIX_VIEWLOG") && frame % 600 == 0) {   /* dev: Total Recoil's sight object, wherever it is */
         uint32_t cg = global_rt("cross"), co = cg ? mem_readd(cg) : 0;
         if (co) {
@@ -1590,7 +2496,8 @@ static void submit_frame_su3k(uint32_t iv, uint32_t im) {
             VPIX_Instance in; in.handle = mem_readd(ma); in.slot = (uint16_t)slot;
             if (getenv("VPIX_VIEWLOG") && frame % 300 == 0) lg("SU3K f=%lu view %d slot %u handle %08X T=(%.0f %.0f %.0f)", frame, v, slot, in.handle, rd_f(ma + 0x34), rd_f(ma + 0x38), rd_f(ma + 0x3C));
             if (in.handle == 0x10000000u) { blit3k(f, ma, slot); continue; }   /* screen bitmap */
-            if (!in.handle || in.handle >= 0x10000000u || !(in.handle & 0x1000000)) {   /* 0x20000000 (3D-placed bitmap): TODO */
+            if (in.handle == 0x20000000u) { blit3k(f, ma, slot, false, true); continue; }   /* bitmap in the 3D world (explosions, fire) */
+            if (!in.handle || in.handle >= 0x10000000u || !(in.handle & 0x1000000)) {
                 static std::set<uint32_t> seen2d;
                 if (getenv("VPIX_VIEWLOG") && in.handle && seen2d.insert(in.handle).second && seen2d.size() < 80)
                     lg("SU3K 2D object slot %u handle %08X T=(%.0f %.0f %.0f) S=(%.2f %.2f %.2f)", slot, in.handle, rd_f(ma + 0x34), rd_f(ma + 0x38), rd_f(ma + 0x3C), rd_f(ma + 0x84), rd_f(ma + 0x88), rd_f(ma + 0x8C));
@@ -1633,6 +2540,50 @@ static void submit_frame_su3k(uint32_t iv, uint32_t im) {
             if (o) lg("HEADOBJ f=%lu obj %08X +0:%08X +4:%08X +8:%08X +C:%08X +10:%08X +14:%08X", frame, o, mem_readd(o), mem_readd(o + 4), mem_readd(o + 8), mem_readd(o + 0xC), mem_readd(o + 0x10), mem_readd(o + 0x14)); }
     }
     std::stable_partition(f.inst.begin(), f.inst.end(), [](const VPIX_Instance &x) { return x.backdrop != 0; });   /* cloud backdrops first */
+    /* VPIX_AERIAL3K=<view> (run_su3k.sh pacman = 3): the spectator camera (Pac-Man VR's aerial_view, 470000 up over the maze: the cabinet's
+       watcher monitor, Bobby 11-01 "so people watching got the classic top down pacman"). Its models, as above (3D models only) */
+    auto grab_view = [&](int vn, float R[3][3], float T[3], std::vector<VPIX_Instance> &out, std::vector<VPIX_Blit> *wb = nullptr) -> bool {
+      if (vn >= 0 && vn < 32 && vn != v) {
+          uint32_t vk = iv + vn * 0xBC; float a = rd_f(vk + 0x10), b2 = rd_f(vk + 0x14), c2 = rd_f(vk + 0x18);
+          if (a * a + b2 * b2 + c2 * c2 >= 0.5f) {
+              rd_mat(vk, R, T);
+              for (int w = 0; w < 16; w++) for (uint32_t bits = mem_readd(vk + 0x40 + 4 * w), k = 0; bits && k < 32; k++) {
+                  if (!(bits >> k & 1)) continue;
+                  uint32_t slot = 32 * w + k, ma = im + slot * 0x20C;
+                  VPIX_Instance in; in.handle = mem_readd(ma); in.slot = (uint16_t)slot;
+                  /* bitmaps standing in the world: Pac-Man VR's pellets and power pellets (the top view showed an empty maze, Bobby 11-01) */
+                  if (in.handle == 0x20000000u && wb) { VPIX_Frame tmp; blit3k(tmp, ma, slot, false, true); wb->insert(wb->end(), tmp.blits.begin(), tmp.blits.end()); continue; }
+                  if (!in.handle || in.handle >= 0x10000000u || !(in.handle & 0x1000000)) continue;
+                  if (!meshes3k.count(in.handle)) { meshes3k.insert(in.handle); build_mesh3k(in.handle); }
+                  for (int r = 0; r < 3; r++) for (int c = 0; c < 3; c++) in.R[r][c] = rd_f(ma + 4 + 0x10 * c + 4 * r);
+                  for (int c = 0; c < 3; c++) { in.T[c] = rd_f(ma + 0x34 + 4 * c); in.S[c] = rd_f(ma + 0x84 + 4 * c); }
+                  for (int c = 0; c < 16; c++) { uint32_t pc = mem_readd(ma + 0xA0 + 16 * c); in.pal[c] = pc & 0xFFFFFF; in.palw[c] = pc; }
+                  in.backdrop = backdrop3k.count(in.handle) ? 1 : 0;
+                  out.push_back(in);
+              }
+              std::stable_partition(out.begin(), out.end(), [](const VPIX_Instance &x) { return x.backdrop != 0; });
+              return !out.empty();
+          }
+      }
+      return false; };
+    { static const int aer = getenv("VPIX_AERIAL3K") ? atoi(getenv("VPIX_AERIAL3K")) : -1; f.aer = grab_view(aer, f.aer_R, f.aer_T, f.aer_inst, &f.aer_blits); }
+    f.rtt = grab_view(rtt_view, f.rtt_R, f.rtt_T, f.rtt_inst);
+    /* VPIX_RTT3K "<view>:<picture>:m": the view's models mirrored about their own origin. Pac-Man VR's CLKMSK slices open anticlockwise
+       from 12 in our camera; the clock art (CLK16/CLK25, AL0000-0010) sweeps its red clockwise from 12 (Bobby 11-01) */
+    { static const bool mir = getenv("VPIX_RTT3K") && strstr(getenv("VPIX_RTT3K"), ":m");
+      if (mir) for (VPIX_Instance &in : f.rtt_inst) in.S[0] = -in.S[0]; }
+    if (rtt_view >= 0 && rtt_view < 32 && rtt_view != v) {   /* and its screen bitmaps (the face the masks cut the sweep from) */
+        VPIX_Frame tmp; uint32_t vk = iv + rtt_view * 0xBC;
+        for (int w = 0; w < 16; w++) for (uint32_t bits = mem_readd(vk + 0x40 + 4 * w), k = 0; bits && k < 32; k++)
+            if (bits >> k & 1 && mem_readd(im + (32 * w + k) * 0x20C) == 0x10000000u) {
+                uint32_t ma = im + (32 * w + k) * 0x20C; size_t n0 = tmp.blits.size();
+                blit3k(tmp, ma, 32 * w + k);
+                /* black = see-through: the game pastes the picture with colour key 0 (the face's black corners showed as a box, Bobby 11-01) */
+                if (tmp.blits.size() > n0) { VPIX_Blit &b = tmp.blits.back(); if (uint32_t hk = build_bmp3k(mem_readd(ma + 0x1A4) & 0xFFFFFF, 0)) b.handle = hk;
+                    static int nl = 0; if (nl++ < 3) lg("RTT bitmap slot %u: src %d,%d %dx%d at %d,%d drawn %.0fx%.0f", 32 * w + k, b.sx, b.sy, b.sw, b.sh, b.x, b.y, b.dw, b.dh); }
+            }
+        f.rtt_blits.swap(tmp.blits); f.rtt = f.rtt || !f.rtt_blits.empty();
+    }
     if (const char *cc = getenv("VPIX_CLEAR3K")) {   /* dev (Bobby 10-18): a test sky colour, e.g. FFFFFF, shows black / unlit models as silhouettes */
         uint32_t c = (uint32_t)strtoul(cc, NULL, 16); f.clear[0] = c >> 16 & 0xFF; f.clear[1] = c >> 8 & 0xFF; f.clear[2] = c & 0xFF;
     } else if (f.inst.empty()) f.clear[0] = f.clear[1] = f.clear[2] = 0;   /* no 3D scene (menus, movies, loading): black, not a sky-grey void (Bobby 10-18) */
@@ -1725,11 +2676,12 @@ static void submit_frame() {
     if (v >= 16) { frame_deliver(f); return; }      /* no 3D view: still show videos/2D (empty scene) */
     uint32_t ih = global_rt("InHead");
     f.in_head = track_on && (ih ? mem_readw(ih) != 0 : true);   /* no InHead symbol: renderer tests the camera */
-    f.head_fed = head_fed; f.crouch_mm = crouch_fed; f.walk_yaw = walk_yaw_fed;
+    f.head_fed = head_fed; f.crouch_mm = crouch_fed; f.walk_yaw = walk_yaw_fed; f.lock_view = attract_lock_now();
     if (frame_force_win == 1 && seat2_live()) { f.head_fed = seat2_head_fed; f.crouch_mm = 0; f.walk_yaw = 0; }
     uint32_t ph = global_rt("player_height");
     if (ph) f.player_height = rd_f(ph);
     if (uint32_t gm = global_rt("game_mode")) f.game_mode = (int16_t)mem_readw(gm);   /* DAC: local slot 0's mode (3 = GAME OVER) */
+    if (dual_on() && hap_ms_now() - dual_shot_ms < 60) f.dual_flash = (int8_t)dual_hand;   /* VPIX_DUAL_GUN: the firing gun's muzzle flash */
     uint32_t va = vw + v * 0x88;
     if (!own_glove_by_view.empty()) { own_glove_slots = own_glove_by_view[va]; own_arm_slots = own_arm_by_view[va]; }   /* this view's own gloves only */
     rd_mat(va, f.cam_R, f.cam_T);
@@ -1772,6 +2724,10 @@ static void submit_frame() {
                 b.dw = rd_f(bp + 0x16); b.dh = rd_f(bp + 0x1A);
                 if (!(b.dw > 0 && b.dw < 4096)) b.dw = (float)b.sw;
                 if (!(b.dh > 0 && b.dh < 4096)) b.dh = (float)b.sh;
+                /* Missile Command's moons: 439000 units wide, 1.7 million away, priority above the sky models and below the rest. The size limit made them 181 units (invisible),
+                   and they sit behind the sky bowl and past the far plane. mid = painted right after the sky (draw_scene, draw_sprites) */
+                const bool sky_spr = sky_sprite.count(b.handle) != 0;
+                if (sky_spr) { b.dw = rd_f(bp + 0x16); b.dh = rd_f(bp + 0x1A); b.mid = true; }
                 /* flag 4: colour key at +0x26 (bytes R,G,B; the card compares the top nibbles),
                    flag 8: translucency level at +0x2A. Letters use key white, the timer digits key black. */
                 uint32_t t = mem_readd(bp + 0x26);
@@ -1782,22 +2738,59 @@ static void submit_frame() {
                 if (!(fl & 4) && (fl & 0x1800)) b.key = 0;
                 b.alpha = (fl & 8) ? mem_readb(bp + 0x2A) / 255.f : 1.f;
                 b.world = (fl & 0x20) != 0;                         /* name tags, STOP sign: world-space sprites */
+                const bool on_top = sprite_top.count(b.handle) != 0;   /* VPIX_SPRITE_TOP: world sprite drawn last; 2D bitmap given the top priority (prio set below) */
+                if (b.world && on_top) b.top = true;
+                /* Sea Diving's far crosshair (targ1.vst, yellow): its size is the bitmap's own, 31 x 30 SCREEN pixels on the card. As world units, 20000 units away, it was too small to see */
+                if (b.world && model_stride == 0x8C && b.dw == (float)b.sw && b.dh == (float)b.sh) b.screen_size = true;
                 for (int c = 0; c < 3; c++) b.pos[c] = rd_f(ma + 0x34 + 4 * c);
                 b.pivot[0] = rd_f(bp + 0x1E); b.pivot[1] = rd_f(bp + 0x22);
                 /* VPIX_GLYPH_COLOUR (games.ps1 GlyphColour, Ghost Train): flag 0x800 = the glyph's colour at
                    +0x2C (R, G, B); each letter comes twice, the second 2 px down-right in black = drop shadow */
                 static const bool glyph_col = getenv("VPIX_GLYPH_COLOUR") && atoi(getenv("VPIX_GLYPH_COLOUR"));
+                static float pearl_player[3] = {-1.f, -1.f, -1.f};
                 /* Sea Diving's older PIX lib (model stride 0x8C): +0x2C is always FFFFFFFF, the colour is at +0x30 (score digits FFFF00,
                    their shadows 000000, box text C8C8C8); read at +0x2C every glyph and shadow was white (Bobby 10-24: white blobs) */
                 const uint32_t col_at = model_stride == 0x8C ? 0x30 : 0x2C;
                 if (glyph_col && (fl & 0x1800))           /* 0x1000: colour pair, the first one used */
                     { for (int c = 0; c < 3; c++) b.tint[c] = mem_readb(bp + col_at + c) / 255.f; b.glyph = true;
-                      if ((fl & 0x1000) && col_at == 0x2C) { for (int c = 0; c < 3; c++) b.tint2[c] = mem_readb(bp + 0x30 + c) / 255.f; b.grad = true; } }
+                      if ((fl & 0x1000) && col_at == 0x2C) { for (int c = 0; c < 3; c++) b.tint2[c] = mem_readb(bp + 0x30 + c) / 255.f; b.grad = true; }
+                      /* Sea Diving score digits (flag 0x1000) on the card: the player's colour (+0x30) at the top row fading to +0x2C (white) at the bottom */
+                      if ((fl & 0x1000) && col_at == 0x30) { for (int c = 0; c < 3; c++) { b.tint2[c] = mem_readb(bp + 0x2C + c) / 255.f; pearl_player[c] = b.tint[c]; } b.grad = true; } }
+                /* its pearl icon (egg*.vst, 4 shades, flag 0x2000, no colour in the record) wears the player's colour too; the last digits drawn give it */
+                if (glyph_col && col_at == 0x30 && (fl & 0x2000) && pearl_player[0] >= 0.f) { for (int c = 0; c < 3; c++) b.tint[c] = pearl_player[c]; b.glyph = true; }
                 {   static const bool blitlog = getenv("VPIX_BLITLOG") != NULL; static std::set<uint32_t> logged;   /* dev: each bitmap's record once */
                     if (blitlog && logged.insert(b.handle).second) lg("BLITREC h=%u flags=%04X rec[%s]", b.handle, fl, rd_hex(bp, 0x38).c_str()); }
                 {   const uint32_t pc = ((uint32_t)mem_readb(ma + 0x60) << 16) | ((uint32_t)mem_readb(ma + 0x61) << 8) | mem_readb(ma + 0x62);
                     if (pc) for (int c = 0; c < 3; c++) b.pal0[c] = ((pc >> (16 - 8 * c)) & 255) / 255.f; }
                 b.prio = (int32_t)mem_readd(ma + 0x54);
+                if (on_top) b.prio = 0x7FFFFFFF;                    /* Olin's QUALIFIED: over the score cards AND their digits (Bobby 10-27) */
+                if (ghost_frame.count(b.handle) && getenv("VPIX_GHOST_BIG")) {   /* VPIX_GHOST_BIG=<scale> (Bobby 10-27: the phantom on the track is too
+                       hard to see): the floaty monster drawn bigger, pulsing between half-faded and solid (frames 5-8 = its dissolve, left alone) */
+                    static const float gsc = (float)atof(getenv("VPIX_GHOST_BIG"));
+                    if (gsc > 0.f && ghost_frame[b.handle] <= 4) {
+                        b.dw *= gsc; b.dh *= gsc; b.pivot[0] *= gsc; b.pivot[1] *= gsc;
+                        b.alpha *= 0.7f + 0.3f * sinf(hap_ms_now() * 0.004f);
+                    }
+                }
+                if (!ghost_sets.empty()) {   /* VPIX_GHOST_SETS: this ghost's own monster set */
+                    auto gf = ghost_frame.find(b.handle);
+                    if (gf != ghost_frame.end()) {
+                        const uint32_t slot = 32 * w + k;
+                        /* a ghost that shows up again after a gap (new ride / respawn) takes the next set, so more sets than the game's 4
+                           ghosts all get seen */
+                        static std::map<uint32_t, unsigned long> seen; static int next_set = 0;
+                        auto it = ghost_slot_set.find(slot);
+                        if (it == ghost_slot_set.end() || frame - seen[slot] > 300) { ghost_slot_set[slot] = next_set++ % (int)ghost_sets.size(); it = ghost_slot_set.find(slot); }
+                        seen[slot] = frame;
+                        if (uint32_t xh = ghost_sets[it->second][gf->second]) {
+                            b.handle = xh;
+                            /* our monsters in their own colours, solid (Bobby 10-27: "they all don't have to be ghosts ... the alien head should be a
+                               non-purple ghost ... a good colour target character"): no ghostly see-through / tint while alive; the dissolve
+                               frames 5-8 (shot) keep the game's fade */
+                            if (gf->second <= 4) { b.alpha = 1.f; for (int c = 0; c < 3; c++) { b.tint[c] = 1.f; b.pal0[c] = -1.f; } b.glyph = false; b.grad = false; b.nofog = true; }
+                        }
+                    }
+                }
                 if (b.sw > 0 && b.sh > 0) f.blits.push_back(b);
                 /* VPIX_TIMER_COPY (games.ps1 TimerCopy, Zone Hunter): for the last 10 s the game takes the top timer's units digit
                    (slot 187, 13x21 at (190,10)) and blows it up to 150x150 in mid screen, so the top timer lost its last digit
@@ -1931,6 +2924,16 @@ static void submit_frame() {
                         for (std::string t : os) { uint8_t mode = 1; if (!t.empty() && t.back() == '*') mode = 2; else if (!t.empty() && t.back() == '#') mode = 3;
                             if (mode > 1) t.pop_back();
                             if (!t.empty() && lo.find(t) != std::string::npos) { in.one_sided = mode; break; } } } }
+            }
+            /* VPIX_BRIGHT_MODELS="name,name" (games.ps1 BrightModels): models the card draws at full colour whatever the lights say
+               (Pac-Man's maze floor: 3.3 x our lit value on the card = its ambient 0.3 undone, the wall tops with the same normal stay 0.3) */
+            {   static std::vector<std::string> bm; static bool rd = false;
+                if (!rd) { rd = true; const char *e = getenv("VPIX_BRIGHT_MODELS"); if (e) { std::string s(e); size_t p = 0;
+                    while (p <= s.size()) { size_t q = s.find(',', p); if (q == std::string::npos) q = s.size(); std::string t = s.substr(p, q - p);
+                        std::transform(t.begin(), t.end(), t.begin(), ::tolower); if (!t.empty()) bm.push_back(t); p = q + 1; } } }
+                if (!bm.empty()) { auto mf = model_files.find(in.handle);
+                    if (mf != model_files.end()) { std::string lo = mf->second; std::transform(lo.begin(), lo.end(), lo.begin(), ::tolower);
+                        for (const std::string &t : bm) if (lo.find(t) != std::string::npos) { in.bright = 1; break; } } }
             }
             /* VPIX_POLY_SELECT="name,name" (games.ps1 PolySelect, Zone Hunter: scorepow): PIXMODEL +0x50 (sent to the card by PIX_SendModelOTHER)
                picks which polygons show by their 3rd word bits. Zone's bonus box holds 1K / 5K / 10K / x2 / x3 / x5 strokes in one model
@@ -2083,6 +3086,10 @@ static void submit_frame() {
             /* VPIX_BOX_GLOVE_TRACK (Boxing): tag your own forced gloves (5) and biceps (6) for the renderer */
             if (std::find(own_glove_slots.begin(), own_glove_slots.end(), (uint32_t)in.slot) != own_glove_slots.end()) in.own_hand = 5;
             else if (std::find(own_arm_slots.begin(), own_arm_slots.end(), (uint32_t)in.slot) != own_arm_slots.end()) in.own_hand = 6;
+            if (red_glove_slots.count((uint32_t)in.slot)) { static const uint32_t col = getenv("VPIX_BOX_GLOVE_COL") ? (uint32_t)strtoul(getenv("VPIX_BOX_GLOVE_COL"), NULL, 16) : 0xB40000u; in.pal[0] = col; }
+            /* Dactyl 2's platform corners (plat50.bin, 12 polygons, palette entry 5): the game leaves 00FAFF00 there, the card shows them black; drawn as cyan, Bobby 11-01 */
+            { static const bool pad5 = getenv("VPIX_PAD5_BLACK") && atoi(getenv("VPIX_PAD5_BLACK"));
+              if (pad5 && in.palw[5] == 0x00FAFF00u) { auto mf = model_files.find(in.handle); if (mf != model_files.end() && mf->second.find("plat50") != std::string::npos) in.pal[5] = 0; } }
             f.inst.push_back(in);
             if ((getenv("VPIX_INSTLOG") && frame % 600 == 300) || (getenv("VPIX_INSTLOG_NEAR") && frame % 20 == 0 &&   /* _NEAR=<units>: models that close, every 20 frames */
                  fabsf(in.T[0] - f.cam_T[0]) + fabsf(in.T[1] - f.cam_T[1]) + fabsf(in.T[2] - f.cam_T[2]) < (float)atof(getenv("VPIX_INSTLOG_NEAR")))) {   /* dev: every model in the view, name + distance + draw priority */
@@ -2111,7 +3118,7 @@ static void submit_frame() {
                 if (lo.find("gl") != std::string::npos && lo.find("eyeglass") == std::string::npos) {
                     float d[3] = {in.T[0] - f.cam_T[0], in.T[1] - f.cam_T[1], in.T[2] - f.cam_T[2]}, l[3];
                     for (int i = 0; i < 3; i++) l[i] = f.cam_R[i][0] * d[0] + f.cam_R[i][1] * d[1] + f.cam_R[i][2] * d[2];
-                    lg("GLOVE f=%lu slot=%u %s rel_cam=(%.0f %.0f %.0f) | fed head=(%.0f %.0f %.0f) hand=(%.0f %.0f %.0f)", frame, 32 * w + k, nm.c_str(),
+                    lg("GLOVE f=%lu slot=%u pal0=%06X own=%d %s rel_cam=(%.0f %.0f %.0f) | fed head=(%.0f %.0f %.0f) hand=(%.0f %.0f %.0f)", frame, 32 * w + k, in.pal[0], (int)(std::find(own_glove_slots.begin(), own_glove_slots.end(), (uint32_t)(32 * w + k)) != own_glove_slots.end()), nm.c_str(),
                        l[0], l[1], l[2], head_fed.p[0], head_fed.p[1], head_fed.p[2], hand_fed[0], hand_fed[1], hand_fed[2]);
                 }
             }
@@ -2507,6 +3514,3776 @@ static void submit_frame() {
                 lg("BIGBLIT f=%lu h=%u world=%d key=%d alpha=%.2f src=%dx%d at (%d,%d) drawn %.0fx%.0f prio=%d dist=%.0f clear=(%d,%d,%d)", frame, b.handle, (int)b.world, b.key, b.alpha, b.sw, b.sh, b.x, b.y, b.dw, b.dh, b.prio, dist, f.clear[0], f.clear[1], f.clear[2]);
         }
     }
+    /* VPIX_FOG="start,end,r,g,b" (Phantom Freight, dev, Bobby 10-27: "try to add smoke or more fog"): replaces the game's depth cue
+       (black from 0 to 3x 10000 units) with a thicker coloured mist; the sky takes the same colour so far things melt into it.
+       Default when set to 1: "1500,16000,38,42,48" (blue-grey night mist). */
+    {
+        static int fs = -1; static float f0 = 1500.f, f1 = 16000.f; static uint8_t fc[3] = {38, 42, 48};
+        if (fs < 0) { fs = 0; if (const char *e = getenv("VPIX_FOG")) { fs = 1; int c0 = fc[0], c1 = fc[1], c2 = fc[2];
+            if (strchr(e, ',')) sscanf(e, "%f,%f,%d,%d,%d", &f0, &f1, &c0, &c1, &c2); fc[0] = (uint8_t)c0; fc[1] = (uint8_t)c1; fc[2] = (uint8_t)c2;
+            lg("HLE: VPIX_FOG %.0f..%.0f colour %d,%d,%d", f0, f1, fc[0], fc[1], fc[2]); } }
+        if (fs == 1 && f.fog_end > 0.f) {   /* only where the game fades (in play), not the menus */
+            /* VPIX_FOG_SECTIONS=1 (Bobby 10-27: "test having some areas with less fog, to see the level better where it counts"): the fog
+               distance by the rider's stage (cart +5): thick in the spooky stretches, 2-3x clearer where there is a lot to see and shoot
+               (stage 5 = the lava, clearest); blended over ~2 s */
+            static const bool fsec = getenv("VPIX_FOG_SECTIONS") && atoi(getenv("VPIX_FOG_SECTIONS"));
+            static float fmul = 1.f;
+            if (fsec) {
+                static const float by_stage[10] = {1.6f, 1.f, 2.5f, 1.f, 2.5f, 3.f, 1.3f, 2.f, 1.5f, 1.5f};
+                float want = 1.f;
+                for (int g = 0; g < 2; g++) for (int k = 0; k < 2; k++) { const uint32_t c = mem_readd(0xEDB7C + data_delta + g * 8 + k * 4);
+                    if (c && mem_readb(0xEDB9C + data_delta + g * 16 + k * 2) == 1) { const int st = (int)(int16_t)mem_readw(c + 5); if (st >= 0 && st < 10) want = by_stage[st]; } }
+                if (dm_fight_now) want = 4.f;   /* DevilMaster: clear air round him (Bobby 10-28: "the fog is making it hard to see him") */
+                fmul += (want - fmul) * 0.02f;
+            }
+            f.fog_start = f0 * fmul; f.fog_end = f1 * fmul;
+            for (int c = 0; c < 3; c++) { f.fog_col[c] = fc[c]; f.clear[c] = fc[c]; }
+        }
+    }
+    /* VPIX_TITLE3D=<folder> (Phantom Freight, dev, Bobby 10-27: "make the new intro text stereoscopic" -> the title and the ending):
+       texts made by events\phantom_freight\make_title3d.py, each 3 layers (glow / letters / highlight) stood one behind the other in
+       front of the rider (4.15 / 4.0 / 3.94 m), so the two eyes see real depth. "PHANTOM FREIGHT" for 5 s when a ride starts, "We
+       wish everyone a Happy Halloween from Gainesphere Studios" for 9 s when it ends (Ghost Train v01.00.09: cart states at
+       0xEDB9C; riding = any cart in state 1, 2, 0x11 or 0x12). */
+    {
+        static const char *td = getenv("VPIX_TITLE3D");
+        static int tstate = 0; static int tw[12] = {0}, th[12] = {0};
+        const uint32_t TH0 = 0x7FFD0100u;
+        if (tstate == 0) {
+            tstate = -1;
+            if (td && *td) {
+                int ok = 0; const char *nm[12] = {"title", "end", "w_spin", "w_flip", "w_roll", "w_leap", "w_double", "w_target", "w_pumpkin", "w_gotcha", "logo", "w_fatal"}, *ly[3] = {"glow", "text", "shine"};
+                for (int t = 0; t < 12; t++) for (int l = 0; l < 3; l++) {
+                    std::string fn = std::string(td) + "\\" + nm[t] + "_" + ly[l] + ".rgba";
+                    FILE *fp = fopen(fn.c_str(), "rb"); if (!fp) continue;
+                    int32_t wh[2] = {0, 0};
+                    if (fread(wh, 4, 2, fp) == 2 && wh[0] > 0 && wh[1] > 0 && wh[0] < 4096 && wh[1] < 4096) {
+                        std::vector<uint32_t> px((size_t)wh[0] * wh[1]);
+                        if (fread(px.data(), 4, px.size(), fp) == px.size() && VPIX_Render_AddBitmapRGBA(TH0 + t * 4 + l, wh[0], wh[1], px.data())) { ok++; tw[t] = wh[0]; th[t] = wh[1]; }
+                    }
+                    fclose(fp);
+                }
+                tstate = ok >= 6 ? 1 : -1;   /* title + ending needed; the trick words are extra */
+                lg("HLE: VPIX_TITLE3D %s: %s", td, tstate == 1 ? "title + ending loaded" : "** layers missing");
+            }
+        }
+        if (tstate == 1) {
+            const unsigned long long now = hap_ms_now();
+            bool riding = false;
+            for (int g = 0; g < 2; g++) for (int k = 0; k < 2; k++) { int st = mem_readb(0xEDB9C + data_delta + g * 16 + k * 2); if (st == 1 || st == 2 || st == 0x11 || st == 0x12) riding = true; }
+            static bool was = false; static unsigned long long ride_from = 0, show_at = 0, idle_from = 0; static int show = -1;
+            if (riding && !was) { if (!idle_from || now - idle_from > 5000) { show = 0; show_at = now; } ride_from = now; }
+            if (!riding && was) { idle_from = now; if (now - ride_from > 20000) { show = 1; show_at = now; } }
+            was = riding;
+            const float len = show == 0 ? 5.f : 9.f, el = (now - show_at) / 1000.f;
+            if (show == 0 && el < len) {   /* the game's "TUTORIAL Y / N" letters sat behind our title and it always goes to the tutorial
+                                              anyway (Bobby 10-27: "take out the tutorial y or n text"): its 2D letters hide while the title shows */
+                std::vector<VPIX_Blit> keep;
+                for (const VPIX_Blit &b : f.blits) { auto bf = bitmap_files.find(b.handle);
+                    if (!b.world && bf != bitmap_files.end()) { std::string lo = bf->second; std::transform(lo.begin(), lo.end(), lo.begin(), ::tolower);
+                        if (lo.find("newchars\\") != std::string::npos) continue; }
+                    keep.push_back(b); }
+                f.blits.swap(keep);
+            }
+            if (show >= 0 && el < len) {
+                const float a = el < 0.6f ? el / 0.6f : el > len - 1.2f ? (len - el) / 1.2f : 1.f;
+                const float wide = show == 0 ? 2600.f : 3400.f, high = wide * th[show] / tw[show];
+                const float dist[3] = {4150.f, 4000.f, 3940.f};
+                for (int l = 0; l < 3; l++) {
+                    VPIX_Blit b = {}; b.handle = TH0 + show * 4 + l; b.sw = tw[show]; b.sh = th[show]; b.key = -1; b.world = true;
+                    const float k = dist[l] / 4000.f;   /* further layers drawn bigger so all three line up from the eye */
+                    b.dw = wide * k; b.dh = high * k; b.pivot[0] = b.dw * 0.5f; b.pivot[1] = b.dh * 0.5f;
+                    for (int c = 0; c < 3; c++) b.pos[c] = f.cam_T[c] + f.cam_R[1][c] * dist[l] + f.cam_R[2][c] * 150.f;
+                    b.alpha = a; b.prio = 100000 + l; b.top = true;
+                    f.blits.push_back(b);
+                }
+            }
+            if (show >= 0 && el >= len) show = -1;
+            if (trick_word >= 0 && tw[2 + trick_word]) {   /* trick word: pops in (0.15 s), holds, fades (1.6 s), up and to the right */
+                const float te = (now - trick_word_at) / 1000.f;
+                if (te < 1.6f) {
+                    const int t = 2 + trick_word;
+                    const float pop = te < 0.15f ? 0.5f + 0.5f * te / 0.15f + 0.15f * sinf(te / 0.15f * 3.14159f) : 1.f;
+                    const float a = te > 1.1f ? (1.6f - te) / 0.5f : 1.f;
+                    const float wide = 1700.f * pop, high = wide * th[t] / tw[t];
+                    const float dist[3] = {3100.f, 3000.f, 2960.f};
+                    for (int l = 0; l < 3; l++) {
+                        VPIX_Blit b = {}; b.handle = TH0 + t * 4 + l; b.sw = tw[t]; b.sh = th[t]; b.key = -1; b.world = true;
+                        const float k = dist[l] / 3000.f;
+                        b.dw = wide * k; b.dh = high * k; b.pivot[0] = b.dw * 0.5f; b.pivot[1] = b.dh * 0.5f;
+                        for (int c = 0; c < 3; c++) b.pos[c] = f.cam_T[c] + f.cam_R[1][c] * dist[l] + f.cam_R[2][c] * (500.f + 250.f * te) + f.cam_R[0][c] * 500.f;
+                        b.alpha = a; b.prio = 100010 + l; b.top = true;
+                        f.blits.push_back(b);
+                    }
+                } else trick_word = -1;
+            }
+            /* the attract screen (Bobby 10-27: "take out the intro attract mode high scores and try and put that bitmap of the characters
+               behind the smoke or blow it up bigger, same with the ghost train logo make ur own to put there ... remember stereo text"):
+               while the game shows its logo (bitmaps\16bit\title.vst) or cast picture (cast.vst) off the ride, MallVR takes both out of
+               the flat 2D layer. The cast picture hangs 9 m away as a big screen, held still in the world (latched when the screen comes
+               up), with smoke wisps drifting in front of it; the Phantom Freight logo (make_title3d.py "logo", 3 layers) stands in front
+               on the logo screen. The high-score letters over the cast picture go, except while initials are typed (DEL / END keys on
+               screen: that's the entry, keep it). */
+            if (tw[10]) {   /* not "!riding": after the attract's demo ride a cart stays in a riding state, and the 2nd cycle showed
+                               Ghost Train's logo again (Bobby 10-27); the logo and cast pictures only come up off the ride anyway */
+                int title_i = -1, cast_i = -1; bool entry = false;
+                for (size_t i = 0; i < f.blits.size(); i++) {
+                    const VPIX_Blit &b = f.blits[i]; if (b.world) continue;
+                    auto bf = bitmap_files.find(b.handle); if (bf == bitmap_files.end()) continue;
+                    std::string lo = bf->second; std::transform(lo.begin(), lo.end(), lo.begin(), ::tolower);
+                    if (lo.find("16bit\\title.vst") != std::string::npos) title_i = (int)i;
+                    else if (lo.find("16bit\\cast.vst") != std::string::npos) cast_i = (int)i;
+                    else if (lo.find("newchars\\del.vst") != std::string::npos || lo.find("newchars\\end.vst") != std::string::npos) entry = true;
+                }
+                static bool on = false; static float aT[3], aR[3][3]; static uint32_t cast_h = 0; static int cw = 0, ch = 0; static unsigned long long on_at = 0;
+                if (cast_i >= 0) { cast_h = f.blits[cast_i].handle; cw = f.blits[cast_i].sw; ch = f.blits[cast_i].sh; }
+                static uint32_t title_h = 0; static int tw2 = 0, th2 = 0;
+                if (title_i >= 0) { title_h = f.blits[title_i].handle; tw2 = f.blits[title_i].sw; th2 = f.blits[title_i].sh; }
+                if ((title_i >= 0 || cast_i >= 0) && !entry) {
+                    if (!on) {   /* latch the view: the screen stays put while the head looks round */
+                        on = true; on_at = now;
+                        for (int c = 0; c < 3; c++) { aT[c] = f.cam_T[c]; for (int r = 0; r < 3; r++) aR[r][c] = f.cam_R[r][c]; }
+                        float fl = sqrtf(aR[1][0] * aR[1][0] + aR[1][1] * aR[1][1]);   /* level: forward flat, up = world z */
+                        if (fl > 0.1f) { aR[1][0] /= fl; aR[1][1] /= fl; aR[1][2] = 0; aR[2][0] = aR[2][1] = 0; aR[2][2] = 1; aR[0][0] = aR[1][1]; aR[0][1] = -aR[1][0]; aR[0][2] = 0; }
+                    }
+                    /* the high-score table = letter rows with 7+ digits (rank + score); PRESS BUTTON / the counter stay (Bobby 10-27:
+                       "the press start and counter at start need to be there") */
+                    std::map<int, int> row_digits;
+                    auto is_glyph = [&](const VPIX_Blit &b, bool &digit) { auto bf = bitmap_files.find(b.handle); if (b.world || bf == bitmap_files.end()) return false;
+                        std::string lo = bf->second; std::transform(lo.begin(), lo.end(), lo.begin(), ::tolower);
+                        const size_t p = lo.find("newchars\\"); if (p == std::string::npos) return false;
+                        digit = lo.size() == p + 14 && lo[p + 9] >= '0' && lo[p + 9] <= '9'; return true; };
+                    for (const VPIX_Blit &b : f.blits) { bool d = false; if (is_glyph(b, d) && d) row_digits[b.y / 4]++; }
+                    std::vector<VPIX_Blit> keep;
+                    for (size_t i = 0; i < f.blits.size(); i++) {
+                        const VPIX_Blit &b = f.blits[i];
+                        if ((int)i == title_i || (int)i == cast_i) continue;
+                        bool d = false;
+                        if (cast_i >= 0 && is_glyph(b, d)) { int n = 0; for (int r = b.y / 4 - 1; r <= b.y / 4 + 1; r++) { auto it = row_digits.find(r); if (it != row_digits.end()) n += it->second; }
+                            if (n >= 7) continue; }
+                        keep.push_back(b);
+                    }
+                    f.blits.swap(keep);
+                    auto at = [&](float fwd, float right, float up, float o[3]) { for (int c = 0; c < 3; c++) o[c] = aT[c] + aR[1][c] * fwd + aR[0][c] * right + aR[2][c] * up; };
+                    const float ein = (std::min)(1.f, (now - on_at) / 800.f);
+                    /* the backdrop, 9 m away, 15 m wide ("blow it up bigger": the old screen was ~4.5 m at that distance): the cast picture,
+                       or on the logo screen the logo picture (make_attract_art.py: the ride cart with Static or the kid) */
+                    const bool use_t = title_i >= 0 && title_h && tw2 > 0 && th2 > 0;
+                    const uint32_t bh = use_t ? title_h : cast_h; const int bw = use_t ? tw2 : cw, bht = use_t ? th2 : ch;
+                    if (bh && bw > 0 && bht > 0) {
+                        VPIX_Blit b = {}; b.handle = bh; b.sw = bw; b.sh = bht; b.key = -1; b.world = true;
+                        b.dw = 15000.f; b.dh = b.dw * bht / bw; b.pivot[0] = b.dw * 0.5f; b.pivot[1] = b.dh * 0.5f;
+                        at(9000.f, 0.f, 300.f, b.pos);
+                        b.alpha = ein; b.prio = 99000;
+                        f.blits.push_back(b);
+                    }
+                    {   /* smoke in front of it: 14 soft wisps 5-8 m out, drifting sideways, fading in and out (own puff picture) */
+                        const uint32_t PH = 0x7FFD0002u; static bool made = false;
+                        if (!made) { made = true; std::vector<uint32_t> px(64 * 64);
+                            for (int y = 0; y < 64; y++) for (int x = 0; x < 64; x++) { float dx = (x - 31.5f) / 32.f, dy = (y - 31.5f) / 32.f, r = sqrtf(dx * dx + dy * dy);
+                                float a = r >= 1.f ? 0.f : (1.f - r) * (1.f - r) * (0.75f + 0.25f * sinf(x * 0.7f + y * 0.45f));
+                                px[y * 64 + x] = (uint32_t)(a * 150.f) << 24 | 0xB4B0AAu; }
+                            VPIX_Render_AddBitmapRGBA(PH, 64, 64, px.data()); }
+                        const float t = (now - on_at) / 1000.f;
+                        for (int k = 0; k < 14; k++) {
+                            const float ph = k * 2.39996f, per = 7.f + (k % 5), u = fmodf(t / per + k * 0.137f, 1.f);
+                            VPIX_Blit b = {}; b.handle = PH; b.sw = 64; b.sh = 64; b.key = -1; b.world = true;
+                            b.dw = b.dh = 3200.f + 1800.f * sinf(ph); b.pivot[0] = b.dw * 0.5f; b.pivot[1] = b.dh * 0.5f;
+                            at(5200.f + 2800.f * fmodf(k * 0.618f, 1.f), -7000.f + 14000.f * fmodf(k * 0.382f + u * 0.35f, 1.f), -2200.f + 3400.f * fmodf(k * 0.271f, 1.f) + 600.f * u, b.pos);
+                            b.alpha = ein * 0.5f * sinf(u * 3.14159f); b.prio = 99100 + k;
+                            f.blits.push_back(b);
+                        }
+                    }
+                    if (title_i >= 0) {   /* our logo in front, 3 stereo layers like the title (4.15 / 4.0 / 3.94 m) */
+                        const float wide = 2600.f, high = wide * th[10] / tw[10], dist[3] = {4150.f, 4000.f, 3940.f};
+                        for (int l = 0; l < 3; l++) {
+                            VPIX_Blit b = {}; b.handle = TH0 + 10 * 4 + l; b.sw = tw[10]; b.sh = th[10]; b.key = -1; b.world = true;
+                            const float k = dist[l] / 4000.f;
+                            b.dw = wide * k; b.dh = high * k; b.pivot[0] = b.dw * 0.5f; b.pivot[1] = b.dh * 0.5f;
+                            at(dist[l], 0.f, 1150.f * k, b.pos);   /* high: the rider in the cart shows under it */
+                            b.alpha = ein; b.prio = 100000 + l; b.top = true;
+                            f.blits.push_back(b);
+                        }
+                    }
+                } else on = false;
+            }
+        }
+    }
+    /* VPIX_SPOOKY_LIGHT=1 (Phantom Freight, dev, Bobby 10-27: "in scary stories people put a flashlight under their face, try some
+       crazy lighting tricks"): Ghost Train sets no lights of its own (the renderer's fixed light). In play this gives it one light
+       from BELOW and in front (camera space, light direction 0,-0.5,-0.85): everything facing you is lit from underneath like a
+       flashlight under the chin, tops of things stay dark; it flickers like a candle; every 8-20 s lightning: two white flashes
+       (sky + everything fully lit for ~80 ms each). */
+    {
+        static const bool sl = getenv("VPIX_SPOOKY_LIGHT") && atoi(getenv("VPIX_SPOOKY_LIGHT"));
+        if (sl && f.fog_end > 0.f) {
+            static unsigned long long next_bolt = 0, bolt_at = 0;
+            const unsigned long long now = hap_ms_now();
+            if (!next_bolt) next_bolt = now + 8000;
+            if (now >= next_bolt) { bolt_at = now; next_bolt = now + 8000 + (unsigned long long)(rand() % 12000); }
+            const unsigned long long since = now - bolt_at;
+            /* none in the museum (Bobby 10-29: "lightning still going on maybe take that o"); mall_now is last frame's, fine here */
+            const bool flash = !mall_now && bolt_at && (since < 80 || (since > 180 && since < 260));
+            const float t = now * 0.001f;
+            const float flick = 0.82f + 0.10f * sinf(t * 7.3f) + 0.06f * sinf(t * 13.1f + 1.f) + 0.04f * sinf(t * 29.f);
+            f.n_lights = 1;
+            f.lights[0].amb = flash ? 0.95f : 0.14f;
+            f.lights[0].diff = flash ? 0.3f : 0.9f * flick;
+            f.lights[0].dir[0] = 0.f; f.lights[0].dir[1] = -0.5f; f.lights[0].dir[2] = -0.85f;
+            if (flash) for (int c = 0; c < 3; c++) { f.clear[c] = 220; f.fog_col[c] = 200; }
+            static unsigned long long last_snd = 0;
+            if (flash && since < 20 && now - last_snd > 1000) { last_snd = now; lg("SPOOKY lightning f=%lu", frame); }
+        }
+    }
+    /* VPIX_RAVE=1|2 (Phantom Freight, dev experiment, Bobby 10-27: "cool rave lights in the sky that make the fog change like a club,
+       faintly, like a UFO is up there, maybe in just spots or the whole thing ... have them match the tempo of that song"): a faint
+       glowing disc high over the ride with coloured light beams hanging from it that sweep round the rider, the fog and sky tinted by
+       the beam colour, all on the beat of the ride track (VPIX_RIDE_MUSIC "file|bpm"; 120 if none). The colour steps every bar, a
+       soft flash on every beat, beams swing over 2 bars. 1 = in spots (stages 2, 4 and 6 of the ride), 2 = the whole ride.
+       VPIX_RAVE_TINT = how far the fog goes toward the beam colour (0.10: faint). */
+    {
+        static int rv = -1; static float tint = 0.10f;
+        if (rv < 0) { rv = getenv("VPIX_RAVE") ? atoi(getenv("VPIX_RAVE")) : 0; if (getenv("VPIX_RAVE_TINT")) tint = (float)atof(getenv("VPIX_RAVE_TINT")); }
+        int stage = -1;
+        if (rv > 0 && f.fog_end > 0.f && region_rt("view")) for (int g = 0; g < 2 && stage < 0; g++) for (int k = 0; k < 2; k++) {
+            const uint32_t c = mem_readd(0xEDB7C + data_delta + g * 8 + k * 4);
+            if (c && mem_readb(0xEDB9C + data_delta + g * 16 + k * 2) == 1 && rd_f(c + 0xD) > 0.f) { stage = (int)(int16_t)mem_readw(c + 5); break; }
+        }
+        static float on = 0.f;   /* fades over ~1.5 s as a spot starts / ends */
+        const bool want = stage >= 0 && !mall_now && (rv == 2 || stage == 2 || stage == 4 || stage == 6);   /* never in the dark museum */
+        on = want ? (std::min)(1.f, on + 0.012f) : (std::max)(0.f, on - 0.012f);
+        if (on > 0.f) {
+            const uint32_t BH = 0x7FFD0003u, GH = 0x7FFD0004u;
+            static bool made = false;
+            if (!made) {   /* a beam (soft-edged column, brightest at the top, fading down) and a round glow */
+                made = true; std::vector<uint32_t> bm(32 * 128), gl(64 * 64);
+                for (int y = 0; y < 128; y++) for (int x = 0; x < 32; x++) { float dx = fabsf(x - 15.5f) / 16.f, a = (1.f - dx * dx) * (0.25f + 0.75f * y / 127.f);
+                    bm[y * 32 + x] = (uint32_t)((std::max)(0.f, a) * 255.f) << 24 | 0xFFFFFFu; }
+                for (int y = 0; y < 64; y++) for (int x = 0; x < 64; x++) { float dx = (x - 31.5f) / 32.f, dy = (y - 31.5f) / 32.f, r = sqrtf(dx * dx + dy * dy);
+                    gl[y * 64 + x] = (uint32_t)(r >= 1.f ? 0.f : (1.f - r) * (1.f - r) * 255.f) << 24 | 0xFFFFFFu; }
+                VPIX_Render_AddBitmapRGBA(BH, 32, 128, bm.data()); VPIX_Render_AddBitmapRGBA(GH, 64, 64, gl.data());
+            }
+            float bpm = 0.f, t = ride_music_beat(bpm);
+            if (bpm <= 0.f) bpm = 120.f;
+            if (t < 0.f) t = hap_ms_now() / 1000.f;
+            const float beats = t * bpm / 60.f, ph = beats - floorf(beats);
+            const float kick = ride_music_kick();                     /* the music's own kick drum: another layer on top of the beat clock */
+            const float pulse = (std::max)(expf(-ph * 5.f), kick);   /* a flash on each beat, dying away - or on each kick */
+            static const float pal[5][3] = {{1.f, 0.15f, 0.85f}, {0.1f, 0.9f, 1.f}, {0.35f, 1.f, 0.25f}, {0.6f, 0.25f, 1.f}, {1.f, 0.45f, 0.1f}};
+            const int bar = (int)floorf(beats / 4.f);
+            /* VPIX_RAVE=2: the lights change their act by section (Bobby 10-27: "have sections of lighting and less of that ... be
+               creative"), stage % 4: 0 CLUB (colour beams sweep, fog changes colour every bar, a pulse on every beat), 1 ABDUCTION (one
+               green tractor beam straight down from the UFO, the fog breathes green), 2 STROBE (dark fog, a soft white flash on every
+               2nd beat), 3 CALM (a faint purple haze breathing every 2 bars: a breather). VPIX_RAVE=1 = CLUB in stages 2, 4, 6. */
+            const int look = rv == 2 ? ((stage % 4) + 4) % 4 : 0;
+            static const float green[3] = {0.25f, 1.f, 0.35f}, purple[3] = {0.45f, 0.2f, 0.75f}, white[3] = {1.f, 1.f, 1.f};
+            const float *col = look == 1 ? green : look == 2 ? white : look == 3 ? purple : pal[((bar % 5) + 5) % 5];
+            float k;
+            if (look == 0) k = on * (tint * 0.6f + tint * 0.6f * pulse);
+            else if (look == 1) k = on * tint * (0.5f + 0.5f * sinf(beats * 3.14159f / 4.f) * sinf(beats * 3.14159f / 4.f));
+            else if (look == 2) { const int bi = (int)floorf(beats); k = on * ((bi % 2 == 0 && ph < 0.08f) ? tint * 2.2f : 0.f); }
+            else k = on * tint * 0.45f * (0.5f + 0.5f * sinf(beats * 3.14159f / 4.f));
+            for (int c = 0; c < 3; c++) {
+                f.fog_col[c] = (uint8_t)(std::min)(255.f, f.fog_col[c] * (1.f - k) + 255.f * col[c] * k);
+                f.clear[c] = (uint8_t)(std::min)(255.f, f.clear[c] * (1.f - k) + 255.f * col[c] * k);
+            }
+            /* the UFO glow 60 m up, ahead */
+            float fw[3] = {f.cam_R[1][0], f.cam_R[1][1], 0.f}; const float fl = sqrtf(fw[0] * fw[0] + fw[1] * fw[1]);
+            if (fl > 1e-3f) { fw[0] /= fl; fw[1] /= fl; } else { fw[0] = 0; fw[1] = 1; }
+            const float rt[2] = {fw[1], -fw[0]};
+            float ufo[3] = {f.cam_T[0] + fw[0] * 25000.f, f.cam_T[1] + fw[1] * 25000.f, f.cam_T[2] + 60000.f};
+            if (look != 2) {   /* no UFO in the strobe: just the flashes */
+                VPIX_Blit b = {}; b.handle = GH; b.sw = b.sh = 64; b.key = -1; b.world = true;
+                b.dw = b.dh = 26000.f * (0.9f + 0.15f * (look == 0 ? pulse : 0.f)); b.pivot[0] = b.pivot[1] = b.dw * 0.5f;
+                for (int c = 0; c < 3; c++) { b.pos[c] = ufo[c]; b.tint[c] = 0.55f + 0.45f * col[c]; }
+                b.alpha = on * (look == 3 ? 0.2f : 0.35f + 0.25f * (look == 0 ? pulse : 0.5f)); b.prio = 98000;
+                f.blits.push_back(b);
+            }
+            if (false) {   /* CLUB beams: off (Bobby 10-27: "not like lasers") */
+                const float swing = beats / 8.f * 6.2831853f;
+                for (int i = 0; i < 5; i++) {
+                    const float a = swing * (i % 2 ? -1.f : 1.f) + i * 1.2566f, r = 9000.f + 4000.f * (i % 3);
+                    const float gx = f.cam_T[0] + fw[0] * 12000.f + (fw[0] * cosf(a) + rt[0] * sinf(a)) * r, gy = f.cam_T[1] + fw[1] * 12000.f + (fw[1] * cosf(a) + rt[1] * sinf(a)) * r;
+                    const float *bc = pal[((bar + i) % 5 + 5) % 5];
+                    VPIX_Blit b = {}; b.handle = BH; b.sw = 32; b.sh = 128; b.key = -1; b.world = true;
+                    b.dw = 2600.f; b.dh = 64000.f; b.pivot[0] = b.dw * 0.5f; b.pivot[1] = 0.f;   /* hangs from the top: bottom at the ground */
+                    b.pos[0] = (gx + ufo[0]) * 0.5f; b.pos[1] = (gy + ufo[1]) * 0.5f; b.pos[2] = f.cam_T[2] - 3000.f;
+                    for (int c = 0; c < 3; c++) b.tint[c] = bc[c];
+                    b.alpha = on * (0.10f + 0.16f * pulse); b.prio = 98010 + i;
+                    f.blits.push_back(b);
+                }
+            } else if (look == 1) {   /* ABDUCTION: one wide green tractor beam straight down ahead, breathing */
+                VPIX_Blit b = {}; b.handle = BH; b.sw = 32; b.sh = 128; b.key = -1; b.world = true;
+                b.dw = 9000.f; b.dh = 64000.f; b.pivot[0] = b.dw * 0.5f; b.pivot[1] = 0.f;
+                b.pos[0] = ufo[0]; b.pos[1] = ufo[1]; b.pos[2] = f.cam_T[2] - 3000.f;
+                for (int c = 0; c < 3; c++) b.tint[c] = green[c];
+                b.alpha = on * (0.14f + 0.12f * sinf(beats * 3.14159f / 2.f) * sinf(beats * 3.14159f / 2.f)); b.prio = 98010;
+                f.blits.push_back(b);
+            }
+            /* DISCO (Bobby 10-27: "more disco like sky lights to the music ... sensory overload of excitement for players"): a mirror
+               ball's spots - 36 coloured dots on a dome round the rider (30 m out, 5-50 degrees up) turning, faster and brighter on
+               every kick of the track; every other dot flips on the beat; colours step each bar - and (lasers removed: Bobby 10-27 "not like lasers"). In every look. */
+            {
+                static float spin = 0.f; static unsigned long long sl = 0; const unsigned long long nn = hap_ms_now();
+                const float dts = sl ? (std::min)(0.05f, (nn - sl) / 1000.f) : 0.f; sl = nn;
+                spin += dts * (0.35f + 2.2f * kick);
+                const int bi = (int)floorf(beats);
+                for (int i = 0; i < 36; i++) {
+                    const float az = i * 0.6981f + spin + (i % 3) * 0.3f, el = (5.f + (i * 37 % 46)) * 0.01745f;
+                    const float *dc = pal[(i + bar) % 5];
+                    if ((i + bi) % 2 && ph > 0.5f) continue;   /* every other dot off for the second half of the beat */
+                    VPIX_Blit b = {}; b.handle = GH; b.sw = b.sh = 64; b.key = -1; b.world = true;
+                    b.dw = b.dh = 1500.f * (1.f + 0.5f * kick); b.pivot[0] = b.pivot[1] = b.dw * 0.5f;
+                    b.pos[0] = f.cam_T[0] + cosf(az) * cosf(el) * 30000.f; b.pos[1] = f.cam_T[1] + sinf(az) * cosf(el) * 30000.f; b.pos[2] = f.cam_T[2] + sinf(el) * 30000.f;
+                    for (int c = 0; c < 3; c++) b.tint[c] = dc[c];
+                    b.alpha = on * (0.45f + 0.55f * kick); b.prio = 98100 + i;
+                    f.blits.push_back(b);
+                }
+                /* NEON SKY (Bobby 10-27: "make the sky have like neon lights to the music, bright but not like lasers, like diffuse light,
+                   multi-coloured lighting" - the ground spots and lasers are out): 7 huge soft glows across the sky round the rider (60 m
+                   out, 10-35 degrees up, 45-70 m wide), each its own neon colour rolling on by the bar, swelling and brightening with the
+                   kick and the beat, drifting slowly round */
+                for (int i = 0; i < 7; i++) {
+                    const float az = i * 0.8976f + nn / 1000.f * 0.05f * (i % 2 ? 1.f : -1.f), el = (10.f + (i * 53 % 26)) * 0.01745f;
+                    static const float neon_c[5][3] = {{1.f, 0.1f, 0.75f}, {0.1f, 0.95f, 1.f}, {0.55f, 0.2f, 1.f}, {0.3f, 1.f, 0.35f}, {1.f, 0.5f, 0.1f}};
+                    /* snapped to the music (Bobby 10-28: "make them or new ones maybe that go to the music suddenly"): a new colour on
+                       every beat and a hard flash that dies fast, half the glows on the off-beat (VPIX_RAVE_SNAP=0 = the old slow roll) */
+                    static const bool snap = !getenv("VPIX_RAVE_SNAP") || atoi(getenv("VPIX_RAVE_SNAP"));
+                    const float *nc = neon_c[(i + (snap ? bi * 3 : bar)) % 5];
+                    const float offb = (i % 2) ? (ph >= 0.5f ? expf(-(ph - 0.5f) * 14.f) : 0.f) : expf(-ph * 12.f);
+                    const float beatpulse = snap ? offb : expf(-ph * 3.f) * ((i + bi) % 2 ? 0.6f : 1.f);
+                    VPIX_Blit b = {}; b.handle = GH; b.sw = b.sh = 64; b.key = -1; b.world = true;
+                    b.dw = b.dh = (45000.f + 15000.f * sinf(nn / 1000.f * 0.3f + i)) * (1.f + 0.25f * kick); b.pivot[0] = b.pivot[1] = b.dw * 0.5f;
+                    b.pos[0] = f.cam_T[0] + cosf(az) * cosf(el) * 60000.f; b.pos[1] = f.cam_T[1] + sinf(az) * cosf(el) * 60000.f; b.pos[2] = f.cam_T[2] + sinf(el) * 60000.f;
+                    for (int c = 0; c < 3; c++) b.tint[c] = nc[c];
+                    b.alpha = on * (std::min)(1.f, snap ? 0.08f + 0.95f * beatpulse + 0.35f * kick : 0.25f + 0.35f * beatpulse + 0.45f * kick); b.prio = 97900 + i;
+                    f.blits.push_back(b);
+                }
+                {   /* the whole sky flashes on the strong kicks (from above), and every 4th beat a glow rises from below through the fog
+                       (Bobby 10-27: "maybe the whole sky flashing, from above or below, in spots - be creative") */
+                    static const float flc[5][3] = {{1.f, 0.2f, 0.8f}, {0.2f, 0.9f, 1.f}, {0.6f, 0.3f, 1.f}, {0.4f, 1.f, 0.4f}, {1.f, 0.55f, 0.2f}};
+                    const float *c1 = flc[(bi / 2) % 5];
+                    const float ks = kick > 0.55f ? (kick - 0.55f) / 0.45f : 0.f, kup = on * 0.6f * ks;
+                    for (int c = 0; c < 3; c++) f.clear[c] = (uint8_t)(std::min)(255.f, f.clear[c] * (1.f - kup) + 255.f * c1[c] * kup);
+                    if (bi % 4 == 0) { const float kd = on * 0.45f * expf(-ph * 4.f); const float *c2 = flc[(bi / 4 + 2) % 5];
+                        for (int c = 0; c < 3; c++) f.fog_col[c] = (uint8_t)(std::min)(255.f, f.fog_col[c] * (1.f - kd) + 255.f * c2[c] * kd); }
+                }
+            }
+            /* UFO light balls (Bobby 10-27: "smaller lights in the sky moving around to effect the fog too ... like light ball ufo you
+               can't quite see ... zipping around"): 6 small glows 25-60 m off round the rider, 10-35 m up. Each hovers with a little
+               wobble, then zips to a new spot (a fast eased dash, 0.35 s) every 2-5 s; colours drift. Each tints the fog toward its colour
+               a little, more the nearer it is. In every look. */
+            {
+                const float tt = hap_ms_now() / 1000.f;
+                auto hsh = [](uint32_t x) { x ^= x >> 16; x *= 0x7feb352dU; x ^= x >> 15; x *= 0x846ca68bU; x ^= x >> 16; return x; };
+                auto spot = [&](int k, uint32_t s, float o[3]) {   /* a place in the sky round the rider, fixed per (orb, segment) */
+                    const uint32_t h = hsh(k * 7919u + s * 104729u);
+                    const float a = (h & 1023) / 1023.f * 6.2831853f, r = 25000.f + ((h >> 10) & 1023) / 1023.f * 35000.f, up = 10000.f + ((h >> 20) & 1023) / 1023.f * 25000.f;
+                    o[0] = f.cam_T[0] + cosf(a) * r; o[1] = f.cam_T[1] + sinf(a) * r; o[2] = f.cam_T[2] + up;
+                };
+                float fogadd[3] = {0, 0, 0}, wsum = 0;
+                for (int k = 0; k < 6; k++) {
+                    const float dur = 2.f + (hsh(k * 31u) % 300) / 100.f, tk = tt + k * 1.7f;
+                    const uint32_t seg = (uint32_t)floorf(tk / dur); const float u = tk / dur - seg;
+                    float A[3], B[3], P[3]; spot(k, seg, A); spot(k, seg + 1, B);
+                    const float z = u < 0.82f ? 0.f : (u - 0.82f) / 0.18f, e = z * z * (3.f - 2.f * z);   /* hover, then the zip */
+                    for (int c = 0; c < 3; c++) P[c] = A[c] + (B[c] - A[c]) * e + 600.f * sinf(tt * (2.3f + k) + c * 2.1f);
+                    const float *oc = pal[(k + (int)floorf(tt / 3.f)) % 5];
+                    VPIX_Blit b = {}; b.handle = GH; b.sw = b.sh = 64; b.key = -1; b.world = true;
+                    b.dw = b.dh = 3200.f * (e > 0.f && e < 1.f ? 0.7f : 1.f); b.pivot[0] = b.pivot[1] = b.dw * 0.5f;
+                    for (int c = 0; c < 3; c++) { b.pos[c] = P[c]; b.tint[c] = 0.5f + 0.5f * oc[c]; }
+                    b.alpha = on * (std::min)(1.f, 0.5f + 0.2f * sinf(tt * 11.f + k) + 0.5f * kick); b.prio = 98020 + k;   /* + the kick */
+                    b.dw = b.dh = b.dw * (1.f + 0.35f * kick); b.pivot[0] = b.pivot[1] = b.dw * 0.5f;
+                    f.blits.push_back(b);
+                    float d = 0; for (int c = 0; c < 3; c++) d += (P[c] - f.cam_T[c]) * (P[c] - f.cam_T[c]);
+                    const float w = 1.f / (1.f + sqrtf(d) / 20000.f);
+                    for (int c = 0; c < 3; c++) fogadd[c] += oc[c] * w; wsum += w;
+                }
+                if (wsum > 0.f) { const float kk = on * tint * 0.35f;
+                    for (int c = 0; c < 3; c++) {
+                        const float oc = fogadd[c] / wsum;
+                        f.fog_col[c] = (uint8_t)(std::min)(255.f, f.fog_col[c] * (1.f - kk) + 255.f * oc * kk);
+                    } }
+            }
+        }
+    }
+    /* VPIX_SMOKE=<n> (Phantom Freight, dev, same ask): n soft smoke wisps kept around the track ahead of the rider, low over the
+       ground, drifting sideways and up, fading in and out (6-9 s each). World sprites of a soft grey puff made here (no file). */
+    {
+        static const int ns = getenv("VPIX_SMOKE") ? (std::max)(0, (std::min)(60, atoi(getenv("VPIX_SMOKE")))) : 0;
+        if (ns > 0 && f.fog_end > 0.f) {
+            const uint32_t SH = 0x7FFD0001u;
+            static bool made = false;
+            if (!made) {
+                made = true; std::vector<uint32_t> px(64 * 64);
+                for (int y = 0; y < 64; y++) for (int x = 0; x < 64; x++) {
+                    float dx = (x - 31.5f) / 32.f, dy = (y - 31.5f) / 32.f, r = sqrtf(dx * dx + dy * dy);
+                    float n = 0.6f + 0.4f * sinf(x * 0.7f + sinf(y * 0.45f) * 2.f) * cosf(y * 0.55f - x * 0.2f);   /* lumpy */
+                    float a = r >= 1.f ? 0.f : (1.f - r) * (1.f - r) * n;
+                    uint32_t al = (uint32_t)((std::max)(0.f, (std::min)(1.f, a)) * 255.f), g = 200;
+                    px[y * 64 + x] = al << 24 | g << 16 | g << 8 | g;
+                }
+                VPIX_Render_AddBitmapRGBA(SH, 64, 64, px.data());
+            }
+            struct Wisp { float p[3], v[3], size, t, life; };
+            static std::vector<Wisp> ws; static unsigned long long last = 0;
+            const unsigned long long now = hap_ms_now(); float dt = last ? (now - last) / 1000.f : 0.f; last = now; if (dt > 0.2f) dt = 0.2f;
+            const float *fw = f.cam_R[1], *rt = f.cam_R[0];
+            auto spawn = [&](Wisp &w, bool anywhere) {
+                float ahead = 1500.f + (rand() % 1000) * (anywhere ? 12.f : 10.f) + (anywhere ? 0.f : 3000.f), side = ((rand() % 2001) - 1000) * 5.f;
+                for (int c = 0; c < 3; c++) w.p[c] = f.cam_T[c] + fw[c] * ahead + rt[c] * side;
+                w.p[2] = f.cam_T[2] - 1200.f + (rand() % 1000) * 1.2f;
+                w.v[0] = ((rand() % 201) - 100) * 3.f; w.v[1] = ((rand() % 201) - 100) * 3.f; w.v[2] = 80.f + (rand() % 100) * 1.5f;
+                w.size = 2500.f + (rand() % 1000) * 3.f; w.life = 6.f + (rand() % 300) * 0.01f; w.t = anywhere ? (rand() % 100) * 0.01f * w.life : 0.f;
+            };
+            if ((int)ws.size() != ns) { ws.resize(ns); for (Wisp &w : ws) spawn(w, true); }
+            for (Wisp &w : ws) {
+                w.t += dt; for (int c = 0; c < 3; c++) w.p[c] += w.v[c] * dt;
+                float d[3] = {w.p[0] - f.cam_T[0], w.p[1] - f.cam_T[1], w.p[2] - f.cam_T[2]};
+                if (w.t >= w.life || d[0] * fw[0] + d[1] * fw[1] + d[2] * fw[2] < -2000.f || d[0] * d[0] + d[1] * d[1] > 30000.f * 30000.f) spawn(w, false);
+                const float u = w.t / w.life, fade = u < 0.25f ? u / 0.25f : u > 0.7f ? (1.f - u) / 0.3f : 1.f;
+                VPIX_Blit b = {}; b.handle = SH; b.sw = b.sh = 64; b.key = -1; b.world = true;
+                b.dw = b.dh = w.size * (1.f + 0.6f * u); b.pivot[0] = b.pivot[1] = b.dw * 0.5f;
+                for (int c = 0; c < 3; c++) b.pos[c] = w.p[c];
+                b.alpha = 0.35f * fade; b.prio = 0;
+                f.blits.push_back(b);
+            }
+        }
+    }
+    /* VPIX_GRIME=1 (Phantom Freight, dev): the track pieces (models
+*.bin: R_S9, RC22.., RS22.., R_S45..) drawn dirtied (renderer) */
+    if (getenv("VPIX_GRIME") && atoi(getenv("VPIX_GRIME"))) {
+        static std::map<uint32_t, bool> trk;
+        for (VPIX_Instance &in : f.inst) {
+            auto it = trk.find(in.handle);
+            if (it == trk.end()) { bool t = false; auto mf = model_files.find(in.handle);
+                if (mf != model_files.end()) { std::string lo = mf->second; std::transform(lo.begin(), lo.end(), lo.begin(), ::tolower); t = lo.rfind("models\\r", 0) == 0; }
+                it = trk.emplace(in.handle, t).first; }
+            if (it->second) in.grime = 1;
+        }
+    }
+    /* VPIX_PROPS=<folder> (Phantom Freight, dev, Bobby 10-27: free 3D assets -> Kenney Graveyard Kit, CC0, converted by
+       events\phantom_freight\obj2bin.py into events\phantom_freight\kenney_bin): beside every tree / stalagmite not already dressed
+       (the odd ones of VPIX_DECOR's hash) one graveyard prop, picked and turned by its position so nothing flickers. The four
+       characters (skeleton, zombie, ghost, vampire) are scaled up to a person's height. Looks only. */
+    {
+        static const char *pd = getenv("VPIX_PROPS");
+        static const char *names[] = {"G_GRAVESTONE_CROSS", "G_GRAVESTONE_ROUND", "G_GRAVESTONE_BROKEN", "G_CROSS_WOOD", "G_LANTERN_CANDLE",
+            "G_LIGHTPOST_SINGLE", "G_IRON_FENCE", "G_IRON_FENCE_DAMAGED", "G_COFFIN", "G_COFFIN_OLD", "G_FIRE_BASKET", "G_PINE_CROOKED",
+            "G_URN_ROUND", "G_CANDLE_MULTIPLE", "G_HAY_BALE", "G_CRYPT_SMALL",   /* not the carved pumpkins: open shells, they read as bowls (Bobby 10-27) */
+            "G_CHARACTER_SKELETON", "G_CHARACTER_ZOMBIE", "G_CHARACTER_GHOST", "G_CHARACTER_VAMPIRE"};
+        const int NP = (int)(sizeof(names) / sizeof(names[0])); const uint32_t HPR = 0x7FFF1000u;
+        static int pst = 0; static bool have[32] = {false}; static int nhave = 0;
+        if (pst == 0) {
+            pst = -1;
+            if (pd && *pd) {
+                for (int k = 0; k < NP; k++) {
+                    std::string fn = std::string(pd) + "\\" + names[k] + ".BIN"; std::vector<uint8_t> d; FILE *fp = fopen(fn.c_str(), "rb");
+                    if (fp) { uint8_t buf[65536]; size_t nr; while ((nr = fread(buf, 1, sizeof(buf), fp)) > 0) d.insert(d.end(), buf, buf + nr); fclose(fp); }
+                    if (!d.empty() && VPIX_Render_AddModel(HPR + k, d.data(), d.size())) { have[k] = true; nhave++; }
+                }
+                pst = nhave ? 1 : -1;
+                lg("HLE: VPIX_PROPS %s: %d of %d props loaded", pd, nhave, NP);
+            }
+        }
+        if (pst == 1) {
+            static std::map<uint32_t, int> kind;
+            const size_t n0 = f.inst.size();
+            for (size_t i = 0; i < n0; i++) {
+                const VPIX_Instance src = f.inst[i];
+                auto kd = kind.find(src.handle);
+                if (kd == kind.end()) {
+                    int kk = 0; auto mf = model_files.find(src.handle);
+                    if (mf != model_files.end()) { std::string lo = mf->second; std::transform(lo.begin(), lo.end(), lo.begin(), ::tolower);
+                        if (lo.find("tree_1.bin") != std::string::npos || lo.find("tree_2.bin") != std::string::npos ||
+                            lo.find("rmite01.bin") != std::string::npos || lo.find("redmite.bin") != std::string::npos) kk = 1; }
+                    kd = kind.emplace(src.handle, kk).first;
+                }
+                if (!kd->second) continue;
+                const uint32_t hsh = (uint32_t)((int)(src.T[0] / 100.f) * 73856093) ^ (uint32_t)((int)(src.T[1] / 100.f) * 19349663);
+                if (!(hsh % 2)) continue;                         /* the even ones carry VPIX_DECOR's grave + jack-o'-lantern */
+                if (hsh % 6 == 5) continue;                       /* a billboard tree (VPIX_DECOR): a prop here stood inside the board (Bobby 10-28) */
+                int k = (int)((hsh / 7) % (uint32_t)NP), tries = 0;
+                while (!have[k] && tries++ < NP) k = (k + 1) % NP;
+                if (!have[k]) continue;
+                const bool person = k >= NP - 4;
+                VPIX_Instance g = {}; g.handle = HPR + (uint32_t)k; g.light_mask = 1;
+                const float a = (hsh >> 9) % 628 / 100.f, sc = person ? 2.3f : 1.f;
+                g.R[0][0] = cosf(a); g.R[0][1] = sinf(a); g.R[1][0] = -sinf(a); g.R[1][1] = cosf(a); g.R[2][2] = 1.f;
+                for (int c = 0; c < 3; c++) g.S[c] = sc;
+                g.T[0] = src.T[0] + 750.f; g.T[1] = src.T[1] - 350.f; g.T[2] = src.T[2];
+                for (int e = 0; e < 16; e++) g.pal[e] = g.palw[e] = 0xFFFFFF;
+                f.inst.push_back(g);
+            }
+        }
+    }
+    /* VPIX_DECOR=<folder with AD.BIN + GRAVEPK.BIN> (Phantom Freight, dev, Bobby 10-27: "Gainesphere ads ... with Halloween theme
+       decorations all over"; models from events\phantom_freight\make_phantom_decor.py). Drawn by MallVR, not placed in the game's
+       data: the game's own tables are full (it loads 251 of ~255 models, and 71 of 74 track/scenery model slots; adding scenery
+       pieces in SECTIONn.ASS stopped it while loading, 10-27). Beside every 2nd tree / stalagmite (TREE_1, TREE_2, RMITE01, REDMITE)
+       a gravestone with a jack-o'-lantern; every 6th tree drawn as a billboard instead (Gainesphere front, MallVR back). Which
+       one gets what is fixed by its position, so nothing flickers. Looks only: the game knows nothing of them. */
+    {
+        static const char *dd = getenv("VPIX_DECOR");
+        static int dstate = 0;                                  /* 0 = not loaded, 1 = ready, -1 = off / failed */
+        const uint32_t HAD = 0x7FFF0E01u, HGP = 0x7FFF0E02u;
+        if (dstate == 0) {
+            dstate = -1;
+            if (dd && *dd) {
+                int ok = 0;
+                for (int k = 0; k < 2; k++) {
+                    std::string fn = std::string(dd) + (k ? "\\GRAVEPK.BIN" : "\\AD.BIN");
+                    std::vector<uint8_t> d; FILE *fp = fopen(fn.c_str(), "rb");
+                    if (fp) { uint8_t buf[65536]; size_t nr; while ((nr = fread(buf, 1, sizeof(buf), fp)) > 0) d.insert(d.end(), buf, buf + nr); fclose(fp); }
+                    if (!d.empty() && VPIX_Render_AddModel(k ? HGP : HAD, d.data(), d.size())) ok++;
+                }
+                dstate = ok == 2 ? 1 : -1;
+                lg("HLE: VPIX_DECOR %s: %s", dd, dstate == 1 ? "AD + GRAVEPK loaded" : "** models not found");
+            }
+        }
+        if (dstate == 1) {
+            static std::map<uint32_t, int> kind;                /* model handle -> 1 tree, 2 stalagmite, 0 other */
+            const size_t n0 = f.inst.size();
+            for (size_t i = 0; i < n0; i++) {
+                VPIX_Instance &in = f.inst[i];
+                auto kd = kind.find(in.handle);
+                if (kd == kind.end()) {
+                    int kk = 0; auto mf = model_files.find(in.handle);
+                    if (mf != model_files.end()) { std::string lo = mf->second; std::transform(lo.begin(), lo.end(), lo.begin(), ::tolower);
+                        if (lo.find("tree_1.bin") != std::string::npos || lo.find("tree_2.bin") != std::string::npos) kk = 1;
+                        else if (lo.find("rmite01.bin") != std::string::npos || lo.find("redmite.bin") != std::string::npos) kk = 2; }
+                    kd = kind.emplace(in.handle, kk).first;
+                }
+                if (!kd->second) continue;
+                const uint32_t hsh = (uint32_t)((int)(in.T[0] / 100.f) * 73856093) ^ (uint32_t)((int)(in.T[1] / 100.f) * 19349663);
+                if (kd->second == 1 && hsh % 6 == 5) {           /* this tree is a billboard */
+                    in.handle = HAD; for (int c = 0; c < 3; c++) in.S[c] = 1.f;
+                    {   /* in to 8 m from the track and turned to face it (Bobby 10-28: the board at the first drop was "far back hard to
+                           see"); worked out once per board, the first time a track piece within 60 m is in view, then fixed */
+                        static std::map<uint32_t, std::array<float, 3>> moved;   /* tree hash -> x, y, yaw */
+                        auto mv = moved.find(hsh);
+                        if (mv == moved.end()) {
+                            float best = 60000.f * 60000.f, tp[2] = {0, 0};
+                            for (const VPIX_Instance &t : f.inst) { auto tf = model_files.find(t.handle); if (tf == model_files.end()) continue;
+                                std::string tl = tf->second; std::transform(tl.begin(), tl.end(), tl.begin(), ::tolower);
+                                if (tl.rfind("models\\r", 0) != 0 || !tl.rfind("models\\re", 0) || !tl.rfind("models\\rm", 0) || !tl.rfind("models\\ro", 0)) continue;
+                                const float dx = t.T[0] - in.T[0], dy = t.T[1] - in.T[1], d2 = dx * dx + dy * dy;
+                                if (d2 < best) { best = d2; tp[0] = t.T[0]; tp[1] = t.T[1]; } }
+                            if (best < 60000.f * 60000.f) {
+                                const float dx = tp[0] - in.T[0], dy = tp[1] - in.T[1], d = sqrtf(dx * dx + dy * dy) + 1e-3f, k = d > 8000.f ? (d - 8000.f) / d : 0.f;
+                                mv = moved.emplace(hsh, std::array<float, 3>{in.T[0] + dx * k, in.T[1] + dy * k, atan2f(-dx, dy)}).first;
+                            }
+                        }
+                        if (mv != moved.end()) {
+                            in.T[0] = mv->second[0]; in.T[1] = mv->second[1]; const float a = mv->second[2];
+                            for (int r = 0; r < 3; r++) for (int c = 0; c < 3; c++) in.R[r][c] = r == c ? 1.f : 0.f;
+                            in.R[0][0] = cosf(a); in.R[0][1] = sinf(a); in.R[1][0] = -sinf(a); in.R[1][1] = cosf(a);
+                        }
+                    }
+                    for (int c = 0; c < 16; c++) in.pal[c] = in.palw[c] = 0xFFFFFF;
+                    /* VPIX_VIDEO_BOARD=<video> (Bobby 10-27: "try a video screen in game ... make them animated ... or a mix of both ...
+                       like our gainesphere logo animation"): every 2nd billboard plays the video on both faces, looping (256 x 144,
+                       15 fps, decoded once by ffmpeg at the first board; cropped to the logo, its black lifted to a deep purple so the
+                       screen reads as lit in the fog); the others keep the still logo */
+                    static const char *vb = getenv("VPIX_VIDEO_BOARD");
+                    static int vstate = 0; static std::vector<std::vector<uint32_t>> vfr; const uint32_t HVB = 0x7FFF0E30u, TVB = 0x7FFD0300u;   /* not 0x7FFF0E10: that is the pumpkins (it made one a flat screen) */
+                    if (vb && *vb && vstate == 0) {
+                        vstate = -1;
+                        static const char *ff = getenv("VPIX_FFMPEG") ? getenv("VPIX_FFMPEG") : "ffmpeg";
+                        char cmd[2048]; snprintf(cmd, sizeof(cmd), "\"%s\" -v quiet -i \"%s\" -an -vf crop=iw*0.84:ih*0.84:iw*0.08:ih*0.1,scale=256:144,fps=15,format=rgba,lutrgb=r=val*0.62+22:g=val*0.66+4:b=val*0.6+36,vflip -f rawvideo -pix_fmt rgba -", ff, vb);
+                        if (void *pv = VPIX_PipeOpen(cmd)) {
+                            std::vector<uint32_t> fr(256 * 144);
+                            while (vfr.size() < 600 && VPIX_PipeRead(pv, fr.data(), fr.size() * 4) == fr.size() * 4) { for (uint32_t &p : fr) p |= 0xFF000000u; vfr.push_back(fr); }
+                            VPIX_PipeClose(pv);
+                        }
+                        if (!vfr.empty() && VPIX_Render_AddTextureRGBA(TVB, 256, 144, vfr[0].data())) {
+                            const float W = 3220.f, H = 1620.f, z0 = 1390.f;   /* the whole board face (16:9 left grey strips at the sides, Bobby 10-27) */
+                            std::vector<float> v = {-W / 2, -70, z0, W / 2, -70, z0, W / 2, -70, z0 + H, -W / 2, -70, z0 + H,
+                                                    W / 2, 70, z0, -W / 2, 70, z0, -W / 2, 70, z0 + H, W / 2, 70, z0 + H};
+                            std::vector<VPIX_MeshPoly> ps(2);
+                            const float uv[4][2] = {{0, 0}, {1, 0}, {1, 1}, {0, 1}};
+                            for (int q = 0; q < 2; q++) { ps[q].n = 4; for (int k = 0; k < 4; k++) { ps[q].idx[k] = (uint32_t)(q * 4 + k); ps[q].uv[k][0] = uv[k][0]; ps[q].uv[k][1] = uv[k][1]; }
+                                ps[q].flags = 0x20FFFFFF; ps[q].tex = TVB; ps[q].nx = 0; ps[q].ny = q ? 1.f : -1.f; ps[q].nz = 0; }
+                            if (VPIX_Render_AddMesh(HVB, v, ps)) vstate = 1;
+                        }
+                        lg("HLE: VPIX_VIDEO_BOARD %s: %u frames%s", vb, (unsigned)vfr.size(), vstate == 1 ? "" : " ** FAILED");
+                    }
+                    if (vstate == 1 && hsh % 12 == 11) {
+                        static unsigned long frame_up = 0xFFFFFFFFul;
+                        if (frame_up != frame) { frame_up = frame; VPIX_Render_UpdateTextureRGBA(TVB, 256, 144, vfr[(hap_ms_now() / 67) % vfr.size()].data()); }
+                        VPIX_Instance g = in; g.handle = HVB;
+                        f.inst.push_back(g);
+                    }
+                    /* VPIX_THANKS_BOARDS=<folder with TB_n.rgba> (Bobby 10-28: "thank special members in dif areas on those billboards so we
+                       dont just have our logo on them all"; art: events\phantom_freight\make_thanks_boards.py): about half the still-logo
+                       boards wear one person's thank-you on both faces (read the right way round from either side), who by place */
+                    else {
+                        static const char *tbd = getenv("VPIX_THANKS_BOARDS"); static int tbn = -1; const uint32_t HTB = 0x7FFF0E40u, TTB = 0x7FFD0310u;
+                        if (tbn < 0) { tbn = 0;
+                            for (int k = 0; tbd && *tbd && k < 16; k++) {
+                                FILE *fq = fopen((std::string(tbd) + "\\TB_" + std::to_string(k) + ".rgba").c_str(), "rb"); int32_t wh[2] = {0, 0};
+                                bool ok = false;
+                                if (fq && fread(wh, 4, 2, fq) == 2 && wh[0] > 0 && wh[1] > 0 && wh[0] <= 2048 && wh[1] <= 2048) {
+                                    std::vector<uint32_t> px((size_t)wh[0] * wh[1]);
+                                    if (fread(px.data(), 4, px.size(), fq) == px.size() && VPIX_Render_AddTextureRGBA(TTB + (uint32_t)k, wh[0], wh[1], px.data())) {
+                                        const float W = 3220.f, H = 1620.f, z0 = 1390.f;
+                                        std::vector<float> v = {-W / 2, -80, z0, W / 2, -80, z0, W / 2, -80, z0 + H, -W / 2, -80, z0 + H,
+                                                                W / 2, 80, z0, -W / 2, 80, z0, -W / 2, 80, z0 + H, W / 2, 80, z0 + H};
+                                        std::vector<VPIX_MeshPoly> ps(2);
+                                        const float uv[4][2] = {{0, 0}, {1, 0}, {1, 1}, {0, 1}};
+                                        for (int q = 0; q < 2; q++) { ps[q].n = 4; for (int j = 0; j < 4; j++) { ps[q].idx[j] = (uint32_t)(q * 4 + j); ps[q].uv[j][0] = uv[j][0]; ps[q].uv[j][1] = uv[j][1]; }
+                                            ps[q].flags = 0x20FFFFFF; ps[q].tex = TTB + (uint32_t)k; ps[q].nx = 0; ps[q].ny = q ? 1.f : -1.f; ps[q].nz = 0; }
+                                        ok = VPIX_Render_AddMesh(HTB + (uint32_t)k, v, ps);
+                                    }
+                                }
+                                if (fq) fclose(fq);
+                                if (!ok) break;
+                                tbn++;
+                            }
+                            if (tbd && *tbd) lg("HLE: VPIX_THANKS_BOARDS %s: %d boards", tbd, tbn);
+                        }
+                        if (tbn > 0 && (hsh / 12) % 2 == 0) { VPIX_Instance g = in; g.handle = HTB + (uint32_t)((hsh / 24) % (uint32_t)tbn); f.inst.push_back(g); }
+                    }
+                    continue;
+                }
+                if (hsh % 2) continue;
+                VPIX_Instance g = in;                           /* gravestone + jack-o'-lantern beside it, upright */
+                g.handle = HGP;
+                for (int r = 0; r < 3; r++) for (int c = 0; c < 3; c++) g.R[r][c] = r == c ? 1.f : 0.f;
+                const float a = (hsh >> 8) % 628 / 100.f;        /* turned a different way each */
+                g.R[0][0] = cosf(a); g.R[0][1] = sinf(a); g.R[1][0] = -sinf(a); g.R[1][1] = cosf(a);
+                for (int c = 0; c < 3; c++) g.S[c] = 1.f;
+                g.T[0] = in.T[0] - 1700.f; g.T[1] = in.T[1] + 400.f;   /* out from under the tree (650 hid it in the trunk: Bobby never saw one) */
+                for (int c = 0; c < 16; c++) g.pal[c] = g.palw[c] = 0xFFFFFF;
+                f.inst.push_back(g);
+            }
+        }
+    }
+    /* The rider's riding cart (state 1) and its gun, for the MallVR extras below (Ghost Train v01.00.09 addresses, re/GHOST_HUNTED_RE.md):
+       cart+0x37 speed, +0x98.. drawn position, +0x13 forward axis, +0x717 slope (sin of pitch, + = climbing), +0x11 trigger held, +9 score;
+       gun pose 0x11FF7C + seat * 0xAC: a PIX matrix at +4 (rows 16 bytes apart, row 1 = aim) and the gun position at +0x34. */
+    static uint32_t my_cart = 0;
+    {
+        my_cart = 0;
+        if (region_rt("view")) for (int g = 0; g < 2 && !my_cart; g++) for (int k = 0; k < 2; k++) {
+            const uint32_t c = mem_readd(0xEDB7C + data_delta + g * 8 + k * 4);
+            if (c && mem_readb(0xEDB9C + data_delta + g * 16 + k * 2) == 1) { my_cart = c; if (rd_f(c + 0xD) > 0.f) ghost_ride_ms = hap_ms_now(); break; }   /* time left: game over / initials are not the ride */
+        }
+    }
+    if (region_rt("view") && getenv("VPIX_ATTRACT_LOCK")) {   /* Phantom Freight: the game's "TUTORIAL Y / N" question (game mode 9, "TUTORIAL?") hidden
+                                                             while it is asked - it always goes to the tutorial anyway (Bobby 10-27: "I saw tutorial text") */
+        const int pod = (int)(int8_t)mem_readb(0xFCDFA + data_delta);
+        const int gm = (pod >= 0 && pod < 4) ? (int16_t)mem_readw(0xEF532 + data_delta + pod * 2) : -1;
+        static int last_gm = -99; static int nl = 0; if (gm != last_gm && nl < 60) { nl++; lg("GAME MODE %d -> %d f=%lu", last_gm, gm, frame); last_gm = gm; }
+        ghost_gm = gm;
+        /* VPIX_SKIP_TUTORIAL (Bobby 10-30: "take out the dang tutorial"): the game sets the cart on the ride's first stage (mode 5), asks
+           TUTORIAL? (mode 9, ~50 frames: too quick to answer with the stick) and then moves the cart to the tutorial track (mode 8). The
+           question is answered here: straight on to riding (mode 1), the cart still on the first stage */
+        static const bool skip_tut = getenv("VPIX_SKIP_TUTORIAL") && atoi(getenv("VPIX_SKIP_TUTORIAL"));
+        if (skip_tut && gm == 9) { mem_writew(0xEF532 + data_delta + pod * 2, 1);
+            /* the ride's clock: the tutorial's end sets it; skipped, a second game started at 0 s and went straight to the initials
+               (10-30 test). The clock of the first game's fresh cart is kept and given to every cart that has none */
+            static float start_t = 0.f;
+            /* only the rider's own cart (riding, state 1; else the first): the clock woke the idle second cart too, and it stood on the
+               track in the Simon room with ours stuck behind it (10-30 ride) */
+            uint32_t mine = 0;
+            for (int g = 0; g < 2 && !mine; g++) for (int k = 0; k < 2; k++) { const uint32_t c = mem_readd(0xEDB7C + data_delta + g * 8 + k * 4);
+                if (c && mem_readb(0xEDB9C + data_delta + g * 16 + k * 2) == 1) { mine = c; break; } }
+            if (!mine) mine = mem_readd(0xEDB7C + data_delta);
+            if (mine) { const float t = rd_f(mine + 0xD); if (t > 0.f && start_t <= 0.f) start_t = t;
+                if (t <= 0.f) { const float nt = start_t > 0.f ? start_t : 60.f; uint32_t u; memcpy(&u, &nt, 4); mem_writed(mine + 0xD, u); }
+                lg("SKIP_TUTORIAL: cart %06X clock %.1f s (start %.1f)", mine, t, start_t); }
+            lg("SKIP_TUTORIAL: mode 9 -> 1 f=%lu", frame); }
+        /* VPIX_SKIP_INITIALS (Bobby 10-30: "the initial screen after the lawnpeople ending part is still getting stuck", "its going crazy
+           so just take out intial screen"): after game over the initials entry (mode 7) stayed black; it goes on to the attract (mode 0)
+           at once, the game's own way out of mode 7 when a score doesn't make the table */
+        static const bool skip_init = getenv("VPIX_SKIP_INITIALS") && atoi(getenv("VPIX_SKIP_INITIALS"));
+        if (skip_init && gm == 7) { mem_writew(0xEF532 + data_delta + pod * 2, 0); lg("SKIP_INITIALS: mode 7 -> 0 f=%lu", frame); }
+        if (gm == 9) {
+            std::vector<VPIX_Blit> keep;
+            for (const VPIX_Blit &b : f.blits) { auto bf = bitmap_files.find(b.handle);
+                if (!b.world && bf != bitmap_files.end()) { std::string lo = bf->second; std::transform(lo.begin(), lo.end(), lo.begin(), ::tolower); if (lo.find("newchars\\") != std::string::npos) continue; }
+                keep.push_back(b); }
+            f.blits.swap(keep);
+        }
+    }
+    /* VPIX_NO_CLOCK (Bobby 10-30: "just take the clock out"): the clock never runs out (VPIX_FLOOR_STAGES holds it at 20 s) and its
+       numbers (the game's letters low on the screen) are not drawn while riding; the ride ends at the end of the line */
+    if (region_rt("view") && ghost_gm == 1 && getenv("VPIX_NO_CLOCK") && atoi(getenv("VPIX_NO_CLOCK"))) {
+        static std::set<int> seen;
+        f.blits.erase(std::remove_if(f.blits.begin(), f.blits.end(), [&](const VPIX_Blit &b) { if (b.world || b.y <= 150) return false;
+            auto bf = bitmap_files.find(b.handle); if (bf == bitmap_files.end() || bf->second.find("newchars") == std::string::npos) return false;
+            if (seen.size() < 40 && seen.insert(b.y * 1000 + b.x).second) lg("NO_CLOCK: hid letter at %d,%d", b.x, b.y);
+            return true; }), f.blits.end());
+    }
+    if (region_rt("view")) {   /* VPIX_RIDE_MUSIC: a ride = a cart riding with time left (1) or starting a stage (0x11, 0x12) */
+        bool riding = false;
+        for (int g = 0; g < 2; g++) for (int k = 0; k < 2; k++) { const int st = mem_readb(0xEDB9C + data_delta + g * 16 + k * 2); const uint32_t c = mem_readd(0xEDB7C + data_delta + g * 8 + k * 4);
+            if (c && ((st == 1 && rd_f(c + 0xD) > 0.f) || st == 0x11 || st == 0x12)) riding = true; }   /* state 1 with no time left = game over */
+        ride_music_tick(riding, my_cart ? (int)(int16_t)mem_readw(my_cart + 5) : -1);
+        /* VPIX_STAGE_TIME=<s> (hell + mall slice, Bobby 10-28: "the time limit needs longer i keep running out of time and cant even get
+           to the end"): each new stage the cart rides into adds s seconds; VPIX_FLOOR_STAGES="1,2" never lets the clock drop under 20 s
+           in those stages (the mall did that already) */
+        static const float stage_time = getenv("VPIX_STAGE_TIME") ? (float)atof(getenv("VPIX_STAGE_TIME")) : 0.f;
+        static std::set<int> floor_st; static bool fs_rd = false;
+        if (!fs_rd) { fs_rd = true; if (const char *e = getenv("VPIX_FLOOR_STAGES")) for (const char *p = e; *p; ) { floor_st.insert(atoi(p)); while (*p && *p != ',') p++; if (*p) p++; } }
+        if (my_cart && riding) {
+            static int t_stage = -99; static uint32_t t_cart = 0;
+            const int st = (int)(int16_t)mem_readw(my_cart + 5); float tl = rd_f(my_cart + 0xD);
+            if (my_cart != t_cart) { t_cart = my_cart; t_stage = st; }
+            if (st != t_stage) { t_stage = st; if (stage_time > 0.f && tl > 0.f) { tl += stage_time; uint32_t u; memcpy(&u, &tl, 4); mem_writed(my_cart + 0xD, u);
+                lg("STAGE_TIME stage %d: +%.0f s -> %.0f s", st, stage_time, tl); } }
+            if (floor_st.count(st) && tl > 0.f && tl < 20.f) { const float t20 = 20.f; uint32_t u; memcpy(&u, &t20, 4); mem_writed(my_cart + 0xD, u); }
+        }
+    }
+    /* VPIX_SKY_FLYERS=<folder> (Phantom Freight, Bobby 10-27: "the eyeball head guy looks so good ... he should look good in the game
+       flying around in the distance, try and add a flying eyeball head guy and a wicked witch"): during the ride a wicked witch on her
+       broom (make_sky_flyers.py: witch_r / witch_l.rgba, picked by her direction) circles wide round the rider 45-70 m out, 20-30 m up,
+       and the eyeball head guy (the floaty_head monster set's frames, VPIX_GHOST_SETS set 1) drifts and swoops 25-40 m out. Looks only. */
+    {
+        static const char *sf = getenv("VPIX_SKY_FLYERS");
+        static int sfs = 0; const uint32_t WR = 0x7FFD0010u, WL = 0x7FFD0011u; static int ww = 0, wh = 0;
+        if (sf && *sf && sfs == 0) {
+            sfs = -1; int ok = 0;
+            for (int k = 0; k < 2; k++) {
+                FILE *fp = fopen((std::string(sf) + (k ? "\\witch_l.rgba" : "\\witch_r.rgba")).c_str(), "rb"); int32_t d2[2] = {0, 0};
+                if (fp && fread(d2, 4, 2, fp) == 2 && d2[0] > 0 && d2[1] > 0 && d2[0] <= 2048 && d2[1] <= 2048) {
+                    std::vector<uint32_t> px((size_t)d2[0] * d2[1]);
+                    if (fread(px.data(), 4, px.size(), fp) == px.size() && VPIX_Render_AddBitmapRGBA(k ? WL : WR, d2[0], d2[1], px.data())) { ok++; ww = d2[0]; wh = d2[1]; }
+                }
+                if (fp) fclose(fp);
+            }
+            sfs = ok == 2 ? 1 : -1; lg("HLE: VPIX_SKY_FLYERS %s: %s", sf, sfs == 1 ? "witch loaded" : "** witch_r / witch_l.rgba missing");
+            if (sfs == 1) { sky_ww = ww; sky_wh = wh; }
+        }
+        if (sfs == 1 && my_cart && f.fog_end > 0.f) {
+            const float t = hap_ms_now() / 1000.f;
+            if (!snatch_witch_now) {   /* the witch: a wide circle, bobbing (off while she swoops on the rider) */
+                const float a = t * 0.18f, r = 57000.f + 13000.f * sinf(t * 0.07f);
+                const float P[3] = {f.cam_T[0] + cosf(a) * r, f.cam_T[1] + sinf(a) * r, f.cam_T[2] + 25000.f + 5000.f * sinf(t * 0.5f)};
+                /* left or right on screen: her velocity across the view */
+                const float vx = -sinf(a), vy = cosf(a), side = vx * f.cam_R[0][0] + vy * f.cam_R[0][1];
+                VPIX_Blit b = {}; b.handle = side >= 0.f ? WR : WL; b.sw = ww; b.sh = wh; b.key = -1; b.world = true; b.nofog = true;
+                b.dw = 9000.f; b.dh = b.dw * wh / ww; b.pivot[0] = b.dw * 0.5f; b.pivot[1] = b.dh * 0.5f;
+                for (int c = 0; c < 3; c++) b.pos[c] = P[c];
+                b.alpha = 1.f; b.prio = 98200; f.blits.push_back(b);
+            }
+            if (ghost_sets.size() > 1) {   /* the eyeball head guy: drifting, swooping */
+                const int fr = 1 + (int)(t * 6.f) % 4; const uint32_t hh = ghost_sets[1][fr];
+                if (hh) {
+                    const float a = -t * 0.27f + 2.f, r = 32000.f + 8000.f * sinf(t * 0.31f);
+                    const float P[3] = {f.cam_T[0] + cosf(a) * r, f.cam_T[1] + sinf(a) * r, f.cam_T[2] + 9000.f + 6000.f * sinf(t * 0.9f)};
+                    VPIX_Blit b = {}; b.handle = hh; b.sw = 48; b.sh = 64; b.key = 0; b.world = true; b.nofog = true;
+                    b.dw = 5200.f; b.dh = b.dw * 64.f / 48.f; b.pivot[0] = b.dw * 0.5f; b.pivot[1] = b.dh * 0.5f;
+                    for (int c = 0; c < 3; c++) b.pos[c] = P[c];
+                    b.alpha = 1.f; b.prio = 98210; f.blits.push_back(b);
+                }
+            }
+        }
+    }
+    /* bat swarms + the Dactyl Nightmare pterodactyl (Bobby 10-27: "more flying bat swarms and the dactyl nightmare guy flying around ...
+       just have him snatch you from the cart and drop you, would be cool if you stop too long"). Bats: 3 swarms of 12 (bat_1 / bat_2
+       .rgba from make_sky_flyers.py, flapping) wheeling round the rider 20-45 m out. The pterodactyl: DAC's own MODELS\OBJECTS\DACTYL.BIN
+       from the player's Dactyl Nightmare (VPIX_DACTYL=<file>), circling high. Sit stopped for 8 s (speed under 300) and he swoops (1.5 s),
+       lifts you 5 m (2.5 s: the cart and your view, through the jump's height, snatch_h), then drops you: crash, big buzz, GOTCHA!. */
+    {
+        static const char *sf = getenv("VPIX_SKY_FLYERS"), *dm = getenv("VPIX_DACTYL");
+        static int st2 = 0; const uint32_t B1 = 0x7FFD0012u, B2 = 0x7FFD0013u, HD = 0x7FFF0E50u; static bool dact = false;
+        if (sf && *sf && st2 == 0) {
+            st2 = -1; int ok = 0;
+            for (int k = 0; k < 2; k++) {
+                FILE *fp = fopen((std::string(sf) + (k ? "\\bat_2.rgba" : "\\bat_1.rgba")).c_str(), "rb"); int32_t d2[2] = {0, 0};
+                if (fp && fread(d2, 4, 2, fp) == 2 && d2[0] == 96 && d2[1] == 64) { std::vector<uint32_t> px(96 * 64);
+                    if (fread(px.data(), 4, px.size(), fp) == px.size() && VPIX_Render_AddBitmapRGBA(k ? B2 : B1, 96, 64, px.data())) ok++; }
+                if (fp) fclose(fp);
+            }
+            if (dm && *dm) { std::vector<uint8_t> d; FILE *fp = fopen(dm, "rb");
+                if (fp) { uint8_t buf[65536]; size_t nr; while ((nr = fread(buf, 1, sizeof(buf), fp)) > 0) d.insert(d.end(), buf, buf + nr); fclose(fp); }
+                dact = !d.empty() && VPIX_Render_AddModel(HD, d.data(), d.size()); }
+            st2 = ok == 2 ? 1 : -1; lg("HLE: bats %s, pterodactyl %s", st2 == 1 ? "loaded" : "** missing", dact ? "loaded" : "** not loaded (VPIX_DACTYL)");
+        }
+        if (st2 == 1 && my_cart && f.fog_end > 0.f) {
+            const float t = hap_ms_now() / 1000.f;
+            for (int sw = 0; sw < 3; sw++) {   /* bat swarms */
+                const float ca = t * (0.22f + 0.05f * sw) + sw * 2.1f, cr = 20000.f + 12000.f * sw * 0.5f + 5000.f * sinf(t * 0.2f + sw);
+                const float C[3] = {f.cam_T[0] + cosf(ca) * cr, f.cam_T[1] + sinf(ca) * cr, f.cam_T[2] + 6000.f + 4000.f * sw + 2000.f * sinf(t * 0.6f + sw)};
+                for (int i = 0; i < 12; i++) {
+                    const float ph = i * 0.5236f + sw, wob = t * (1.5f + 0.13f * i);
+                    VPIX_Blit b = {}; b.handle = ((int)(t * 9.f + i) % 2) ? B1 : B2; b.sw = 96; b.sh = 64; b.key = -1; b.world = true; b.nofog = true;
+                    b.dw = 1300.f; b.dh = 870.f; b.pivot[0] = 650.f; b.pivot[1] = 435.f;
+                    b.pos[0] = C[0] + cosf(ph + wob) * 2600.f; b.pos[1] = C[1] + sinf(ph + wob * 0.8f) * 2600.f; b.pos[2] = C[2] + sinf(ph * 2.f + wob) * 1200.f;
+                    b.alpha = 1.f; b.prio = 98220 + sw * 12 + i; f.blits.push_back(b);
+                }
+            }
+            /* VPIX_SNATCH_WITCH=1 (Bobby 10-28: "the dac that picks you up when slow should fly in from in front of you so you see it
+               ... might be cool to have the witch do it"; the lift + drop stays: "it picked me up and i started moving forward and
+               jumped from high ... it was fun"): the sky witch does the snatch instead of the pterodactyl, and either one now swoops in
+               from straight ahead of the cart, so you see it coming */
+            static const bool witch_sn = getenv("VPIX_SNATCH_WITCH") && atoi(getenv("VPIX_SNATCH_WITCH")) && sky_ww > 0;
+            if (dact || witch_sn) {
+                const unsigned long long now = hap_ms_now();
+                static unsigned long long stop_from = 0, sn_at = 0;
+                const float spd = rd_f(my_cart + 0x37); const bool live = rd_f(my_cart + 0xD) > 0.f;
+                /* not in the tutorial either (Bobby 10-29: "dont let the thing pick us up in the air during tutorial"): it's the last line of
+                   TRACK.DBS, stage 7 (hell_slice_dev.py's 7 sections + tutorial); VPIX_TUTORIAL_STAGE overrides */
+                static const int tut_st = getenv("VPIX_TUTORIAL_STAGE") ? atoi(getenv("VPIX_TUTORIAL_STAGE")) : 7;
+                const bool tut = (int)(int16_t)mem_readw(my_cart + 5) == tut_st;
+                if (spd < 300.f && live && !sn_at && !mall_now && !dm_fight_now && !tut) { if (!stop_from) stop_from = now; } else stop_from = 0;   /* not on the slow mall ride / at the boss */
+                if (stop_from && now - stop_from > 8000 && !sn_at) { sn_at = now; lg("DACTYL snatch f=%lu", frame); }
+                float P[3], vel[3];
+                const float ct = t * 0.12f, crr = 70000.f;   /* his circle, high */
+                const float home[3] = {f.cam_T[0] + cosf(ct) * crr, f.cam_T[1] + sinf(ct) * crr, f.cam_T[2] + 30000.f};
+                for (int c = 0; c < 3; c++) { P[c] = home[c]; }
+                vel[0] = -sinf(ct); vel[1] = cosf(ct); vel[2] = 0;
+                snatch_h = 0.f; snatch_witch_now = false;
+                if (sn_at) {
+                    const float e = (now - sn_at) / 1000.f;
+                    const float over[3] = {f.cam_T[0], f.cam_T[1], f.cam_T[2] + 2600.f};
+                    /* the swoop starts 40 m straight ahead (the cart's heading), 15 m up, so it comes at you in plain view */
+                    static float from[3]; if (e < 0.05f || from[0] == 0.f) { float fx = f.cam_R[1][0], fy = f.cam_R[1][1], fl2 = sqrtf(fx * fx + fy * fy);
+                        if (fl2 < 1e-3f) { fx = 0; fy = 1; fl2 = 1; } from[0] = f.cam_T[0] + fx / fl2 * 40000.f; from[1] = f.cam_T[1] + fy / fl2 * 40000.f; from[2] = f.cam_T[2] + 15000.f; }
+                    snatch_witch_now = witch_sn;
+                    if (e < 1.5f) { const float u = e / 1.5f, s2 = u * u * (3 - 2 * u); for (int c = 0; c < 3; c++) { P[c] = from[c] + (over[c] - from[c]) * s2; vel[c] = over[c] - from[c]; } }
+                    else if (e < 4.f) { const float u = (e - 1.5f) / 2.5f; snatch_h = 9000.f * (1.f - (1.f - u) * (1.f - u)); for (int c = 0; c < 3; c++) P[c] = over[c]; vel[0] = f.cam_R[1][0]; vel[1] = f.cam_R[1][1]; vel[2] = 0;
+                        static int nl = 0; if (nl < 1 && e > 1.6f) { nl = 1; play_game_sound(5, 90); VPIX_Haptic(2, 0.4f, 0.8f); } }
+                    else if (e < 4.6f) { const float u = (e - 4.f) / 0.6f; snatch_h = 9000.f * (1.f - u * u); for (int c = 0; c < 3; c++) P[c] = over[c] + (home[c] - over[c]) * u; vel[2] = 1; }
+                    else { sn_at = 0; stop_from = 0; snatch_h = 0.f; snatch_witch_now = false; play_game_sound(5, 127); VPIX_Haptic(2, 0.6f, 1.f); trick_word = 7; trick_word_at = now; }
+                }
+                if (witch_sn) {   /* the witch on her broom (only while she swoops; the rest of the time she circles in the sky above) */
+                    if (sn_at) {
+                        const float side = vel[0] * f.cam_R[0][0] + vel[1] * f.cam_R[0][1];
+                        VPIX_Blit b = {}; b.handle = side >= 0.f ? 0x7FFD0010u : 0x7FFD0011u; b.sw = sky_ww; b.sh = sky_wh; b.key = -1; b.world = true; b.nofog = true;
+                        b.dw = 6500.f; b.dh = b.dw * sky_wh / sky_ww; b.pivot[0] = b.dw * 0.5f; b.pivot[1] = b.dh * 0.5f;
+                        for (int c = 0; c < 3; c++) b.pos[c] = P[c];
+                        b.alpha = 1.f; b.prio = 98205; f.blits.push_back(b);
+                    }
+                } else {
+                float fl = sqrtf(vel[0] * vel[0] + vel[1] * vel[1]); if (fl < 1e-3f) { vel[0] = 0; vel[1] = 1; fl = 1; }
+                VPIX_Instance g = {}; g.handle = HD; g.light_mask = 1;
+                g.R[1][0] = vel[0] / fl; g.R[1][1] = vel[1] / fl; g.R[1][2] = 0; g.R[0][0] = g.R[1][1]; g.R[0][1] = -g.R[1][0]; g.R[0][2] = 0; g.R[2][2] = 1;
+                for (int c = 0; c < 3; c++) { g.T[c] = P[c]; g.S[c] = 2.5f; }
+                for (int c = 0; c < 16; c++) g.pal[c] = g.palw[c] = 0xFFFFFF;
+                f.inst.push_back(g);
+                }
+            }
+        }
+    }
+    /* VR aim (Bobby 10-27: "take out the head aim crosshair since now it's your right hand gun, but keep it for desktop users ... add
+       the 3D crosshair when it's on an object, like Zone Hunter has"): in the headset the game's screen-centre sight (onecol\targ1.vst)
+       goes, and a red ring stands on whatever the right gun's ray meets (gf_aim_pt, from the game's own ray test), the same size to
+       the eye at any distance. Only with the dual guns (VPIX_DUAL_GUN). */
+    /* the game's own laser beams (models\laser.bin, two of them) are placed in the CAMERA's frame, from the rider's chest, whatever the
+       shot's ray was (Bobby 10-28: "the 2 laser beams from original shoot mechanic are still tied to my chest area when i press right
+       trigger so still need to be linked to gun"): each one is moved into the right gun's frame - the same distance down the gun's
+       ray, its side offsets squeezed in to 25 %, its turn carried over from camera axes to gun axes. */
+    /* ride 3 (Bobby 10-28: "the shots ... needs to be pot on my gun aim though its still centere with the character but i think at gun
+       height"): moving the chest beams into the gun's frame kept their side offsets and their slant in to the head's aim point, so they
+       still ran from the body's middle. Now each beam is rebuilt on the gun: it starts at the muzzle (the live gun, so it follows the
+       hand), runs straight down the gun's ray at the distance the game had it travelled, the two beams 35 mm either side, the game's
+       own length and width kept. */
+    if (dual_on() && cur_in.vr && my_cart && gf_cart == my_cart && hap_ms_now() - gf_ms < 1500) {
+        static std::map<uint32_t, bool> is_laser;
+        float go[3], gd[3];
+        if (!gun_ray_now(my_cart, go, gd)) { memcpy(go, gf_o, sizeof(go)); memcpy(gd, gf_d, sizeof(gd)); }
+        float gy[3] = {gd[0], gd[1], gd[2]}, gx[3] = {gy[1], -gy[0], 0.f}, gz[3];
+        { float l = sqrtf(gx[0] * gx[0] + gx[1] * gx[1]); if (l < 1e-3f) { gx[0] = 1; gx[1] = 0; l = 1; } gx[0] /= l; gx[1] /= l; }
+        gz[0] = gx[1] * gy[2] - gx[2] * gy[1]; gz[1] = gx[2] * gy[0] - gx[0] * gy[2]; gz[2] = gx[0] * gy[1] - gx[1] * gy[0];
+        for (VPIX_Instance &in : f.inst) {
+            auto it = is_laser.find(in.handle);
+            if (it == is_laser.end()) { bool l = false; auto mf = model_files.find(in.handle);
+                if (mf != model_files.end()) { std::string lo = mf->second; std::transform(lo.begin(), lo.end(), lo.begin(), ::tolower); l = lo.find("laser.bin") != std::string::npos; }
+                it = is_laser.emplace(in.handle, l).first; }
+            if (!it->second) continue;
+            const float d[3] = {in.T[0] - f.cam_T[0], in.T[1] - f.cam_T[1], in.T[2] - f.cam_T[2]};
+            const float side = d[0] * f.cam_R[0][0] + d[1] * f.cam_R[0][1] + d[2] * f.cam_R[0][2];
+            const float along = (std::max)(0.f, d[0] * f.cam_R[1][0] + d[1] * f.cam_R[1][1] + d[2] * f.cam_R[1][2]);
+            const float sx = side < 0.f ? -35.f : 35.f;
+            for (int c = 0; c < 3; c++) { in.T[c] = go[c] + gy[c] * along + gx[c] * sx; in.R[0][c] = gx[c]; in.R[1][c] = gy[c]; in.R[2][c] = gz[c]; }
+        }
+    }
+    if (dual_on() && cur_in.vr && my_cart && hap_ms_now() - gf_aim_ms >= 120) {
+        /* the game's hit test only reports 3D enemies and the rival cart, so the ring never sat on bitmap sprites (the ghosts, our
+           floating monsters; Bobby 10-28: "the 3d target from the gun aim works on 3d objects but is not tracking in the bitmap
+           targets"): while shooting, the nearest world sprite the gun's ray passes through gets the ring at its centre depth */
+        float go[3], gd[3];
+        if (gun_ray_now(my_cart, go, gd)) {   /* every frame now, and 30 m out in empty space, so the ring never blinks out */
+            float best = 1e30f, bp[3] = {0, 0, 0};
+            for (const VPIX_Blit &b : f.blits) {
+                if (!b.world || b.top || b.dw <= 0.f) continue;
+                const float w[3] = {b.pos[0] - go[0], b.pos[1] - go[1], b.pos[2] - go[2]};
+                const float t = w[0] * gd[0] + w[1] * gd[1] + w[2] * gd[2];
+                if (t <= 0.f || t >= best) continue;
+                float m2 = 0; for (int i = 0; i < 3; i++) { const float q = w[i] - gd[i] * t; m2 += q * q; }
+                const float r = 0.5f * (std::max)(b.dw, b.dh);
+                if (m2 < r * r) { best = t; for (int i = 0; i < 3; i++) bp[i] = go[i] + gd[i] * t; }
+            }
+            if (best < 1e29f) { memcpy(gf_aim_pt, bp, sizeof(bp)); gf_aim_ms = hap_ms_now(); }
+            else { for (int i = 0; i < 3; i++) gf_aim_pt[i] = go[i] + gd[i] * 30000.f; gf_aim_ms = hap_ms_now(); }
+        }
+    }
+    if (dual_on() && cur_in.vr) {
+        std::vector<VPIX_Blit> keep; keep.reserve(f.blits.size());
+        for (const VPIX_Blit &b : f.blits) { auto bf = bitmap_files.find(b.handle);
+            if (!b.world && bf != bitmap_files.end()) { std::string lo = bf->second; std::transform(lo.begin(), lo.end(), lo.begin(), ::tolower); if (lo.find("targ1.vst") != std::string::npos) continue; }
+            keep.push_back(b); }
+        f.blits.swap(keep);
+        static const bool ring_on = !getenv("VPIX_AIM_RING") || atoi(getenv("VPIX_AIM_RING")) != 0;   /* VPIX_AIM_RING=0: no red ring, the laser aims (Phantom Freight, Bobby 10-29) */
+        if (ring_on && my_cart && hap_ms_now() - gf_aim_ms < 120) {
+            const uint32_t RET = 0x7FFD0006u; static bool made = false;
+            if (!made) { made = true; std::vector<uint32_t> px(64 * 64);
+                for (int y = 0; y < 64; y++) for (int x = 0; x < 64; x++) {
+                    const float dx = x - 31.5f, dy = y - 31.5f, r = sqrtf(dx * dx + dy * dy);
+                    const bool ring = r > 22.f && r < 29.f && !(fabsf(dx) < 4.f || fabsf(dy) < 4.f), dot = r < 3.5f;
+                    const bool tick = (fabsf(dx) < 2.f && fabsf(dy) > 12.f && fabsf(dy) < 22.f) || (fabsf(dy) < 2.f && fabsf(dx) > 12.f && fabsf(dx) < 22.f);
+                    px[y * 64 + x] = (ring || dot || tick) ? 0xFF2020FFu : 0u; }   /* 0xAABBGGRR: red */
+                VPIX_Render_AddBitmapRGBA(RET, 64, 64, px.data()); }
+            float d = 0; for (int c = 0; c < 3; c++) d += (gf_aim_pt[c] - f.cam_T[c]) * (gf_aim_pt[c] - f.cam_T[c]); d = sqrtf(d);
+            VPIX_Blit b = {}; b.handle = RET; b.sw = b.sh = 64; b.key = -1; b.world = true; b.top = true;
+            b.dw = b.dh = (std::max)(150.f, d * 0.05f); b.pivot[0] = b.pivot[1] = b.dw * 0.5f;
+            for (int c = 0; c < 3; c++) b.pos[c] = gf_aim_pt[c];
+            b.alpha = 0.9f; b.prio = 100050;
+            f.blits.push_back(b);
+        }
+    }
+    /* VPIX_TARGETS=<n> (Phantom Freight, dev, Bobby 10-27: "tons of targets ... just off in the distance, random places or floating,
+       giving a ding or some positive reinforcement sound or animation when shot"): n floating bullseyes (models\PFDECOR\TARGET.BIN from
+       VPIX_DECOR) bobbing ahead of the cart, off to the sides and up high, turned to face you. MallVR tests the game's own gun ray
+       against them while the trigger is held: a hit spins the target away (0.35 s), plays the game's point ding, adds 50 to the score
+       and pops "BULLSEYE +50" (VPIX_TITLE3D word). Respawn ahead. */
+    {
+        static const int nt = getenv("VPIX_TARGETS") ? (std::max)(0, (std::min)(40, atoi(getenv("VPIX_TARGETS")))) : 0;
+        static int tg_state = 0; const uint32_t HTG = 0x7FFF0E03u;
+        if (nt > 0 && tg_state == 0) {
+            tg_state = -1; const char *dd = getenv("VPIX_DECOR");
+            if (dd && *dd) { std::string fn = std::string(dd) + "\\TARGET.BIN"; std::vector<uint8_t> d; FILE *fp = fopen(fn.c_str(), "rb");
+                if (fp) { uint8_t buf[65536]; size_t nr; while ((nr = fread(buf, 1, sizeof(buf), fp)) > 0) d.insert(d.end(), buf, buf + nr); fclose(fp); }
+                if (!d.empty() && VPIX_Render_AddModel(HTG, d.data(), d.size())) tg_state = 1; }
+            lg("HLE: VPIX_TARGETS %d: %s", nt, tg_state == 1 ? "TARGET.BIN loaded" : "** TARGET.BIN not found (VPIX_DECOR)");
+        }
+        /* VPIX_GALLERY=<folder> (Bobby 10-27: "bring the shooting gallery's ducks, cans, bottles, rabbits, balloons and targets in as
+           floating targets ... evil ... Halloween theme"): the gallery's targets baked from the player's own Olin Shotgun (renderer
+           VPIX_BAKE) and recoloured by events\phantom_freight\gallery_bake.py: GAL_*.BIN + GAL_INDEX.txt (name, centre, hit radius).
+           The floating targets then take a random type each; a shot balloon shows the gallery's popped balloon. */
+        struct TType { uint32_t h, pop; float c[3], r; int pts; int set = -1; };   /* set >= 0: a monster sprite (VPIX_GHOST_SETS set) */
+        static std::vector<TType> types;
+        if (tg_state == 1 && types.empty()) {
+            types.push_back({HTG, 0, {0, 0, 0}, 520.f, 50});   /* the orange bullseye */
+            const char *gd = getenv("VPIX_GALLERY");
+            if (gd && *gd) {
+                std::map<std::string, TType> byname; uint32_t nh = 0x7FFF0E20u;
+                FILE *fi = fopen((std::string(gd) + "\\GAL_INDEX.txt").c_str(), "r"); char nm[64]; float cx, cy, cz, rr;
+                while (fi && fscanf(fi, "%63s %f %f %f %f", nm, &cx, &cy, &cz, &rr) == 5) {
+                    std::string fn = std::string(gd) + "\\" + nm + ".BIN"; std::vector<uint8_t> d; FILE *fp = fopen(fn.c_str(), "rb");
+                    if (fp) { uint8_t buf[65536]; size_t nr; while ((nr = fread(buf, 1, sizeof(buf), fp)) > 0) d.insert(d.end(), buf, buf + nr); fclose(fp); }
+                    if (d.empty() || !VPIX_Render_AddModel(nh, d.data(), d.size())) continue;
+                    const std::string n = nm;
+                    const int pts = n == "GAL_RABBIT" ? 100 : n == "GAL_CLWNTARG" ? 150 : (n == "GAL_CAN" || n == "GAL_BOTTLE") ? 75 : n == "GAL_BALLOON" ? 25 : 50;
+                    byname[n] = {nh++, 0, {cx, cy, cz}, rr, pts};
+                }
+                if (fi) fclose(fi);
+                if (byname.count("GAL_BALLOON") && byname.count("GAL_BALLPOP")) byname["GAL_BALLOON"].pop = byname["GAL_BALLPOP"].h;
+                for (auto &kv : byname) if (kv.first != "GAL_BALLPOP" && kv.first != "GAL_CLOWN") types.push_back(kv.second);
+                lg("HLE: VPIX_GALLERY %s: %d gallery targets", gd, (int)types.size() - 1);
+            }
+            /* our monsters as facing-us targets too (Bobby 10-27: "put more of the 3D bitmap facing us targets in after the tutorial level,
+               there is lacking ... good colour target characters"): each monster set but Patch's (set 0, he is the track's phantom) */
+            for (size_t d = 1; d < ghost_sets.size(); d++) if (ghost_sets[d][1]) { TType m = {ghost_sets[d][1], 0, {0, 0, 0}, 1500.f, 75}; m.set = (int)d; types.push_back(m); }
+        }
+        if (tg_state == 1 && my_cart && rd_f(my_cart + 0xD) > 0.f && !(mall_now && mall_in_room)) {   /* riding with time left: not over the initials (Bobby 10-28); none on the mall ride */
+            struct Tgt { float p[3], ph; unsigned long long hit_at; bool live; int ty; };
+            static std::vector<Tgt> tg;
+            const unsigned long long now = hap_ms_now();
+            const float cp[3] = {rd_f(my_cart + 0x98), rd_f(my_cart + 0x9C), rd_f(my_cart + 0xA0)};
+            float fw[3] = {rd_f(my_cart + 0x13), rd_f(my_cart + 0x17), rd_f(my_cart + 0x1B)};
+            { float l = sqrtf(fw[0] * fw[0] + fw[1] * fw[1]); if (l < 1e-3f) { fw[0] = f.cam_R[1][0]; fw[1] = f.cam_R[1][1]; l = sqrtf(fw[0] * fw[0] + fw[1] * fw[1]); }
+              if (l < 1e-3f) l = 1.f; fw[0] /= l; fw[1] /= l; fw[2] = 0; }
+            const float sd[3] = {fw[1], -fw[0], 0};
+            /* spread out and far off, harder to get (Bobby 10-28: "spread out some of those 2d bitmap targets far away for harder to
+               get, when they are behind a stalactite cave feature it looks like a mistake till you get closer"): 20-65 m ahead, 5-30 m
+               to the side, 2-12 m up, at least 9 m from each other, and never within 6 m of a cave rock (stalactite / stalagmite) */
+            auto rocky = [&](const float p[3]) {
+                static std::map<uint32_t, bool> rk;
+                for (const VPIX_Instance &in : f.inst) {
+                    auto it = rk.find(in.handle);
+                    if (it == rk.end()) { bool r = false; auto mf = model_files.find(in.handle);
+                        if (mf != model_files.end()) { std::string lo = mf->second; std::transform(lo.begin(), lo.end(), lo.begin(), ::tolower);
+                            r = lo.find("tite") != std::string::npos || lo.find("mite") != std::string::npos || lo.find("rock") != std::string::npos ||
+                                lo.find("stal") != std::string::npos || lo.find("cave") != std::string::npos; }
+                        it = rk.emplace(in.handle, r).first; }
+                    if (!it->second) continue;
+                    const float dx = in.T[0] - p[0], dy = in.T[1] - p[1];
+                    if (dx * dx + dy * dy < 6000.f * 6000.f) return true;
+                }
+                return false;
+            };
+            auto spawn = [&](Tgt &t, bool far_only) {
+                for (int tries = 0; tries < 12; tries++) {
+                    const float ahead = (far_only ? 40000.f : 20000.f) + (rand() % 1000) * (far_only ? 25.f : 45.f);
+                    const float side = (rand() % 2 ? 1.f : -1.f) * (5000.f + (rand() % 1000) * 25.f);
+                    for (int c = 0; c < 3; c++) t.p[c] = cp[c] + fw[c] * ahead + sd[c] * side;
+                    t.p[2] = cp[2] + 2000.f + (rand() % 1000) * 10.f;
+                    bool bad = rocky(t.p);
+                    for (const Tgt &o : tg) if (&o != &t && !bad) { const float dx = o.p[0] - t.p[0], dy = o.p[1] - t.p[1], dz = o.p[2] - t.p[2];
+                        if (dx * dx + dy * dy + dz * dz < 9000.f * 9000.f) bad = true; }
+                    if (!bad) break;
+                }
+                t.ph = (rand() % 628) * 0.01f; t.hit_at = 0; t.live = true; t.ty = types.size() > 1 ? 1 + rand() % ((int)types.size() - 1) : 0;
+                if (types.size() > 1 && rand() % 5 == 0) t.ty = 0;   /* a bullseye now and then */
+                if (rand() % 2) { std::vector<int> ms; for (size_t q = 0; q < types.size(); q++) if (types[q].set >= 0) ms.push_back((int)q); if (!ms.empty()) t.ty = ms[rand() % ms.size()]; }   /* half monsters */
+            };
+            if ((int)tg.size() != nt) { tg.resize(nt); for (Tgt &t : tg) spawn(t, false); }
+            /* the game's gun ray */
+            float go[3] = {0, 0, 0}, gd[3] = {0, 0, 0}; bool shooting = false;
+            {
+                const int seat = (int)(int16_t)mem_readw(my_cart + 3) + (int)(int8_t)mem_readb(0xFCDFA + data_delta);
+                const uint32_t gb = 0x11FF7C + data_delta + (uint32_t)(seat < 0 ? 0 : seat) * 0xAC;
+                for (int c = 0; c < 3; c++) { go[c] = rd_f(gb + 0x34 + 4 * c); gd[c] = rd_f(gb + 4 + 0x10 + 4 * c); }
+                const float l = sqrtf(gd[0] * gd[0] + gd[1] * gd[1] + gd[2] * gd[2]);
+                if (l > 1e-3f) { for (float &v : gd) v /= l; shooting = mem_readw(my_cart + 0x11) != 0; }
+                ghost_shot_ray(my_cart, go, gd);   /* the ray the game's shot really used (the right gun: the controller) */
+            }
+            for (Tgt &t : tg) {
+                const float d[3] = {t.p[0] - cp[0], t.p[1] - cp[1], t.p[2] - cp[2]};
+                const float along = d[0] * fw[0] + d[1] * fw[1], dist = sqrtf(d[0] * d[0] + d[1] * d[1]);
+                if (along < -6000.f || dist > 70000.f) { spawn(t, true); continue; }
+                if (!t.live) { if (now - t.hit_at > 2500) { spawn(t, true); continue; } else if (now - t.hit_at > 350) continue; }
+                const float bob = 350.f * sinf(now * 0.0017f + t.ph);
+                const float c[3] = {t.p[0], t.p[1], t.p[2] + bob};
+                const TType &ty = types[t.ty < (int)types.size() ? t.ty : 0];
+                float n[3] = {f.cam_T[0] - c[0], f.cam_T[1] - c[1], 0}; float nl = sqrtf(n[0] * n[0] + n[1] * n[1]); if (nl < 1) nl = 1;
+                n[0] /= nl; n[1] /= nl;
+                const float hc[3] = {c[0] - n[0] * ty.c[1] + n[1] * ty.c[0], c[1] - n[1] * ty.c[1] - n[0] * ty.c[0], c[2] + ty.c[2]};   /* model centre in the world */
+                if (t.live && shooting) {   /* ray vs the target's sphere (centre + radius from the type) */
+                    const float w[3] = {hc[0] - go[0], hc[1] - go[1], hc[2] - go[2]};
+                    const float tt = w[0] * gd[0] + w[1] * gd[1] + w[2] * gd[2];
+                    if (tt > 0) { float m2 = 0; for (int i = 0; i < 3; i++) { const float q = w[i] - gd[i] * tt; m2 += q * q; }
+                        if (m2 < ty.r * ty.r) {
+                            t.live = false; t.hit_at = now;
+                            mem_writed(my_cart + 9, mem_readd(my_cart + 9) + (uint32_t)ty.pts);
+                            play_game_sound(4, 127); trick_word = t.ty == 0 ? 5 : 7; trick_word_at = now;   /* "BULLSEYE +50" / "GOTCHA!" */
+                            VPIX_Haptic(0, 0.05f, 0.6f);
+                            static int nl = 0; if (nl++ < 40) lg("TARGET hit f=%lu", frame);
+                        } }
+                }
+                if (ty.set >= 0) {   /* a monster sprite: its 4 live frames, then its dissolve (frames 5-8) when shot */
+                    const int fr = t.live ? 1 + (int)((now / 160 + (unsigned long long)(t.ph * 10)) % 4) : 5 + (std::min)(3, (int)((now - t.hit_at) / 90));
+                    const uint32_t hh = ghost_sets[ty.set][fr] ? ghost_sets[ty.set][fr] : ty.h;
+                    VPIX_Blit b = {}; b.handle = hh; b.sw = 48; b.sh = 64; b.key = 0; b.world = true; b.nofog = true;   /* 0 = see-through (no black box) */
+                    b.dw = 3000.f; b.dh = 4000.f; b.pivot[0] = b.dw * 0.5f; b.pivot[1] = b.dh * 0.5f;
+                    for (int k = 0; k < 3; k++) b.pos[k] = c[k];
+                    b.alpha = 1.f; b.prio = 98500; f.blits.push_back(b);
+                    continue;
+                }
+                VPIX_Instance in = {}; in.handle = (!t.live && ty.pop) ? ty.pop : ty.h; in.light_mask = 1;
+                in.bright = 1;   /* lit from within (Bobby 10-30: the shooting gallery's targets "to dark to see" in the tunnels) */
+                float spin = 0.f, sc = 1.f;
+                if (!t.live) { const float u = (now - t.hit_at) / 350.f; spin = u * 12.f; sc = 1.f + 0.6f * u; }   /* pop: spins and swells away */
+                const float cs = cosf(spin), sn = sinf(spin);
+                const float y[2] = {n[0] * cs - n[1] * sn, n[0] * sn + n[1] * cs};   /* local y faces the camera (turned while popping) */
+                in.R[1][0] = -y[0]; in.R[1][1] = -y[1]; in.R[1][2] = 0;
+                in.R[2][0] = 0; in.R[2][1] = 0; in.R[2][2] = 1;
+                in.R[0][0] = in.R[1][1]; in.R[0][1] = -in.R[1][0]; in.R[0][2] = 0;
+                for (int k = 0; k < 3; k++) { in.T[k] = c[k]; in.S[k] = sc; }
+                for (int e = 0; e < 16; e++) in.pal[e] = in.palw[e] = 0xFFFFFF;
+                f.inst.push_back(in);
+            }
+        }
+    }
+    /* VPIX_THANKS=<folder with thanks_sign.rgba> (Phantom Freight, Bobby 10-27: "thank him and those other people somewhere in that
+       Halloween phantom game ... write on a wall or sign in game ... with avatars"; art: events\phantom_freight\make_thanks_sign.py).
+       A plank sign on two posts beside track 1, early in the ride: anchored to the first straight track piece (models\r_s9.bin)
+       that is 12-24 m along the start of the ride (section 1 and the tutorial both start there), 3.2 m to its left, angled toward
+       the rider. Drawn sharp from the picture (a textured mesh). Shown for the first 45 s of each ride only, so it doesn't turn up
+       in later sections (they reuse the same coordinates). */
+    {
+        static const char *th = getenv("VPIX_THANKS");
+        static int ts_state = 0; const uint32_t HSIGN = 0x7FFF1100u, TSIGN = 0x7FFD0200u;
+        if (th && *th && ts_state == 0) {
+            ts_state = -1;
+            FILE *fp = fopen((std::string(th) + "\\thanks_sign.rgba").c_str(), "rb"); int32_t wh[2] = {0, 0};
+            if (fp && fread(wh, 4, 2, fp) == 2 && wh[0] > 0 && wh[1] > 0 && wh[0] <= 4096 && wh[1] <= 4096) {
+                std::vector<uint32_t> px((size_t)wh[0] * wh[1]);
+                if (fread(px.data(), 4, px.size(), fp) == px.size() && VPIX_Render_AddTextureRGBA(TSIGN, wh[0], wh[1], px.data())) {
+                    /* board 3600 x 2250 (16:10, the picture), bottom 1300 up, facing -y; two dark posts */
+                    const float W = 3600.f, H = 2250.f, z0 = 1300.f;
+                    std::vector<float> v = {-W / 2, -20, z0, W / 2, -20, z0, W / 2, -20, z0 + H, -W / 2, -20, z0 + H};
+                    std::vector<VPIX_MeshPoly> ps(1);
+                    ps[0].n = 4; for (int k = 0; k < 4; k++) ps[0].idx[k] = (uint32_t)k;
+                    ps[0].flags = 0x20FFFFFF; ps[0].tex = TSIGN; ps[0].nx = 0; ps[0].ny = -1; ps[0].nz = 0;
+                    const float uv[4][2] = {{0, 0}, {1, 0}, {1, 1}, {0, 1}};   /* rows bottom-up in the file = v 0 at the bottom */
+                    for (int k = 0; k < 4; k++) { ps[0].uv[k][0] = uv[k][0]; ps[0].uv[k][1] = uv[k][1]; }
+                    auto box = [&](float x0, float x1, float y0, float y1, float zz0, float zz1, uint32_t col) {
+                        const uint32_t b = (uint32_t)(v.size() / 3);
+                        const float c[8][3] = {{x0, y0, zz0}, {x1, y0, zz0}, {x1, y1, zz0}, {x0, y1, zz0}, {x0, y0, zz1}, {x1, y0, zz1}, {x1, y1, zz1}, {x0, y1, zz1}};
+                        for (auto &q : c) { v.push_back(q[0]); v.push_back(q[1]); v.push_back(q[2]); }
+                        const int f6[6][4] = {{0, 1, 5, 4}, {1, 2, 6, 5}, {2, 3, 7, 6}, {3, 0, 4, 7}, {4, 5, 6, 7}, {3, 2, 1, 0}};
+                        const float nn[6][3] = {{0, -1, 0}, {1, 0, 0}, {0, 1, 0}, {-1, 0, 0}, {0, 0, 1}, {0, 0, -1}};
+                        for (int fi = 0; fi < 6; fi++) { VPIX_MeshPoly q; q.n = 4; for (int k = 0; k < 4; k++) q.idx[k] = b + (uint32_t)f6[fi][k];
+                            q.flags = 0x20000000 | col; q.nx = nn[fi][0]; q.ny = nn[fi][1]; q.nz = nn[fi][2]; ps.push_back(q); }
+                    };
+                    box(-W / 2 + 250, -W / 2 + 400, -10, 120, 0, z0 + H - 200, 0x0E1A2A);
+                    box(W / 2 - 400, W / 2 - 250, -10, 120, 0, z0 + H - 200, 0x2A1A0E);
+                    box(-W / 2 - 60, W / 2 + 60, 0, 60, z0 - 60, z0 + H + 60, 0x08101A);   /* back of the board */
+                    if (VPIX_Render_AddMesh(HSIGN, v, ps)) ts_state = 1;
+                }
+            }
+            if (fp) fclose(fp);
+            lg("HLE: VPIX_THANKS %s: %s", th, ts_state == 1 ? "sign loaded" : "** thanks_sign.rgba not found");
+        }
+        if (ts_state == 1) {
+            static unsigned long long ride_at = 0; static bool anchored = false; static float sp[3] = {0, 0, 0}, sf[2] = {0, 1};
+            const unsigned long long now = hap_ms_now();
+            if (!my_cart) { ride_at = 0; anchored = false; }
+            else if (!ride_at) ride_at = now;
+            if (my_cart && now - ride_at < 45000) {
+                if (!anchored) {   /* where the ride starts: 9 m ahead of the rider, 3.2 m to the left (10-30 night: anchored to a track
+                       piece it slid behind the cart's start, "the thank you sign at the start is gone now"); the camera's own forward */
+                    float fw[2] = {f.cam_R[1][0], f.cam_R[1][1]}; const float fl = sqrtf(fw[0] * fw[0] + fw[1] * fw[1]);
+                    if (fl > 0.3f && now - ride_at > 1500)   /* the camera settled on the cart */ { fw[0] /= fl; fw[1] /= fl;
+                        sp[0] = f.cam_T[0] + fw[0] * 9000.f - fw[1] * 3200.f; sp[1] = f.cam_T[1] + fw[1] * 9000.f + fw[0] * 3200.f; sp[2] = f.cam_T[2] - 1500.f;
+                        sf[0] = -fw[0]; sf[1] = -fw[1]; anchored = true;   /* square to the rider coming up */
+                        { const float dx = f.cam_T[0] - sp[0], dy = f.cam_T[1] - sp[1], l = sqrtf(dx * dx + dy * dy); if (l > 1.f) { sf[0] = -dx / l; sf[1] = -dy / l; } } }
+                }
+                if (anchored) {
+                    /* clear of the museum's exhibits (Bobby 10-30: "the sign at the start of the museum is intersecting with an arcade
+                       machine": it stood in the station's row of red-eye cabinets): slid along the track to the nearest spot 3 m from
+                       every exhibit (the board is 3.6 m wide and turns to the rider), else a step further out from the track */
+                    float q[3] = {sp[0], sp[1], sp[2]};
+                    auto clear_at = [&](float x, float y) { for (size_t k = 0; k + 1 < museum_xy.size(); k += 2) {
+                        const float dx = museum_xy[k] - x, dy = museum_xy[k + 1] - y; if (dx * dx + dy * dy < 3000.f * 3000.f) return false; } return true; };
+                    if (!clear_at(q[0], q[1])) {
+                        static const float along[5] = {0.f, 2000.f, 4000.f, 6000.f, 8000.f};   /* only on ahead, never back behind the start */
+                        bool found = false;
+                        for (float out : {0.f, 2500.f}) { for (float a : along) {   /* sf points back at the rider: ahead = -sf, further left = (sf1, -sf0) */
+                            const float xx = sp[0] - sf[0] * a + sf[1] * out, yy = sp[1] - sf[1] * a - sf[0] * out;
+                            if (clear_at(xx, yy)) { q[0] = xx; q[1] = yy; found = true; break; } } if (found) break; }
+                        static bool said = false; if (!said) { said = true; lg("HLE: VPIX_THANKS sign moved %.0f, %.0f mm clear of the exhibits%s", q[0] - sp[0], q[1] - sp[1], found ? "" : " (** no clear spot)"); }
+                    }
+                    VPIX_Instance g = {}; g.handle = HSIGN; g.light_mask = 1;
+                    g.R[1][0] = sf[0]; g.R[1][1] = sf[1]; g.R[0][0] = sf[1]; g.R[0][1] = -sf[0]; g.R[2][2] = 1.f;   /* its front (-y) at the rider */
+                    for (int c = 0; c < 3; c++) { g.T[c] = q[c]; g.S[c] = 1.f; }
+                    for (int e = 0; e < 16; e++) g.pal[e] = g.palw[e] = 0xFFFFFF;
+                    f.inst.push_back(g);
+                }
+            }
+        }
+    }
+    /* VPIX_HELL=<prop folder> + VPIX_MALLRIDE=<make_mallride.py folder> (Phantom Freight, dev, Bobby 10-28; events\phantom_freight\
+       RIDE_PLAN.md "DEVIL GIRLS ALL THROUGH HELL", "THE VR HISTORY MUSEUM RIDE", "MUSEUM RIDE FINALE: THE MALL PREVIEW"; "the section
+       after hell is the mall so far", "a slow disney type ride with voiceover explainers on whats coming"). Our 3D props (orbit ->
+       Hunyuan3D -> obj2bin: ~2,500 flat-colour faces, centred on the origin, 2.35 m across) drawn by MallVR beside the track while the
+       rider's cart (+5) is on a given stage. The hell track and the mall section aren't built yet (track room, RIDE_PLAN.md), so the
+       dev slice dresses existing stages: VPIX_HELL_STAGE (default 5, the lava) and VPIX_MALLRIDE_STAGE (default 7, the end of the line).
+       HELL: beside ~1 in 4 track pieces a devil girl (CHAR_DEVIL_GIRL, turned / scaled a little so they don't read as clones), facing
+       the track; some knee-deep in the ground, a third pop up out of the fire as the cart nears (lit from below in red). The first
+       landing piece (RLAND*) seen gets Velvet with a row of six (the welcome committee); one more Velvet on a straight mid-ride. Shot =
+       she sinks away spinning, +50, GOTCHA!. Red fog. Velvet in the Devil's Chamber waits for the chamber.
+       MALL RIDE: the exhibits of LAYOUT.TXT, in ride order, one each side of every track piece as the cart first sees it, on plinths
+       with brass plaques (PLQ_n.rgba) toward the track; a missing BIN = empty plinth + COMING SOON plaque. The cart crawls
+       (VPIX_MALLRIDE_SPEED, default 3000) and its time is topped up. Scene 0 is the dark station: black fog, the red-eye cabinets'
+       screens come on one by one; scene 1 on, the lights come up warm. Each scene lights up (drawn full colour + a warm glow) when
+       the cart comes within 14 m of it and its narration (narration\NARR_n.wav, make_narration.py; VPIX_NARRATION=<folder>) plays,
+       the ride music ducked under it. VPIX_PROP_FRONT=<deg> turns every prop if their fronts face the wrong way. */
+    {
+        static const char *hd = getenv("VPIX_HELL"), *md = getenv("VPIX_MALLRIDE"), *nd = getenv("VPIX_NARRATION");
+        static const int hell_st = getenv("VPIX_HELL_STAGE") ? atoi(getenv("VPIX_HELL_STAGE")) : 5;
+        static const int mall_st = getenv("VPIX_MALLRIDE_STAGE") ? atoi(getenv("VPIX_MALLRIDE_STAGE")) : 7;
+        static const float mall_sp = getenv("VPIX_MALLRIDE_SPEED") ? (float)atof(getenv("VPIX_MALLRIDE_SPEED")) : 3000.f;
+        static const float front = getenv("VPIX_PROP_FRONT") ? (float)atof(getenv("VPIX_PROP_FRONT")) * 0.0174533f : 0.f;
+        struct PM { bool ok = false; float zmin = 0, zmax = 0, ext = 0; };   /* ext: the biggest of its three sizes */
+        auto load_bin = [&](const std::string &fn, uint32_t h) {   /* our BIN 0200 (obj2bin.py): vertex count at 56 + ov - 4 */
+            PM pm; std::vector<uint8_t> d; FILE *fp = fopen(fn.c_str(), "rb");
+            if (fp) { uint8_t buf[65536]; size_t nr; while ((nr = fread(buf, 1, sizeof(buf), fp)) > 0) d.insert(d.end(), buf, buf + nr); fclose(fp); }
+            if (d.size() < 80 || !VPIX_Render_AddModel(h, d.data(), d.size())) return pm;
+            auto be = [&](size_t o) { return (uint32_t)d[o] << 24 | (uint32_t)d[o + 1] << 16 | (uint32_t)d[o + 2] << 8 | d[o + 3]; };
+            const size_t base = 56, ov = be(base); const uint32_t nv = be(base + ov - 4);
+            pm.zmin = 1e30f; pm.zmax = -1e30f; float lo[2] = {1e30f, 1e30f}, hi[2] = {-1e30f, -1e30f};
+            for (uint32_t k = 0; k < nv && base + ov + 12 * k + 12 <= d.size(); k++) { uint32_t u = be(base + ov + 12 * k + 8); float z; memcpy(&z, &u, 4);
+                pm.zmin = (std::min)(pm.zmin, z); pm.zmax = (std::max)(pm.zmax, z);
+                for (int q = 0; q < 2; q++) { uint32_t w = be(base + ov + 12 * k + 4 * q); float v; memcpy(&v, &w, 4); lo[q] = (std::min)(lo[q], v); hi[q] = (std::max)(hi[q], v); } }
+            pm.ext = (std::max)(pm.zmax - pm.zmin, (std::max)(hi[0] - lo[0], hi[1] - lo[1]));
+            pm.ok = pm.zmax > pm.zmin; return pm;
+        };
+        auto is_track = [&](uint32_t handle, bool *straight, bool *landing) {   /* models\r*.bin track pieces, not the red rocks / mites */
+            static std::map<uint32_t, int> tk;   /* 0 no, 1 piece, 2 straight R_S9, 3 landing RLAND* */
+            auto it = tk.find(handle);
+            if (it == tk.end()) { int t = 0; auto mf = model_files.find(handle);
+                if (mf != model_files.end()) { std::string lo = mf->second; std::transform(lo.begin(), lo.end(), lo.begin(), ::tolower);
+                    if (lo.rfind("models\\r", 0) == 0 && lo.rfind("models\\re", 0) && lo.rfind("models\\rm", 0) && lo.rfind("models\\ro", 0))
+                        t = lo.find("r_s9.bin") != std::string::npos ? 2 : lo.rfind("models\\rland", 0) == 0 ? 3 : 1; }
+                it = tk.emplace(handle, t).first; }
+            *straight = it->second == 2; *landing = it->second == 3; return it->second != 0;
+        };
+        auto yaw_to = [&](VPIX_Instance &g, float dx, float dy, float jitter) {   /* local -y (the front) toward (dx, dy) */
+            const float a = atan2f(dx, -dy) + jitter + front;
+            g.R[0][0] = cosf(a); g.R[0][1] = sinf(a); g.R[0][2] = 0; g.R[1][0] = -sinf(a); g.R[1][1] = cosf(a); g.R[1][2] = 0;
+            g.R[2][0] = g.R[2][1] = 0; g.R[2][2] = 1.f;
+        };
+        auto glow = [&](uint32_t h, uint32_t rgb) {   /* soft round glow bitmaps, made once */
+            std::vector<uint32_t> px(32 * 32);
+            for (int y = 0; y < 32; y++) for (int x = 0; x < 32; x++) { const float dx = (x - 15.5f) / 16.f, dy = (y - 15.5f) / 16.f, r = sqrtf(dx * dx + dy * dy);
+                px[y * 32 + x] = (uint32_t)((std::max)(0.f, 1.f - r) * (std::max)(0.f, 1.f - r) * 255.f) << 24 | rgb; }
+            VPIX_Render_AddBitmapRGBA(h, 32, 32, px.data());
+        };
+        auto put_glow = [&](uint32_t h, const float p[3], float size, float alpha) {
+            VPIX_Blit b = {}; b.handle = h; b.sw = b.sh = 32; b.key = -1; b.world = true; b.dw = b.dh = size; b.pivot[0] = b.pivot[1] = size * 0.5f;
+            for (int q = 0; q < 3; q++) b.pos[q] = p[q]; b.alpha = alpha; b.prio = 99300; f.blits.push_back(b);
+        };
+        const uint32_t GRED = 0x7FFD0020u, GWARM = 0x7FFD0021u, GEYE = 0x7FFD0022u;
+        static int st = 0;
+        static PM girl, velvet; static bool hell_ok = false, mall_ok = false;
+        struct Ex { int scene; char kind; std::string name; int plq; PM pm; bool has_near = false, hires = false; float nzmin = 0.f, nzmax = 0.f; };   /* nz: the NEAR / hires mesh's own bottom and top */   /* near: a textured NEAR model (NEAR_<i>) */
+        static bool gate_ok[16] = {false};   /* GATE_<scene>.rgba loaded: that gallery has doors */
+        static std::vector<VSound> bob_says(16); static std::atomic<bool> bob_ready(false);   /* BOBBY_<scene>.wav: Bobby's own lines (his cloned voice) */
+        static std::vector<Ex> ex; static std::vector<VSound> narr; static std::atomic<bool> narr_ready(false);
+        static std::vector<float> loop_path; static int ball_chunks = 0; static bool ball_solid = false;   /* the loop sculpture's track (x y z, up xyz per point); critter ball chunks loaded */
+        const uint32_t HGIRL = 0x7FFF1200u, HVEL = 0x7FFF1201u, HPLINTH = 0x7FFF12F0u, HEX0 = 0x7FFF1300u, HPLQ0 = 0x7FFF1400u, TPLQ0 = 0x7FFD0400u;
+        if (st == 0) {
+            st = 1;
+            glow(GRED, 0x1040FFu); glow(GWARM, 0x90D8FFu); glow(GEYE, 0x0000FFu);   /* 0xBBGGRR */
+            {   /* a flame tongue: a tall soft ellipse, white-yellow core -> orange -> red edge (symmetric, so either row order reads) */
+                std::vector<uint32_t> px(32 * 64);
+                for (int y = 0; y < 64; y++) for (int x = 0; x < 32; x++) {
+                    const float dx = (x - 15.5f) / 16.f, dy = (y - 31.5f) / 32.f, r = sqrtf(dx * dx + dy * dy * 0.9f);
+                    const float a = r >= 1.f ? 0.f : (1.f - r) * (0.6f + 0.4f * (1.f - r));
+                    const float h = (std::max)(0.f, 1.f - r * 1.6f);   /* heat: 1 at the core */
+                    const uint32_t R = 255, G = (uint32_t)(60 + 195 * h), B = (uint32_t)(20 + 150 * h * h);
+                    px[y * 32 + x] = (uint32_t)(a * 255.f) << 24 | B << 16 | G << 8 | R;
+                }
+                VPIX_Render_AddBitmapRGBA(0x7FFD0023u, 32, 64, px.data());
+            }
+            {   /* the rock pillar the devil girls stand on (RIDE_PLAN: "on top of lava pillars"): 8 sides, 1.0 m across the top, 1.6 m at
+                   the foot, 14 m down into the fire; dark basalt sides, a molten top */
+                std::vector<float> v; std::vector<VPIX_MeshPoly> ps; const int N = 8; const float rt = 1000.f, rb = 1600.f, zb = -14000.f;
+                for (int k = 0; k < N; k++) { const float a = k * 6.2831853f / N, wob = 1.f + 0.12f * ((k * 7) % 3 - 1);
+                    v.push_back(cosf(a) * rt * wob); v.push_back(sinf(a) * rt * wob); v.push_back(0.f);
+                    v.push_back(cosf(a) * rb * wob); v.push_back(sinf(a) * rb * wob); v.push_back(zb); }
+                for (int k = 0; k < N; k++) { const int k2 = (k + 1) % N; VPIX_MeshPoly q; q.n = 4;
+                    q.idx[0] = 2 * k; q.idx[1] = 2 * k + 1; q.idx[2] = 2 * k2 + 1; q.idx[3] = 2 * k2;
+                    const float a = (k + 0.5f) * 6.2831853f / N; q.nx = cosf(a); q.ny = sinf(a); q.nz = 0.f;
+                    q.flags = 0x20000000 | (k % 2 ? 0x141A22u : 0x10141Cu); ps.push_back(q); }
+                VPIX_MeshPoly top; top.n = N; for (int k = 0; k < N; k++) top.idx[k] = (uint32_t)(2 * (N - 1 - k));
+                top.nx = top.ny = 0.f; top.nz = 1.f; top.flags = 0x20000000 | 0x1060FFu; ps.push_back(top);
+                VPIX_Render_AddMesh(0x7FFF12F2u, v, ps);
+            }
+            /* track strips: two rails + sleepers along a path (points P, the track's "up" U per point), flat colour, for the spiral
+               tunnel's tracks and the loop sculptures */
+            struct V3 { float x, y, z; };
+            auto nrm = [](V3 a) { const float l = sqrtf(a.x * a.x + a.y * a.y + a.z * a.z) + 1e-6f; return V3{a.x / l, a.y / l, a.z / l}; };
+            auto crs = [](V3 a, V3 b) { return V3{a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x}; };
+            auto quad = [](std::vector<float> &v, std::vector<VPIX_MeshPoly> &ps, const V3 c[4], V3 n, uint32_t col) {
+                const uint32_t b = (uint32_t)(v.size() / 3);
+                for (int k = 0; k < 4; k++) { v.push_back(c[k].x); v.push_back(c[k].y); v.push_back(c[k].z); }
+                VPIX_MeshPoly q; q.n = 4; for (int k = 0; k < 4; k++) q.idx[k] = b + (uint32_t)k;
+                q.nx = n.x; q.ny = n.y; q.nz = n.z; q.flags = 0x20000000 | col; ps.push_back(q);
+            };
+            auto rails = [&](std::vector<float> &v, std::vector<VPIX_MeshPoly> &ps, const std::vector<V3> &P, const std::vector<V3> &U, float gauge, int sleep_every) {
+                for (size_t i = 0; i + 1 < P.size(); i++) {
+                    const V3 t0 = nrm(V3{P[i + 1].x - P[i].x, P[i + 1].y - P[i].y, P[i + 1].z - P[i].z});
+                    const V3 n0 = nrm(crs(U[i], t0)), n1 = nrm(crs(U[i + 1], t0));
+                    for (int r = -1; r <= 1; r += 2) {
+                        const float o = r * gauge * 0.5f;
+                        const V3 c[4] = {{P[i].x + n0.x * (o - 90), P[i].y + n0.y * (o - 90), P[i].z + n0.z * (o - 90)},
+                                         {P[i].x + n0.x * (o + 90), P[i].y + n0.y * (o + 90), P[i].z + n0.z * (o + 90)},
+                                         {P[i + 1].x + n1.x * (o + 90), P[i + 1].y + n1.y * (o + 90), P[i + 1].z + n1.z * (o + 90)},
+                                         {P[i + 1].x + n1.x * (o - 90), P[i + 1].y + n1.y * (o - 90), P[i + 1].z + n1.z * (o - 90)}};
+                        quad(v, ps, c, U[i], 0xA0A0A0u);   /* steel */
+                    }
+                    if ((int)i % sleep_every == 0) {
+                        const float w = gauge * 0.5f + 220.f;
+                        const V3 b = {P[i].x - U[i].x * 60, P[i].y - U[i].y * 60, P[i].z - U[i].z * 60};
+                        const V3 c[4] = {{b.x - n0.x * w - t0.x * 130, b.y - n0.y * w - t0.y * 130, b.z - n0.z * w - t0.z * 130},
+                                         {b.x + n0.x * w - t0.x * 130, b.y + n0.y * w - t0.y * 130, b.z + n0.z * w - t0.z * 130},
+                                         {b.x + n0.x * w + t0.x * 130, b.y + n0.y * w + t0.y * 130, b.z + n0.z * w + t0.z * 130},
+                                         {b.x - n0.x * w + t0.x * 130, b.y - n0.y * w + t0.y * 130, b.z - n0.z * w + t0.z * 130}};
+                        quad(v, ps, c, U[i], 0x1A3A6Au);   /* wooden sleeper (0xBBGGRR) */
+                    }
+                }
+            };
+            {   /* THE SPIRAL TUNNEL (RIDE_PLAN "spiral tunnel", Bobby 10-28 "dont forget that tunnel i gave you with the spiral tracks"):
+                   one 9 m length to wrap a straight track piece (piece space: along +y 0..9000, the tube's axis at z 0, radius 3.4 m):
+                   old stone blocks, two brick ribs, and two tracks spiralling round the inside, one full turn per length so lengths join */
+                std::vector<float> v; std::vector<VPIX_MeshPoly> ps; const int S = 16, L = 6; const float R = 3400.f;
+                for (int j = 0; j < L; j++) for (int i = 0; i < S; i++) {
+                    const float a0 = i * 6.2831853f / S, a1 = (i + 1) * 6.2831853f / S, y0 = j * 1500.f, y1 = y0 + 1500.f, am = (a0 + a1) * 0.5f;
+                    const V3 c[4] = {{R * cosf(a0), y0, R * sinf(a0)}, {R * cosf(a0), y1, R * sinf(a0)}, {R * cosf(a1), y1, R * sinf(a1)}, {R * cosf(a1), y0, R * sinf(a1)}};
+                    static const uint32_t stone[4] = {0x2A3440u, 0x222B36u, 0x303A46u, 0x1C242Eu};
+                    quad(v, ps, c, V3{-cosf(am), 0, -sinf(am)}, stone[(i * 3 + j * 5 + (i * j) % 3) % 4]);
+                }
+                for (int rb = 0; rb < 2; rb++) for (int i = 0; i < S; i++) {
+                    const float a0 = i * 6.2831853f / S, a1 = (i + 1) * 6.2831853f / S, y = rb * 4500.f + 300.f, r = R - 120.f, am = (a0 + a1) * 0.5f;
+                    const V3 c[4] = {{r * cosf(a0), y - 150, r * sinf(a0)}, {r * cosf(a0), y + 150, r * sinf(a0)}, {r * cosf(a1), y + 150, r * sinf(a1)}, {r * cosf(a1), y - 150, r * sinf(a1)}};
+                    quad(v, ps, c, V3{-cosf(am), 0, -sinf(am)}, (i % 2) ? 0x1A2A5Au : 0x162250u);   /* brick ribs */
+                }
+                for (int tr = 0; tr < 2; tr++) {
+                    std::vector<V3> P, U; const float rr = R - 260.f;
+                    for (int i = 0; i <= 24; i++) { const float ph = tr * 3.14159265f + i * 6.2831853f / 24.f;
+                        P.push_back(V3{rr * cosf(ph), i * 375.f, rr * sinf(ph)}); U.push_back(V3{-cosf(ph), 0, -sinf(ph)}); }
+                    rails(v, ps, P, U, 1000.f, 1);
+                }
+                VPIX_Render_AddMesh(0x7FFF12F3u, v, ps);
+            }
+            {   /* LOOP SCULPTURES (Bobby 10-28, a coaster picture: "do some of these"): a loop-the-loop and a corkscrew of track standing
+                   out in the fire, our own build. Local: runs along +x, up +z, ground at z 0: a 20 m straight, a 9 m-radius loop (stepping
+                   1.6 m sideways so it clears itself), 20 m straight, a 2-turn corkscrew round an axis 4 m up, steel legs into the fire */
+                std::vector<float> v; std::vector<VPIX_MeshPoly> ps; std::vector<V3> P, U;
+                auto add = [&](V3 p, V3 u) { P.push_back(p); U.push_back(u); };
+                for (int i = 0; i <= 8; i++) add(V3{-20000.f + i * 2500.f, 0, 0}, V3{0, 0, 1});
+                for (int i = 1; i <= 40; i++) { const float th = i * 6.2831853f / 40.f;
+                    add(V3{9000.f * sinf(th), th / 6.2831853f * 1600.f, 9000.f - 9000.f * cosf(th)}, V3{-sinf(th), 0, cosf(th)}); }
+                for (int i = 1; i <= 8; i++) add(V3{i * 2500.f, 1600.f, 0}, V3{0, 0, 1});
+                for (int i = 1; i <= 48; i++) { const float ps2 = i * 2.f * 6.2831853f / 48.f;
+                    add(V3{20000.f + i * 625.f, 1600.f + 4000.f * sinf(ps2), 4000.f - 4000.f * cosf(ps2)}, V3{0, -sinf(ps2), cosf(ps2)}); }
+                rails(v, ps, P, U, 1100.f, 1);
+                for (float x : {-15000.f, -5000.f, 5000.f, 15000.f, 26000.f, 38000.f, 48000.f}) {   /* the legs */
+                    const float y = x > 0 ? 1600.f : 0.f;
+                    const V3 a[4] = {{x - 150, y, -16000}, {x + 150, y, -16000}, {x + 150, y, -200}, {x - 150, y, -200}};
+                    quad(v, ps, a, V3{0, -1, 0}, 0x3C3C40u);
+                    const V3 b[4] = {{x, y - 150, -16000}, {x, y + 150, -16000}, {x, y + 150, -200}, {x, y - 150, -200}};
+                    quad(v, ps, b, V3{1, 0, 0}, 0x34343Au);
+                }
+                VPIX_Render_AddMesh(0x7FFF12F4u, v, ps);
+                for (size_t i = 0; i < P.size(); i++) { loop_path.push_back(P[i].x); loop_path.push_back(P[i].y); loop_path.push_back(P[i].z);
+                    loop_path.push_back(U[i].x); loop_path.push_back(U[i].y); loop_path.push_back(U[i].z); }
+            }
+            if (const char *bd = getenv("VPIX_BALL_CHASE")) for (int k = 0; k < 8; k++)   /* the critter ball's 8 chunks */
+                if (load_bin(std::string(bd) + "\\BALL_" + std::to_string(k) + ".BIN", 0x7FFF1210u + (uint32_t)k).ok) ball_chunks++;
+            if (const char *bd = getenv("VPIX_BALL_CHASE")) {   /* the solid critter ball: a sphere wearing the picture (BALL_TEX.rgba) */
+                FILE *fp = fopen((std::string(bd) + "\\BALL_TEX.rgba").c_str(), "rb"); int32_t wh[2] = {0, 0};
+                if (fp && fread(wh, 4, 2, fp) == 2 && wh[0] > 0 && wh[1] > 0 && wh[0] <= 2048 && wh[1] <= 2048) {
+                    std::vector<uint32_t> px((size_t)wh[0] * wh[1]);
+                    if (fread(px.data(), 4, px.size(), fp) == px.size() && VPIX_Render_AddTextureRGBA(0x7FFD0024u, wh[0], wh[1], px.data())) {
+                        /* the chunks' sphere (radius 620, centre 620 up); each face takes the picture seen straight on from the side it
+                           faces (make_critter_ball.py colour()), the same projection for its 4 corners so faces don't smear across seams */
+                        std::vector<float> v; std::vector<VPIX_MeshPoly> ps; const int NA = 20, NO = 32; const float R = 620.f, CZ = 620.f;
+                        auto sp = [&](int i, int j, float o[3]) { const float th = 3.14159265f * i / NA, ph = 6.2831853f * j / NO;
+                            o[0] = sinf(th) * cosf(ph); o[1] = sinf(th) * sinf(ph); o[2] = cosf(th); };
+                        for (int i = 0; i < NA; i++) for (int j = 0; j < NO; j++) {
+                            float c[4][3]; sp(i, j, c[0]); sp(i + 1, j, c[1]); sp(i + 1, j + 1, c[2]); sp(i, j + 1, c[3]);
+                            float n[3] = {0, 0, 0}; for (int k = 0; k < 4; k++) for (int q = 0; q < 3; q++) n[q] += c[k][q] * 0.25f;
+                            const bool fb = fabsf(n[1]) >= fabsf(n[0]);
+                            VPIX_MeshPoly q; q.n = 4; const uint32_t b0 = (uint32_t)(v.size() / 3);
+                            for (int k = 0; k < 4; k++) {
+                                v.push_back(c[k][0] * R); v.push_back(c[k][1] * R); v.push_back(CZ + c[k][2] * R);
+                                const float u = fb ? 0.5f + 0.5f * (n[1] < 0 ? c[k][0] : -c[k][0]) : 0.5f + 0.5f * (n[0] > 0 ? -c[k][1] : c[k][1]);
+                                q.idx[k] = b0 + (uint32_t)k; q.uv[k][0] = u; q.uv[k][1] = 0.5f + 0.5f * c[k][2];
+                            }
+                            const float nl = sqrtf(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]) + 1e-6f;
+                            q.nx = n[0] / nl; q.ny = n[1] / nl; q.nz = n[2] / nl; q.flags = 0x20FFFFFF; q.tex = 0x7FFD0024u; ps.push_back(q);
+                        }
+                        if (VPIX_Render_AddMesh(0x7FFF1218u, v, ps)) ball_solid = true;
+                    }
+                }
+                if (fp) fclose(fp);
+                lg("HLE: VPIX_BALL_CHASE %s: %d chunks, solid ball %s", bd, ball_chunks, ball_solid ? "made" : "** BALL_TEX.rgba missing");
+            }
+            if (hd && *hd) {
+                girl = load_bin(std::string(hd) + "\\CHAR_DEVIL_GIRL.BIN", HGIRL); velvet = load_bin(std::string(hd) + "\\CHAR_VELVET.BIN", HVEL);
+                hell_ok = girl.ok;
+                lg("HLE: VPIX_HELL %s: devil girl %s, Velvet %s, stage %d", hd, girl.ok ? "loaded" : "** missing", velvet.ok ? "loaded" : "** missing", hell_st);
+            }
+            if (md && *md) {
+                FILE *fp = fopen((std::string(md) + "\\LAYOUT.TXT").c_str(), "r"); char line[512];
+                while (fp && fgets(line, sizeof(line), fp)) { int sc, pq; char k, nm[256];
+                    if (sscanf(line, "%d %c %255s %d", &sc, &k, nm, &pq) == 4) ex.push_back({sc, k, nm, pq, PM()}); }
+                if (fp) fclose(fp);
+                /* the plinth (dark wood, a gold rim on top) */
+                {   std::vector<float> v; std::vector<VPIX_MeshPoly> ps;
+                    auto box = [&](float x0, float x1, float y0, float y1, float z0, float z1, uint32_t col) {
+                        const uint32_t b = (uint32_t)(v.size() / 3);
+                        const float c[8][3] = {{x0, y0, z0}, {x1, y0, z0}, {x1, y1, z0}, {x0, y1, z0}, {x0, y0, z1}, {x1, y0, z1}, {x1, y1, z1}, {x0, y1, z1}};
+                        for (auto &q : c) { v.push_back(q[0]); v.push_back(q[1]); v.push_back(q[2]); }
+                        const int f6[6][4] = {{0, 1, 5, 4}, {1, 2, 6, 5}, {2, 3, 7, 6}, {3, 0, 4, 7}, {4, 5, 6, 7}, {3, 2, 1, 0}};
+                        const float nn[6][3] = {{0, -1, 0}, {1, 0, 0}, {0, 1, 0}, {-1, 0, 0}, {0, 0, 1}, {0, 0, -1}};
+                        for (int fi = 0; fi < 6; fi++) { VPIX_MeshPoly q; q.n = 4; for (int kk = 0; kk < 4; kk++) q.idx[kk] = b + (uint32_t)f6[fi][kk];
+                            q.flags = 0x20000000 | col; q.nx = nn[fi][0]; q.ny = nn[fi][1]; q.nz = nn[fi][2]; ps.push_back(q); }
+                    };
+                    box(-900, 900, -900, 900, 0, 260, 0x10182A); box(-920, 920, -920, 920, 260, 300, 0x40B0D8);
+                    VPIX_Render_AddMesh(HPLINTH, v, ps);
+                    v.clear(); ps.clear();   /* the tall plinth for the small pieces (headsets, gloves) */
+                    box(-450, 450, -450, 450, 0, 1050, 0x10182A); box(-470, 470, -470, 470, 1050, 1100, 0x40B0D8);
+                    VPIX_Render_AddMesh(HPLINTH + 1, v, ps);
+                }
+                /* THE GALLERY DOORS (Bobby 10-29: "make the museum part more grand", dark rides / EPCOT, "cart goes threw doors that open
+                   for it"): per gallery (scene 2 on, GATE_<scene>.rgba from make_mallride.py) a curtain wall across the hall with a gold
+                   doorway, two lacquered door leaves (DOOR.rgba) and a lit marquee over it. Local: x across (right of the track), y along
+                   it, z up from the floor; the doorway 4.8 m wide, 5 m tall. */
+                {   auto rd = [&](const std::string &fn, uint32_t tex) { FILE *fq = fopen(fn.c_str(), "rb"); int32_t wh[2] = {0, 0}; bool ok = false;
+                        if (fq && fread(wh, 4, 2, fq) == 2 && wh[0] > 0 && wh[1] > 0 && wh[0] <= 2048 && wh[1] <= 2048) { std::vector<uint32_t> px((size_t)wh[0] * wh[1]);
+                            ok = fread(px.data(), 4, px.size(), fq) == px.size() && VPIX_Render_AddTextureRGBA(tex, wh[0], wh[1], px.data()); }
+                        if (fq) fclose(fq); return ok; };
+                    std::vector<float> v; std::vector<VPIX_MeshPoly> ps;
+                    auto q4 = [&](float x0, float x1, float y, float z0, float z1, uint32_t tex, float ru, float rv, uint32_t col) {
+                        const uint32_t b = (uint32_t)(v.size() / 3); const float c[4][3] = {{x0, y, z0}, {x1, y, z0}, {x1, y, z1}, {x0, y, z1}};
+                        for (auto &q : c) { v.push_back(q[0]); v.push_back(q[1]); v.push_back(q[2]); }
+                        VPIX_MeshPoly q; q.n = 4; const float uv[4][2] = {{0, 0}, {ru, 0}, {ru, rv}, {0, rv}};
+                        for (int kk = 0; kk < 4; kk++) { q.idx[kk] = b + (uint32_t)kk; q.uv[kk][0] = uv[kk][0]; q.uv[kk][1] = uv[kk][1]; }
+                        q.flags = 0x20000000u | col; q.tex = tex; q.nx = 0; q.ny = -1; q.nz = 0; ps.push_back(q); };
+                    auto flush = [&](uint32_t h) { VPIX_Render_AddMesh(h, v, ps); v.clear(); ps.clear(); };
+                    const float DW = 2400.f, DH = 5000.f, TOP = 8800.f;
+                    q4(-11500, -DW, 0, 0, TOP, 0x7FFD0701u, 9100.f / 3000.f, 1.f, 0xFFFFFF);   /* the curtain wall (the hall's velvet) */
+                    q4(DW, 11500, 0, 0, TOP, 0x7FFD0701u, 9100.f / 3000.f, 1.f, 0xFFFFFF);
+                    q4(-DW, DW, 0, DH, TOP, 0x7FFD0701u, 4800.f / 3000.f, (TOP - DH) / TOP, 0xFFFFFF);
+                    flush(0x7FFF1720u);
+                    /* the gold door frame, a little proud of the wall */
+                    q4(-DW - 320, -DW, -40, 0, DH + 320, 0, 1, 1, 0x40B0D8); q4(DW, DW + 320, -40, 0, DH + 320, 0, 1, 1, 0x40B0D8);
+                    q4(-DW - 320, DW + 320, -40, DH, DH + 320, 0, 1, 1, 0x40B0D8);
+                    flush(0x7FFF1721u);
+                    if (rd(std::string(md) + "\\DOOR.rgba", 0x7FFD0720u)) {
+                        q4(0, DW, 0, 0, DH, 0x7FFD0720u, 1, 1, 0xFFFFFF); flush(0x7FFF1722u);   /* left leaf: hinge at x 0, reaches +x */
+                        q4(-DW, 0, 0, 0, DH, 0x7FFD0720u, 1, 1, 0xFFFFFF); flush(0x7FFF1723u); }
+                    for (int sc = 2; sc < 16; sc++) if (rd(std::string(md) + "\\GATE_" + std::to_string(sc) + ".rgba", 0x7FFD0730u + (uint32_t)sc)) {
+                        q4(-3600, 3600, -120, DH + 450, DH + 450 + 1800, 0x7FFD0730u + (uint32_t)sc, 1, 1, 0xFFFFFF); flush(0x7FFF1730u + (uint32_t)sc);
+                        gate_ok[sc] = true; }
+                    std::vector<uint32_t> px(32 * 64);   /* the spotlight beam: a soft vertical shaft, fading at both ends */
+                    for (int y = 0; y < 64; y++) for (int x = 0; x < 32; x++) { const float dx = fabsf((x - 15.5f) / 16.f), t = y / 63.f;
+                        const float a = (std::max)(0.f, 1.f - dx) * (std::max)(0.f, 1.f - dx) * sinf(3.14159f * t) * (0.55f + 0.45f * t);
+                        px[(size_t)y * 32 + x] = (uint32_t)(a * 255.f) << 24 | 0xA8E0FFu; }
+                    VPIX_Render_AddBitmapRGBA(0x7FFD0028u, 32, 64, px.data());
+                }
+                int nm = 0, np = 0;
+                for (size_t i = 0; i < ex.size(); i++) {
+                    Ex &e = ex[i];
+                    const char *pp = getenv("VPIX_MALLRIDE_PROPS");   /* ';'-separated prop folders */
+                    std::string all = pp ? pp : (hd ? hd : ""); size_t p = 0;
+                    while (!e.pm.ok && p <= all.size()) { size_t q = all.find(';', p); if (q == std::string::npos) q = all.size();
+                        if (q > p) e.pm = load_bin(all.substr(p, q - p) + "\\" + e.name + ".BIN", HEX0 + (uint32_t)i); p = q + 1; }
+                    if (e.pm.ok) nm++;
+                    /* the NEAR model (Bobby 10-28, like DAC's players: textured face up close, the flat LORES model far off): NEAR_<i>.mesh
+                       + NEAR_<i>.rgba from make_mallride.py (bake_texture.py's <name>_near.obj + _tex.png), in the BIN's own space */
+                    if (e.pm.ok) {
+                        FILE *fm = fopen((std::string(md) + "\\NEAR_" + std::to_string(i) + ".mesh").c_str(), "rb"), *ft = fopen((std::string(md) + "\\NEAR_" + std::to_string(i) + ".rgba").c_str(), "rb");
+                        int32_t nv = 0, nf = 0, wh[2] = {0, 0}; bool ok = fm && ft;
+                        /* NEAR_<i>.hires: the hi-res bake (~26k faces, 2048 texture) on the renderer's fast path, shown at any distance */
+                        { FILE *fh = fopen((std::string(md) + "\\NEAR_" + std::to_string(i) + ".hires").c_str(), "rb"); e.hires = fh != NULL; if (fh) fclose(fh); }
+                        std::vector<float> v; std::vector<VPIX_MeshPoly> ps;
+                        if (ok && fread(&nv, 4, 1, fm) == 1 && nv > 0 && nv < 1000000) { v.resize((size_t)nv * 3); ok = fread(v.data(), 4, v.size(), fm) == v.size(); } else ok = false;
+                        if (ok) { e.nzmin = 1e30f; e.nzmax = -1e30f; for (int32_t k = 0; k < nv; k++) { e.nzmin = (std::min)(e.nzmin, v[(size_t)k * 3 + 2]); e.nzmax = (std::max)(e.nzmax, v[(size_t)k * 3 + 2]); } }
+                        if (ok && fread(&nf, 4, 1, fm) == 1 && nf > 0 && nf < 1000000) {
+                            for (int32_t k = 0; k < nf && ok; k++) { int32_t n = 0; float nn[3]; VPIX_MeshPoly q;
+                                ok = fread(&n, 4, 1, fm) == 1 && n >= 3 && n <= 16 && fread(nn, 4, 3, fm) == 3;
+                                if (!ok) break;
+                                q.n = (uint8_t)n; q.nx = nn[0]; q.ny = nn[1]; q.nz = nn[2]; q.flags = 0x20FFFFFF; q.tex = 0x7FFD0500u + (uint32_t)i;
+                                for (int32_t c = 0; c < n && ok; c++) { int32_t vi; float uv[2]; ok = fread(&vi, 4, 1, fm) == 1 && fread(uv, 4, 2, fm) == 2 && vi >= 0 && vi < nv;
+                                    q.idx[c] = (uint32_t)vi; q.uv[c][0] = uv[0]; q.uv[c][1] = uv[1]; }
+                                ps.push_back(q); }
+                        } else ok = false;
+                        /* NEAR_<i>.vcol (transfer_colors.py): one colour per vertex, from the good NEAR bake - drawn instead of the texture */
+                        if (ok && e.hires) { FILE *fv = fopen((std::string(md) + "\\NEAR_" + std::to_string(i) + ".vcol").c_str(), "rb"); int32_t nc = 0;
+                            if (fv && fread(&nc, 4, 1, fv) == 1 && nc == nv) { std::vector<uint32_t> vc((size_t)nv);
+                                if (fread(vc.data(), 4, vc.size(), fv) == vc.size()) { for (auto &q : ps) { q.tex = 0; for (int c = 0; c < q.n; c++) q.vcol[c] = vc[q.idx[c]]; }
+                                    lg("HLE: VPIX_MALLRIDE %s: vertex colours", e.name.c_str()); } }
+                            if (fv) fclose(fv); }
+                        if (ok && fread(wh, 4, 2, ft) == 2 && wh[0] > 0 && wh[1] > 0 && wh[0] <= 4096 && wh[1] <= 4096) {
+                            std::vector<uint32_t> px((size_t)wh[0] * wh[1]);
+                            ok = fread(px.data(), 4, px.size(), ft) == px.size() && VPIX_Render_AddTextureRGBA(0x7FFD0500u + (uint32_t)i, wh[0], wh[1], px.data())
+                                 && (e.hires ? VPIX_Render_AddMeshHires(0x7FFF1500u + (uint32_t)i, v, ps) : VPIX_Render_AddMesh(0x7FFF1500u + (uint32_t)i, v, ps));
+                        } else ok = false;
+                        if (fm) fclose(fm); if (ft) fclose(ft);
+                        if (ok) { e.has_near = true; lg("HLE: VPIX_MALLRIDE %s: %s model (%d verts, %d faces)", e.name.c_str(), e.hires ? "HIRES" : "near", nv, nf); }
+                    }
+                    if (e.plq >= 0) {   /* the brass plaque on a short post, leaning back, facing -y */
+                        FILE *fq = fopen((std::string(md) + "\\PLQ_" + std::to_string(e.plq) + ".rgba").c_str(), "rb"); int32_t wh[2] = {0, 0};
+                        if (fq && fread(wh, 4, 2, fq) == 2 && wh[0] > 0 && wh[1] > 0 && wh[0] <= 2048 && wh[1] <= 2048) {
+                            std::vector<uint32_t> px((size_t)wh[0] * wh[1]);
+                            if (fread(px.data(), 4, px.size(), fq) == px.size() && VPIX_Render_AddTextureRGBA(TPLQ0 + (uint32_t)i, wh[0], wh[1], px.data())) {
+                                const bool easel = e.kind == 'w';   /* a framed picture on an easel (the Simon Marston Collection) */
+                                const bool smallp = e.kind == 's';   /* a small piece's plaque low and narrow (10-29: it covered the piece) */
+                                const float W = easel ? 4500.f : smallp ? 700.f : 1000.f, H = W * wh[1] / wh[0], z0 = easel ? 3200.f : smallp ? 220.f : 650.f, lean = (easel ? 0.f : 0.35f) * H;   /* pictures: 4.5 m, hung on the wall (10-29) */
+                                std::vector<float> v = {-W / 2, 0, z0, W / 2, 0, z0, W / 2, lean, z0 + H, -W / 2, lean, z0 + H,
+                                                        -40, 60, 0, 40, 60, 0, 40, 60, z0 + 40, -40, 60, z0 + 40};
+                                std::vector<VPIX_MeshPoly> ps(2);
+                                const float uv[4][2] = {{0, 0}, {1, 0}, {1, 1}, {0, 1}};
+                                ps[0].n = 4; for (int kk = 0; kk < 4; kk++) { ps[0].idx[kk] = (uint32_t)kk; ps[0].uv[kk][0] = uv[kk][0]; ps[0].uv[kk][1] = uv[kk][1]; }
+                                ps[0].flags = 0x20FFFFFF; ps[0].tex = TPLQ0 + (uint32_t)i; ps[0].nx = 0; ps[0].ny = -0.94f; ps[0].nz = 0.33f;
+                                ps[1].n = 4; for (int kk = 0; kk < 4; kk++) ps[1].idx[kk] = 4u + (uint32_t)kk;
+                                ps[1].flags = 0x20000000 | 0x10182A; ps[1].nx = 0; ps[1].ny = -1; ps[1].nz = 0;
+                                if (easel) ps.resize(1);   /* hung on the wall: no post */
+                                if (VPIX_Render_AddMesh(HPLQ0 + (uint32_t)i, v, ps)) np++; else e.plq = -1;
+                            } else e.plq = -1;
+                        } else e.plq = -1;
+                        if (fq) fclose(fq);
+                    }
+                }
+                mall_ok = !ex.empty();
+                lg("HLE: VPIX_MALLRIDE %s: %u exhibits, %d models, %d plaques, stage %d, speed %.0f", md, (unsigned)ex.size(), nm, np, mall_st, mall_sp);
+                if (nd && *nd) std::thread([]() {   /* the narration, decoded once (22.05 kHz mono, like the made sounds) */
+                    static const char *ff = getenv("VPIX_FFMPEG") ? getenv("VPIX_FFMPEG") : "ffmpeg";
+                    std::vector<VSound> got;
+                    for (int n = 0; n < 32; n++) {
+                        char cmd[2048]; snprintf(cmd, sizeof(cmd), "\"%s\" -v quiet -i \"%s\\NARR_%d.wav\" -f s16le -ac 1 -ar 22050 -", ff, getenv("VPIX_NARRATION"), n);
+                        VSound s; s.rate = 22050;
+                        if (void *pa = VPIX_PipeOpen(cmd)) { std::vector<int16_t> chunk(32768); size_t r;
+                            while ((r = VPIX_PipeRead(pa, chunk.data(), chunk.size() * 2)) > 0) s.pcm.insert(s.pcm.end(), chunk.begin(), chunk.begin() + r / 2);
+                            VPIX_PipeClose(pa); }
+                        if (s.pcm.empty()) break;
+                        for (int16_t &x : s.pcm) x = (int16_t)(std::max)(-32767, (std::min)(32767, x * 5 / 2));   /* a lot louder (Bobby 10-28) */
+                        got.push_back(s);
+                    }
+                    lg("HLE: VPIX_NARRATION %u lines", (unsigned)got.size());
+                    narr.swap(got); narr_ready = true;
+                    int nb = 0;
+                    for (int n = 0; n < 16; n++) {   /* Bobby talking to the riders (10-29: "like the animatronics at disney rides") */
+                        char cmd[2048]; snprintf(cmd, sizeof(cmd), "\"%s\" -v quiet -i \"%s\\BOBBY_%d.wav\" -f s16le -ac 1 -ar 22050 -", ff, getenv("VPIX_NARRATION"), n);
+                        VSound s; s.rate = 22050;
+                        if (void *pa = VPIX_PipeOpen(cmd)) { std::vector<int16_t> chunk(32768); size_t r;
+                            while ((r = VPIX_PipeRead(pa, chunk.data(), chunk.size() * 2)) > 0) s.pcm.insert(s.pcm.end(), chunk.begin(), chunk.begin() + r / 2);
+                            VPIX_PipeClose(pa); }
+                        if (s.pcm.empty()) continue;
+                        for (int16_t &x : s.pcm) x = (int16_t)(std::max)(-32767, (std::min)(32767, x * 5 / 2));
+                        bob_says[n] = s; nb++;
+                    }
+                    lg("HLE: VPIX_NARRATION %d Bobby lines", nb); bob_ready = true;
+                }).detach();
+            }
+        }
+        /* the rider's stage; the shot ray (as the pumpkins) */
+        static int last_stage = -99; const int stage = my_cart ? (int)(int16_t)mem_readw(my_cart + 5) : -1;
+        static unsigned long long stage_sw_ms = 0;
+        if (stage != last_stage) { lg("HLE: rider stage %d", stage); last_stage = stage; stage_sw_ms = hap_ms_now(); }
+        if (stage_sw_ms && hap_ms_now() - stage_sw_ms < 4000 && frame % 15 == 0) {   /* dev: the 2D pictures just after a stage switch (the black card at the tutorial's end) */
+            std::string sb; for (const VPIX_Blit &b : f.blits) { if (b.world) continue; auto bf = bitmap_files.find(b.handle); char bb[200];
+                snprintf(bb, sizeof(bb), " %X:%s@%d,%d %.0fx%.0f a%.2f", b.handle, bf != bitmap_files.end() ? bf->second.c_str() : "?", b.x, b.y, b.dw, b.dh, b.alpha); sb += bb; }
+            lg("SWITCH2D f=%lu%s", frame, sb.c_str()); }
+        const unsigned long long now = hap_ms_now();
+        float go[3] = {0, 0, 0}, gd[3] = {0, 0, 0}; bool shooting = false;
+        if (my_cart) {
+            const int seat = (int)(int16_t)mem_readw(my_cart + 3) + (int)(int8_t)mem_readb(0xFCDFA + data_delta);
+            const uint32_t gb = 0x11FF7C + data_delta + (uint32_t)(seat < 0 ? 0 : seat) * 0xAC;
+            for (int c = 0; c < 3; c++) { go[c] = rd_f(gb + 0x34 + 4 * c); gd[c] = rd_f(gb + 4 + 0x10 + 4 * c); }
+            const float l = sqrtf(gd[0] * gd[0] + gd[1] * gd[1] + gd[2] * gd[2]);
+            if (l > 1e-3f) { for (float &v : gd) v /= l; shooting = mem_readw(my_cart + 0x11) != 0; }
+            ghost_shot_ray(my_cart, go, gd);
+        }
+        auto key_of = [](const float T[3]) { return (uint64_t)(uint32_t)(int)(T[0] / 100.f) * 2654435761ull ^ (uint64_t)(uint32_t)(int)(T[1] / 100.f) * 40503ull ^ (uint64_t)(uint32_t)(int)(T[2] / 100.f) * 97ull; };
+        static unsigned long long last_ride = 0;
+        if (my_cart) { if (last_ride && now - last_ride > 20000) last_ride = 0; }
+        /* ---- HELL ---- */
+        static std::map<uint64_t, unsigned long long> girl_hit; static uint64_t landing_key = 0; static std::set<uint64_t> vel_keys; static int girls_logged = -1;
+        if (!my_cart || stage != hell_st) { if (!my_cart) { girl_hit.clear(); landing_key = 0; vel_keys.clear(); } }
+        /* hell's rocks out of the cart's way (Bobby 10-29: "one drop in hell where a rock sticks into the track ... in a drop"): a
+           stalactite / stalagmite (REDTITE / REDMITE / RTITE / RMITE) within 3.5 m of the cart's line of travel, 0-40 m ahead (its
+           pitch too, so on the drops), isn't drawn; each one logged once */
+        if (my_cart && stage == hell_st) {
+            static std::map<uint32_t, int> rocky; static std::set<uint64_t> told;
+            const float *F = f.cam_R[1]; const float fl = sqrtf(F[0] * F[0] + F[1] * F[1] + F[2] * F[2]) + 1e-6f;
+            float cf[3] = {rd_f(my_cart + 0x13), rd_f(my_cart + 0x17), 0.f};
+            { const float l = sqrtf(cf[0] * cf[0] + cf[1] * cf[1]); if (l > 1e-3f) { cf[0] /= l; cf[1] /= l; } else for (int c = 0; c < 3; c++) cf[c] = F[c] / fl; }
+            f.inst.erase(std::remove_if(f.inst.begin(), f.inst.end(), [&](const VPIX_Instance &in) {
+                auto it = rocky.find(in.handle);
+                if (it == rocky.end()) { int r = 0; auto mf = model_files.find(in.handle);
+                    if (mf != model_files.end()) { std::string lo = mf->second; std::transform(lo.begin(), lo.end(), lo.begin(), ::tolower);
+                        r = lo.find("tite") != std::string::npos || lo.find("mite") != std::string::npos; }
+                    it = rocky.emplace(in.handle, r).first; }
+                if (!it->second) return false;
+                const float d[3] = {in.T[0] - f.cam_T[0], in.T[1] - f.cam_T[1], in.T[2] - f.cam_T[2]};
+                for (int pass = 0; pass < 2; pass++) {   /* along the cart's heading, and along the view (pitched down a drop) */
+                    float a[3]; if (pass) for (int c = 0; c < 3; c++) a[c] = F[c] / fl; else for (int c = 0; c < 3; c++) a[c] = cf[c];
+                    const float al = d[0] * a[0] + d[1] * a[1] + d[2] * a[2]; if (al < 0.f || al > 40000.f) continue;
+                    float off2 = 0.f; for (int c = 0; c < 3; c++) { const float o = d[c] - a[c] * al; off2 += o * o; }
+                    if (off2 < 3500.f * 3500.f) { const uint64_t k = key_of(in.T);
+                        if (!told.count(k)) { told.insert(k); lg("HLE: hell rock in the cart's way hidden (%s at %.0f m)", model_files[in.handle].c_str(), al / 1000.f); }
+                        return true; } }
+                return false; }), f.inst.end());
+        }
+        if (hell_ok && my_cart && stage == hell_st) {
+            /* the fire light hits on the beat (Bobby 10-28: "lights ... that go to the music suddenly, more flames in the pits of hell
+               coming from the ground"): red fog, a hard orange flash on each beat dying in ~0.1 s, a hotter one on each bar; the devil
+               girls are lit full colour in the flash */
+            float bpm = 0.f, bt = ride_music_beat(bpm); if (bpm <= 0.f) bpm = 128.f; if (bt < 0.f) bt = now / 1000.f;
+            const float beats = bt * bpm / 60.f, bph = beats - floorf(beats); const int bidx = (int)floorf(beats);
+            const float kick = ride_music_kick(), flash = (std::max)(expf(-bph * 10.f) * (bidx % 4 == 0 ? 1.f : 0.7f), kick * 0.8f);
+            {   static const float base[3] = {70, 14, 8}, hot[3] = {255, 110, 20};
+                for (int c = 0; c < 3; c++) { f.fog_col[c] = (uint8_t)(base[c] + (hot[c] - base[c]) * 0.55f * flash); f.clear[c] = f.fog_col[c]; } }
+            auto flame = [&](const float p[3], float h, float w, float alpha) {   /* one tongue standing on p, h tall */
+                VPIX_Blit b = {}; b.handle = 0x7FFD0023u; b.sw = 32; b.sh = 64; b.key = -1; b.world = true;
+                b.dw = w; b.dh = h; b.pivot[0] = w * 0.5f; b.pivot[1] = h * 0.5f;
+                b.pos[0] = p[0]; b.pos[1] = p[1]; b.pos[2] = p[2] + h * 0.42f; b.alpha = alpha; b.prio = 99310; f.blits.push_back(b);
+            };
+            /* the pits: every lava model of the section (LAVA_SML / MED / LGE) burns, tongues leaping on the beat */
+            {   static std::map<uint32_t, bool> lv;
+                const size_t nl = f.inst.size();
+                for (size_t i = 0; i < nl; i++) {
+                    const VPIX_Instance &in = f.inst[i];
+                    auto it = lv.find(in.handle);
+                    if (it == lv.end()) { bool l = false; auto mf = model_files.find(in.handle);
+                        if (mf != model_files.end()) { std::string lo = mf->second; std::transform(lo.begin(), lo.end(), lo.begin(), ::tolower); l = lo.find("lava") != std::string::npos; }
+                        it = lv.emplace(in.handle, l).first; }
+                    if (!it->second) continue;
+                    const uint32_t lh = (uint32_t)key_of(in.T);
+                    for (int k = 0; k < 7; k++) {
+                        const float a = k * 0.8976f + (lh % 100) * 0.06f, r = 600.f + ((lh >> (k * 2)) & 7) * 380.f;
+                        const float tt = now / 1000.f * (6.f + k) + k * 1.3f, fl = 0.7f + 0.2f * sinf(tt) + 0.1f * sinf(tt * 2.7f);
+                        const float p[3] = {in.T[0] + cosf(a) * r * in.S[0], in.T[1] + sinf(a) * r * in.S[1], in.T[2]};
+                        flame(p, (2600.f + 2400.f * flash * ((k + bidx) % 2 ? 1.f : 0.4f)) * fl, 1300.f * fl, 0.85f);
+                    }
+                }
+            }
+            const float hgt = girl.zmax - girl.zmin, base_sc = 1720.f / hgt;
+            /* SPIRAL TUNNELS: the straight run after every landing (the pieces 2-50 m ahead of a RLAND* piece, on its line) is wrapped in
+               the tunnel, the whole tube turning round the rider (VPIX_TUNNEL_SPIN rad/s, default 1.4, kicked faster by the music's kick
+               drum: the tracks on the walls wind past = dizzy, while the view and the aim stay true); torches on the ribs turn with it,
+               fire glowing at the far end. LOOPS: beside every landing, 30 m out, a loop sculpture with a little critter ball riding it. */
+            static std::set<uint64_t> tunnel;
+            {
+                static float spin = 0.f; static unsigned long long sl = 0;
+                static const float spin_rate = getenv("VPIX_TUNNEL_SPIN") ? (float)atof(getenv("VPIX_TUNNEL_SPIN")) : 1.4f;
+                const float dts = sl ? (std::min)(0.05f, (now - sl) / 1000.f) : 0.f; sl = now; spin += dts * spin_rate * (1.f + 2.f * kick);
+                std::vector<size_t> lands; tunnel.clear();
+                for (size_t i = 0; i < f.inst.size(); i++) { bool st2, ld; if (is_track(f.inst[i].handle, &st2, &ld) && ld) lands.push_back(i); }
+                const size_t n1 = f.inst.size();
+                for (size_t li : lands) {
+                    const VPIX_Instance L = f.inst[li]; float far_along = -1.f; float far_p[3] = {0, 0, 0};
+                    for (size_t i = 0; i < n1; i++) {
+                        bool st2, ld; if (!is_track(f.inst[i].handle, &st2, &ld) || !st2) continue;
+                        const VPIX_Instance &tp = f.inst[i];
+                        const float d[3] = {tp.T[0] - L.T[0], tp.T[1] - L.T[1], tp.T[2] - L.T[2]};
+                        const float along = d[0] * L.R[1][0] + d[1] * L.R[1][1] + d[2] * L.R[1][2], lat = d[0] * L.R[0][0] + d[1] * L.R[0][1] + d[2] * L.R[0][2];
+                        if (along < 1500.f || along > 50000.f || fabsf(lat) > 1500.f || fabsf(d[2]) > 2500.f) continue;
+                        tunnel.insert(key_of(tp.T));
+                        const float c = cosf(spin), sn = sinf(spin);
+                        VPIX_Instance g = {}; g.handle = 0x7FFF12F3u; g.light_mask = 1; g.bright = flash > 0.5f ? 1 : 0;
+                        for (int q = 0; q < 3; q++) { g.R[0][q] = c * tp.R[0][q] + sn * tp.R[2][q]; g.R[1][q] = tp.R[1][q]; g.R[2][q] = -sn * tp.R[0][q] + c * tp.R[2][q];
+                            g.S[q] = 1.f; g.T[q] = tp.T[q] + tp.R[2][q] * 1400.f; }
+                        for (int e = 0; e < 16; e++) g.pal[e] = g.palw[e] = 0xFFFFFF;
+                        f.inst.push_back(g);
+                        for (int k = 0; k < 4; k++) {   /* torches on the ribs, turning with the tube */
+                            const float a = spin + k * 1.5708f + 0.4f, y = (k % 2) * 4500.f + 300.f;
+                            const float tt = now / 1000.f * (9.f + k) + (float)k, fl = 0.75f + 0.2f * sinf(tt) + 0.05f * sinf(tt * 3.1f);
+                            float tpp[3]; for (int q = 0; q < 3; q++) tpp[q] = g.T[q] + tp.R[1][q] * y + (tp.R[0][q] * cosf(a) + tp.R[2][q] * sinf(a)) * 3000.f;
+                            put_glow(GRED, tpp, 1300.f * fl * (1.f + 0.5f * flash), 0.9f);
+                        }
+                        if (along > far_along) { far_along = along; for (int q = 0; q < 3; q++) far_p[q] = tp.T[q] + tp.R[1][q] * 9500.f + tp.R[2][q] * 1400.f; }
+                    }
+                    if (far_along > 0.f) { put_glow(GRED, far_p, 9000.f * (1.f + 0.3f * flash), 0.95f); put_glow(GWARM, far_p, 4000.f, 0.8f); }
+                    /* the loop sculpture beside this landing */
+                    if (!loop_path.empty()) {
+                        const uint64_t lk = key_of(L.T); const float side = (lk & 1) ? 1.f : -1.f;
+                        float fx[3] = {L.R[1][0], L.R[1][1], 0.f}; const float fl2 = sqrtf(fx[0] * fx[0] + fx[1] * fx[1]) + 1e-6f; fx[0] /= fl2; fx[1] /= fl2;
+                        VPIX_Instance g = {}; g.handle = 0x7FFF12F4u; g.light_mask = 1; g.bright = flash > 0.5f ? 1 : 0;
+                        g.R[0][0] = fx[0]; g.R[0][1] = fx[1]; g.R[1][0] = -fx[1]; g.R[1][1] = fx[0]; g.R[2][2] = 1.f;
+                        for (int q = 0; q < 3; q++) g.S[q] = 1.f;
+                        g.T[0] = L.T[0] + L.R[0][0] * 30000.f * side + fx[0] * 12000.f; g.T[1] = L.T[1] + L.R[0][1] * 30000.f * side + fx[1] * 12000.f; g.T[2] = L.T[2] - 1500.f;
+                        for (int e = 0; e < 16; e++) g.pal[e] = g.palw[e] = 0xFFFFFF;
+                        f.inst.push_back(g);
+                    }
+                }
+            }
+            int ngirls = 0; const size_t n0 = f.inst.size();
+            for (size_t i = 0; i < n0; i++) {
+                const VPIX_Instance tp = f.inst[i]; bool straight, landing;
+                if (!is_track(tp.handle, &straight, &landing)) continue;
+                const uint64_t pk = key_of(tp.T); const uint32_t hsh = (uint32_t)(pk ^ pk >> 29);
+                if (tunnel.count(pk)) continue;
+                float mid[3]; for (int c = 0; c < 3; c++) mid[c] = tp.T[c] + (straight ? tp.R[1][c] * 4500.f : 0.f);
+                struct G { float side, along, sink; bool vel, pop; };
+                std::vector<G> gs;
+                if (landing && !landing_key) landing_key = pk;
+                if (pk == landing_key) {   /* the welcome committee: Velvet in the middle, three girls each side, pitchforks up */
+                    gs.push_back({-5200.f, 0.f, 0.f, true, false});
+                    for (int s = -1; s <= 1; s += 2) for (int k = 0; k < 3; k++) gs.push_back({s * (4600.f + k * 300.f), (k - 1) * 1700.f + (s > 0 ? 0.f : 900.f), 0.f, false, false});
+                } else if (hsh % 4 == 1) {
+                    const float side = (hsh & 16 ? 1.f : -1.f) * (4300.f + (hsh >> 5) % 1800);
+                    const bool vel = straight && hsh % 41 == 9 && (vel_keys.count(pk) || (vel_keys.size() < 2 && vel_keys.insert(pk).second));
+                    gs.push_back({side, ((int)((hsh >> 11) % 5) - 2) * 900.f, (hsh >> 14) % 4 == 0 ? 520.f : 0.f, vel, !vel && (hsh >> 17) % 3 == 0});
+                    if ((hsh >> 20) % 3 == 0) gs.push_back({-side * 1.1f, ((int)((hsh >> 22) % 5) - 2) * 900.f, 0.f, false, false});   /* sometimes a pair */
+                }
+                for (size_t gi = 0; gi < gs.size(); gi++) {
+                    const G &g0 = gs[gi]; const uint64_t id = pk * 16 + gi;
+                    const bool vel = g0.vel && velvet.ok;
+                    const PM &pm = vel ? velvet : girl;
+                    float P[3]; for (int c = 0; c < 3; c++) P[c] = mid[c] + tp.R[0][c] * g0.side + tp.R[1][c] * g0.along; P[2] = mid[2];
+                    const float sc = (vel ? 1850.f / (pm.zmax - pm.zmin) : base_sc * (0.92f + (hsh >> (gi + 3) & 7) * 0.03f));
+                    float rise = 0.f, spin = 0.f; bool lit = false;
+                    if (g0.pop) {   /* out of the fire as the cart comes near */
+                        const float dx = P[0] - f.cam_T[0], dy = P[1] - f.cam_T[1], dd = sqrtf(dx * dx + dy * dy);
+                        const float u = (std::max)(0.f, (std::min)(1.f, (15000.f - dd) / 3500.f));
+                        rise = -(1.f - u * u * (3.f - 2.f * u)) * 2300.f; lit = u > 0.f;
+                        if (u <= 0.f) continue;
+                    }
+                    /* shooting-gallery reactions (Bobby 10-28: "the devil girls do that motion when you hit them as a positive feedback thing
+                       like a shooting gallery then when hit a bunch fall", "just so they dont all sync", "only do it as you shoot em"): each
+                       hit (0.22 s apart) sets her off on one move - a hop, a spin, a side-to-side wobble or a flip back - picked per girl and
+                       per hit, at her own speed, +25 and the ding; the 3rd hit (Velvet: 6th) and she falls (sinks away spinning), +50 GOTCHA! */
+                    static std::map<uint64_t, std::pair<int, unsigned long long>> react;
+                    float hop = 0.f, roll = 0.f, pitch = 0.f;
+                    auto hit = girl_hit.find(id);
+                    if (hit != girl_hit.end()) { const float u = (now - hit->second) / 700.f; if (u >= 1.f) continue; rise -= u * u * 2400.f; spin = u * 9.f; }
+                    else {
+                        auto rc = react.find(id);
+                        if (rc != react.end()) {
+                            const uint32_t rh = (uint32_t)(id * 2654435761ull >> 7) + (uint32_t)rc->second.first * 40503u;
+                            const float dur = 0.45f + (rh >> 4) % 30 * 0.01f, u = (now - rc->second.second) / 1000.f / dur;
+                            if (u < 1.f) { const float e = sinf(u * 3.14159f);
+                                switch (rh % 4) { case 0: hop = e * 900.f; break; case 1: spin += u * 6.2832f * ((rh >> 9) & 1 ? 1.f : -1.f); break;
+                                    case 2: roll = sinf(u * 3.f * 6.2832f) * 0.45f * (1.f - u); break; default: pitch = -e * 0.7f; hop = e * 250.f; break; } }
+                        }
+                        if (shooting && (rc == react.end() || now - rc->second.second > 220)) {   /* ray vs her body: radius 450 round a point 0.9 m up */
+                            const float w[3] = {P[0] - go[0], P[1] - go[1], P[2] + rise - g0.sink + hop + 900.f - go[2]};
+                            const float tt = w[0] * gd[0] + w[1] * gd[1] + w[2] * gd[2];
+                            if (tt > 0) { float m2 = 0; for (int q = 0; q < 3; q++) { const float e = w[q] - gd[q] * tt; m2 += e * e; }
+                                if (m2 < 450.f * 450.f) {
+                                    auto &r = react[id]; r.first++; r.second = now;
+                                    if (r.first >= (vel ? 6 : 3)) { girl_hit[id] = now; react.erase(id); mem_writed(my_cart + 9, mem_readd(my_cart + 9) + 50);
+                                        play_game_sound(4, 127); trick_word = 7; trick_word_at = now; VPIX_Haptic(0, 0.06f, 0.7f); }
+                                    else { mem_writed(my_cart + 9, mem_readd(my_cart + 9) + 25); play_game_sound(4, 90); VPIX_Haptic(0, 0.03f, 0.4f); }
+                                } }
+                        }
+                    }
+                    if (!my_cart) react.clear();
+                    VPIX_Instance g = {}; g.handle = vel ? HVEL : HGIRL; g.light_mask = 1; g.bright = (lit || flash > 0.35f) ? 1 : 0;
+                    yaw_to(g, mid[0] - P[0], mid[1] - P[1], ((int)(hsh >> (gi + 7) & 15) - 7) * 0.05f + spin);
+                    if (roll != 0.f) { const float c = cosf(roll), sn = sinf(roll); for (int q = 0; q < 3; q++) { const float a0 = g.R[0][q], a2 = g.R[2][q]; g.R[0][q] = c * a0 + sn * a2; g.R[2][q] = -sn * a0 + c * a2; } }
+                    if (pitch != 0.f) { const float c = cosf(pitch), sn = sinf(pitch); for (int q = 0; q < 3; q++) { const float a1 = g.R[1][q], a2 = g.R[2][q]; g.R[1][q] = c * a1 + sn * a2; g.R[2][q] = -sn * a1 + c * a2; } }
+                    for (int q = 0; q < 3; q++) { g.S[q] = sc; g.T[q] = P[q] - g.R[2][q] * pm.zmin * sc; }
+                    g.T[2] += -g0.sink + rise + hop;
+                    for (int e = 0; e < 16; e++) g.pal[e] = g.palw[e] = 0xFFFFFF;
+                    f.inst.push_back(g); ngirls++;
+                    const float fl = 0.75f + 0.25f * sinf(now / 1000.f * 8.f + (float)(hsh % 7));
+                    {   VPIX_Instance pl = {}; pl.handle = 0x7FFF12F2u; pl.light_mask = 1;   /* her pillar, up out of the fire */
+                        yaw_to(pl, 1.f, 0.f, (float)(hsh % 360) * 0.01745f); for (int q = 0; q < 3; q++) { pl.S[q] = 1.f; pl.T[q] = P[q]; }
+                        for (int e = 0; e < 16; e++) pl.pal[e] = pl.palw[e] = 0xFFFFFF;
+                        f.inst.push_back(pl); }
+                    float gp[3] = {P[0], P[1], P[2] + 200.f};
+                    put_glow(GRED, gp, (lit ? 3200.f : 2200.f) * fl * (1.f + 0.6f * flash), lit ? 0.75f : 0.45f + 0.4f * flash);   /* the fire at her feet, lighting her from below */
+                    for (int k = 0; k < 3; k++) {   /* tongues round the pillar top, and a jet roaring up on the strong kicks */
+                        const float a = k * 2.094f + gi, tt = now / 1000.f * (7.f + k) + (float)(hsh % 11);
+                        const float p[3] = {P[0] + cosf(a) * 700.f, P[1] + sinf(a) * 700.f, P[2] - 300.f};
+                        const bool jet = k == 0 && (hsh >> 3) % 3 == 0 && kick > 0.5f;
+                        flame(p, jet ? 7500.f * (0.8f + 0.2f * kick) : (1300.f + 900.f * flash) * (0.75f + 0.25f * sinf(tt)), jet ? 1700.f : 800.f, 0.8f);
+                    }
+                }
+            }
+            /* THE RUNNER (Bobby 10-28: "animate one of the devil girls doing things and or running along the track"): no rig yet, so the
+               life is in the motion: from 8 s into hell, for 30 s, a devil girl runs on the track 10-14 m ahead of the cart (keeping pace,
+               drifting nearer and farther), with a running bounce, a lean into the run and hip sway, a look back over her shoulder to
+               taunt you every few seconds, and a spinning leap now and then. Shot = she tumbles off into the fire, +100, GOTCHA! */
+            {
+                static unsigned long long run_from = 0, run_hit = 0; static int run_stage = -99; static float rp[3] = {0, 0, 0}; static bool rp_ok = false;
+                if (run_stage != stage) { run_stage = stage; run_from = now; run_hit = 0; rp_ok = false; }
+                const float tr = (now - run_from) / 1000.f;
+                if (tr > 8.f && tr < 38.f && (!run_hit || now - run_hit < 1500)) {
+                    const float cp[3] = {rd_f(my_cart + 0x98), rd_f(my_cart + 0x9C), rd_f(my_cart + 0xA0)};
+                    float fw[2] = {rd_f(my_cart + 0x13), rd_f(my_cart + 0x17)}; { const float l = sqrtf(fw[0] * fw[0] + fw[1] * fw[1]) + 1e-6f; fw[0] /= l; fw[1] /= l; }
+                    const float ahead = 12000.f + 2000.f * sinf(tr * 0.7f);
+                    const float want[3] = {cp[0] + fw[0] * ahead, cp[1] + fw[1] * ahead, cp[2]};
+                    if (!rp_ok) { for (int q = 0; q < 3; q++) rp[q] = want[q]; rp_ok = true; }
+                    for (int q = 0; q < 3; q++) rp[q] += (want[q] - rp[q]) * 0.12f;   /* smoothed: no snapping on the curves */
+                    const float step = tr * 9.f, bounce = fabsf(sinf(step)) * 260.f;
+                    const float lp = fmodf(tr, 6.f), leap = lp > 5.f ? sinf((lp - 5.f) * 3.14159f) : 0.f;   /* a 1 s leap every 6 s */
+                    const float look = fmodf(tr, 4.f) > 3.2f ? sinf((fmodf(tr, 4.f) - 3.2f) / 0.8f * 3.14159f) : 0.f;   /* glance back */
+                    float yaw = atan2f(-fw[0], fw[1]) + 3.14159f * 0.f;   /* her front (-y) away from the cart: running ahead */
+                    yaw += 0.12f * sinf(step) + 2.4f * look + leap * 6.2832f * (lp > 5.f ? (lp - 5.f) : 0.f);
+                    float tumble = 0.f, drop = 0.f;
+                    if (run_hit) { const float u = (now - run_hit) / 1000.f; tumble = u * 8.f; drop = u * u * 9000.f; for (int q = 0; q < 2; q++) rp[q] += fw[1 - q] * (q ? -1.f : 1.f) * 120.f; }
+                    else if (shooting) {
+                        /* her whole body (Bobby 10-28: "the devil girl in the track was hard to shoot ended up just going over her"):
+                           a 1.4 m ball round her middle instead of 0.55 m at the waist, and the VR ring sits on her while you're on target */
+                        const float w[3] = {rp[0] - go[0], rp[1] - go[1], rp[2] + 1200.f + bounce + leap * 3000.f - go[2]};
+                        const float tt = w[0] * gd[0] + w[1] * gd[1] + w[2] * gd[2];
+                        if (tt > 0) { float m2 = 0; for (int q = 0; q < 3; q++) { const float e = w[q] - gd[q] * tt; m2 += e * e; }
+                            if (m2 < 1400.f * 1400.f) { for (int q = 0; q < 3; q++) gf_aim_pt[q] = go[q] + gd[q] * tt; gf_aim_ms = now; }
+                            if (m2 < 1400.f * 1400.f) { run_hit = now; mem_writed(my_cart + 9, mem_readd(my_cart + 9) + 100); play_game_sound(4, 127);
+                                trick_word = 7; trick_word_at = now; VPIX_Haptic(0, 0.08f, 0.8f); } }
+                    }
+                    const float lean = 0.28f + tumble, sc = base_sc;
+                    /* yaw about z, then the lean forward (about her local x) */
+                    const float cy = cosf(yaw), sy = sinf(yaw), cl = cosf(lean), sl3 = sinf(lean);
+                    VPIX_Instance g = {}; g.handle = HGIRL; g.light_mask = 1; g.bright = flash > 0.35f ? 1 : 0;
+                    const float X[3] = {cy, sy, 0}, Y[3] = {-sy, cy, 0}, Z[3] = {0, 0, 1};
+                    for (int q = 0; q < 3; q++) { g.R[0][q] = X[q]; g.R[1][q] = cl * Y[q] + sl3 * Z[q]; g.R[2][q] = -sl3 * Y[q] + cl * Z[q]; g.S[q] = sc; }
+                    for (int q = 0; q < 3; q++) g.T[q] = rp[q] - g.R[2][q] * girl.zmin * sc;
+                    g.T[2] += bounce + leap * 3000.f - drop;
+                    for (int e = 0; e < 16; e++) g.pal[e] = g.palw[e] = 0xFFFFFF;
+                    f.inst.push_back(g);
+                    float fp[3] = {rp[0], rp[1], rp[2] + 100.f - drop}; put_glow(GRED, fp, 1800.f, 0.5f);   /* fire at her heels */
+                }
+            }
+            /* DEVILMASTER, the hell boss (Bobby 10-28: "give him a final hell boss character DevilMaster in game with some reference to
+               32 bit implementation :)"; a tribute to DevilMaster, MallVR's tech-support tester, whose 32-bit build report read "WINDOWS
+               10 32 BIT: IT WORKS PERFECTLY"; the Devil's Chamber boss of RIDE_PLAN.md until the chamber exists). VPIX_DEVILMASTER=<folder
+               from make_devilmaster.py>; VPIX_DM_AT=<s into hell> (45). He rises out of the fire 30 m ahead, ~15 m tall; the cart
+               crawls in and holds 15 m from him (time topped up). Six devil girls on pillars guard him and go down first (one shot each:
+               "TAKE DOWN HIS GUARDS!"); then 32 hits on the "DEVILMASTER - 32-BIT EDITION" health bar, each one a flinch and a flash,
+               while he throws glowing 32s and binary bits at the cart (shoot them: +10; a bit that reaches you = a jolt). Velvet stands
+               on his shoulder. Down: he sinks into the lava, +3200, "32 BIT: IT WORKS PERFECTLY", then "WINDOWS 7 ... TESTING", and the
+               cart rolls on. */
+            {
+                static const char *dmd = getenv("VPIX_DEVILMASTER"); static int dms = 0; static PM dm; static VSound dm_voice; static std::atomic<bool> dm_voice_ready(false); static bool dm_spoke = false; const uint32_t HDM = 0x7FFF1230u, BDM = 0x7FFD0600u;
+                static int bw[40] = {0}, bh[40] = {0};   /* bitmap sizes: 0..32 health plates, 33..35 bits (32, 0, 1), 36 guards, 37 win, 38 win7 */
+                if (dms == 0) { dms = -1;
+                    if (dmd && *dmd) { dm = load_bin(std::string(dmd) + "\\" + "DEVILMASTER.BIN", HDM); int nb = 0;
+                        const char *extra[6] = {"DM_BIT_32", "DM_BIT_0", "DM_BIT_1", "DM_GUARDS", "DM_WIN", "DM_WIN7"};
+                        for (int k = 0; k < 39; k++) {
+                            const std::string nm = k <= 32 ? "DM_HP_" + std::to_string(k) : extra[k - 33];
+                            FILE *fp = fopen((std::string(dmd) + "\\" + nm + ".rgba").c_str(), "rb"); int32_t wh[2] = {0, 0};
+                            if (fp && fread(wh, 4, 2, fp) == 2 && wh[0] > 0 && wh[1] > 0 && wh[0] <= 2048 && wh[1] <= 2048) {
+                                std::vector<uint32_t> px((size_t)wh[0] * wh[1]);
+                                if (fread(px.data(), 4, px.size(), fp) == px.size() && VPIX_Render_AddBitmapRGBA(BDM + (uint32_t)k, wh[0], wh[1], px.data())) { bw[k] = wh[0]; bh[k] = wh[1]; nb++; } }
+                            if (fp) fclose(fp);
+                        }
+                        dms = dm.ok && nb == 39 ? 1 : -1;
+                        lg("HLE: VPIX_DEVILMASTER %s: model %s, %d of 39 pictures", dmd, dm.ok ? "loaded" : "** missing", nb);
+                        /* his line as he rises (Bobby 10-28: "or audio saying i am Devil Master"): narration\DM_VOICE.wav, from
+                           make_devilmaster_voice.py, decoded once off the game thread like the narration */
+                        if (getenv("VPIX_NARRATION")) std::thread([]() {
+                            static const char *ff = getenv("VPIX_FFMPEG") ? getenv("VPIX_FFMPEG") : "ffmpeg";
+                            char cmd[2048]; snprintf(cmd, sizeof(cmd), "\"%s\" -v quiet -i \"%s\\DM_VOICE.wav\" -f s16le -ac 1 -ar 22050 -", ff, getenv("VPIX_NARRATION"));
+                            VSound s; s.rate = 22050;
+                            if (void *pa = VPIX_PipeOpen(cmd)) { std::vector<int16_t> chunk(32768); size_t r;
+                                while ((r = VPIX_PipeRead(pa, chunk.data(), chunk.size() * 2)) > 0) s.pcm.insert(s.pcm.end(), chunk.begin(), chunk.begin() + r / 2);
+                                VPIX_PipeClose(pa); }
+                            lg("HLE: VPIX_DEVILMASTER voice %s", s.pcm.empty() ? "** missing" : "loaded");
+                            for (int16_t &x : s.pcm) x = (int16_t)(std::max)(-32767, (std::min)(32767, x * 2));   /* louder talking (Bobby 10-28) */
+                            if (!s.pcm.empty()) { dm_voice = s; dm_voice_ready = true; }
+                        }).detach(); } }
+                auto sprite = [&](int k, const float p[3], float wdt, float alpha) {   /* a picture standing in the world, facing the rider */
+                    if (!bw[k]) return;
+                    VPIX_Blit b = {}; b.handle = BDM + (uint32_t)k; b.sw = bw[k]; b.sh = bh[k]; b.key = -1; b.world = true; b.nofog = true;
+                    b.dw = wdt; b.dh = wdt * bh[k] / bw[k]; b.pivot[0] = b.dw * 0.5f; b.pivot[1] = b.dh * 0.5f;
+                    for (int q = 0; q < 3; q++) b.pos[q] = p[q]; b.alpha = alpha; b.prio = 99600; f.blits.push_back(b);
+                };
+                struct Bit { float p[3], v[3]; int k; bool live; unsigned long long pop; };
+                static std::vector<Bit> bits; static int dm_stage = -99; static unsigned long long dm_from = 0, win_at = 0, last_hit = 0, next_throw = 0, flinch_at = 0;
+                static bool placed = false; static float bp[3], fyaw = 0.f; static int hits = 0, guards = 0; static unsigned long long guard_down[6];
+                static const float dm_at = getenv("VPIX_DM_AT") ? (float)atof(getenv("VPIX_DM_AT")) : 45.f;
+                if (dm_stage != stage) { dm_stage = stage; dm_from = now; placed = false; hits = 0; guards = 0; win_at = 0; bits.clear(); dm_spoke = false; for (auto &g2 : guard_down) g2 = 0; }
+                const float tdm = (now - dm_from) / 1000.f;
+                dm_fight_now = dms == 1 && tdm > dm_at && !win_at && stage == dm_stage;
+                if (dms == 1 && tdm > dm_at && (!win_at || now - win_at < 11000)) {
+                    const float cp[3] = {rd_f(my_cart + 0x98), rd_f(my_cart + 0x9C), rd_f(my_cart + 0xA0)};
+                    float fw[2] = {rd_f(my_cart + 0x13), rd_f(my_cart + 0x17)}; { const float l = sqrtf(fw[0] * fw[0] + fw[1] * fw[1]) + 1e-6f; fw[0] /= l; fw[1] /= l; }
+                    const float SC = 3.3f, H = (dm.zmax - dm.zmin) * SC;
+                    if (!placed) { placed = true; bp[0] = cp[0] + fw[0] * 30000.f; bp[1] = cp[1] + fw[1] * 30000.f; bp[2] = cp[2] - 4000.f;
+                        fyaw = atan2f(cp[0] - bp[0], -(cp[1] - bp[1])); next_throw = now + 3000; }
+                    /* kept in front (Bobby 10-28 ride 3: "i got stuck on the track at devil master and did not know to look around"):
+                       the track curves, so where he rose ended up off to the side. While he's up, if he is more than 25 deg off the
+                       cart's heading he swings round it toward straight ahead (the boss moves, not the view: no turning the rider's
+                       head in VR), about 40 deg a second, and keeps facing the cart. */
+                    if (!win_at) {
+                        float tx = bp[0] - cp[0], ty = bp[1] - cp[1]; const float r = sqrtf(tx * tx + ty * ty) + 1e-3f;
+                        const float off = atan2f(fw[0] * ty - fw[1] * tx, fw[0] * tx + fw[1] * ty);
+                        if (fabsf(off) > 0.44f) { const float st = (std::min)(fabsf(off) - 0.44f, 0.7f / 60.f) * (off > 0 ? -1.f : 1.f);
+                            const float cs = cosf(st), sn = sinf(st); bp[0] = cp[0] + (tx * cs - ty * sn); bp[1] = cp[1] + (tx * sn + ty * cs); (void)r; }
+                        fyaw = atan2f(cp[0] - bp[0], -(cp[1] - bp[1]));
+                    }
+                    const float rise = (std::min)(1.f, (tdm - dm_at) / 2.5f);   /* rising out of the fire */
+                    if (!dm_spoke && tdm > dm_at + 1.f && dm_voice_ready) { dm_spoke = true;   /* "I... am... DEVILMASTER!" */
+                        dm_duck_until = now + dm_voice.pcm.size() * 1000ull / 22050; lg("HLE: VPIX_DEVILMASTER speaks");
+                        for (int v = 31; v >= 0; v--) if (!voices[v].on) { voices[v] = VVoice(); voices[v].s = &dm_voice; voices[v].vol = 127; voices[v].on = true; break; } }
+                    float tox[2] = {cp[0] - bp[0], cp[1] - bp[1]}; const float dist = sqrtf(tox[0] * tox[0] + tox[1] * tox[1]) + 1e-3f; tox[0] /= dist; tox[1] /= dist;
+                    const float side[2] = {tox[1], -tox[0]};
+                    /* never stuck (Bobby 10-28 ride 3: "i got stuck on the track at devil master"): 90 s after he rises without the
+                       32 hits, he sinks anyway (no bonus) and the cart rolls on */
+                    if (!win_at && tdm > dm_at + 90.f) { win_at = now; lg("HLE: VPIX_DEVILMASTER timed out, the cart rolls on"); }
+                    if (!win_at) {   /* the cart crawls in and holds; time enough for the fight */
+                        const float cap = dist < 15000.f ? 0.f : 2500.f;
+                        if (rd_f(my_cart + 0x37) > cap) { uint32_t u; memcpy(&u, &cap, 4); mem_writed(my_cart + 0x37, u); }
+                        if (rd_f(my_cart + 0xD) < 20.f) { const float t20 = 20.f; uint32_t u; memcpy(&u, &t20, 4); mem_writed(my_cart + 0xD, u); }
+                    }
+                    /* the guards: six devil girls on pillars in an arc between him and the cart */
+                    int up_n = 0;
+                    for (int k = 0; k < 6; k++) {
+                        float gp[3] = {bp[0] + tox[0] * 8000.f + side[0] * (k - 2.5f) * 2800.f, bp[1] + tox[1] * 8000.f + side[1] * (k - 2.5f) * 2800.f, cp[2] - 300.f};
+                        float sink = 0.f, spin = 0.f;
+                        if (guard_down[k]) { const float u = (now - guard_down[k]) / 700.f; if (u >= 1.f) continue; sink = u * u * 2400.f; spin = u * 9.f; }
+                        else {
+                            up_n++;
+                            if (shooting && rise >= 1.f) { const float w[3] = {gp[0] - go[0], gp[1] - go[1], gp[2] + 900.f - go[2]};
+                                const float tt = w[0] * gd[0] + w[1] * gd[1] + w[2] * gd[2];
+                                if (tt > 0) { float m2 = 0; for (int q = 0; q < 3; q++) { const float e = w[q] - gd[q] * tt; m2 += e * e; }
+                                    if (m2 < 450.f * 450.f) { guard_down[k] = now; mem_writed(my_cart + 9, mem_readd(my_cart + 9) + 50); play_game_sound(4, 120); VPIX_Haptic(0, 0.05f, 0.6f); } } }
+                        }
+                        VPIX_Instance pl = {}; pl.handle = 0x7FFF12F2u; pl.light_mask = 1; yaw_to(pl, 1.f, 0.f, k * 0.9f);
+                        for (int q = 0; q < 3; q++) { pl.S[q] = 1.f; pl.T[q] = gp[q]; } for (int e = 0; e < 16; e++) pl.pal[e] = pl.palw[e] = 0xFFFFFF; f.inst.push_back(pl);
+                        VPIX_Instance g = {}; g.handle = HGIRL; g.light_mask = 1; g.bright = flash > 0.35f ? 1 : 0;
+                        yaw_to(g, cp[0] - gp[0], cp[1] - gp[1], spin);
+                        for (int q = 0; q < 3; q++) { g.S[q] = base_sc; g.T[q] = gp[q]; } g.T[2] = gp[2] - girl.zmin * base_sc - (1.f - rise) * 2500.f - sink;
+                        for (int e = 0; e < 16; e++) g.pal[e] = g.palw[e] = 0xFFFFFF; f.inst.push_back(g);
+                    }
+                    guards = up_n;
+                    /* him: a sway and a breath, a flinch back on each hit */
+                    const float fl_u = flinch_at ? (now - flinch_at) / 350.f : 1.f, flinch = fl_u < 1.f ? sinf(fl_u * 3.14159f) * 0.18f : 0.f;
+                    float sinkw = 0.f, spinw = 0.f; if (win_at) { const float u = (now - win_at) / 5000.f; sinkw = (std::min)(1.f, u) * (std::min)(1.f, u) * H * 1.2f; spinw = u * 2.f; }
+                    /* lit from within, always (Bobby 10-28: "demon master is the same red as the background ... make hime brighter"); no
+                       sway or breathing (the "wavy effect") */
+                    VPIX_Instance b = {}; b.handle = HDM; b.light_mask = 1; b.bright = 1;
+                    {   const float a = fyaw + spinw, ca = cosf(a), sa = sinf(a);
+                        const float X[3] = {ca, sa, 0}, Y[3] = {-sa, ca, 0}, Z[3] = {0, 0, 1}, cf = cosf(-flinch), sf = sinf(-flinch);
+                        for (int q = 0; q < 3; q++) { b.R[0][q] = X[q]; b.R[1][q] = cf * Y[q] + sf * Z[q]; b.R[2][q] = -sf * Y[q] + cf * Z[q]; b.S[q] = SC; }
+                        for (int q = 0; q < 3; q++) b.T[q] = bp[q] - b.R[2][q] * dm.zmin * SC; b.T[2] -= (1.f - rise) * H + sinkw; }
+                    for (int e = 0; e < 16; e++) b.pal[e] = b.palw[e] = 0xFFFFFF;
+                    f.inst.push_back(b);
+                    auto at = [&](float lx, float ly, float lz, float o[3]) { for (int q = 0; q < 3; q++) o[q] = b.T[q] + (lx * b.R[0][q] + ly * b.R[1][q] + lz * b.R[2][q]) * b.S[0]; };
+                    for (int e2 = -1; e2 <= 1; e2 += 2) { float ep[3]; at(e2 * 120.f, -300.f, 3200.f, ep); put_glow(GEYE, ep, 1600.f, 0.9f); put_glow(GEYE, ep, 5000.f, 0.3f + 0.3f * flash); }
+                    for (int k = 0; k < 8; k++) {   /* the fire he stands in */
+                        const float a = k * 0.785f + now / 1000.f * 0.3f, tt = now / 1000.f * (5.f + k) + k;
+                        const float fp[3] = {bp[0] + cosf(a) * 4500.f, bp[1] + sinf(a) * 4500.f, bp[2] - sinkw * 0.2f};
+                        flame(fp, (5000.f + 3000.f * flash) * (0.75f + 0.25f * sinf(tt)), 2400.f, 0.85f);
+                    }
+                    if (velvet.ok && !win_at) {   /* Velvet on his left shoulder */
+                        VPIX_Instance v = b; v.handle = HVEL; const float vs = 1850.f / (velvet.zmax - velvet.zmin);
+                        float vp[3]; at(-520.f, 0.f, 2780.f, vp);
+                        yaw_to(v, cp[0] - vp[0], cp[1] - vp[1], 0.f); for (int q = 0; q < 3; q++) { v.S[q] = vs; v.T[q] = vp[q]; } v.T[2] -= velvet.zmin * vs;
+                        f.inst.push_back(v);
+                    }
+                    if (!win_at && rise >= 1.f) {
+                        /* hits: only once the guards are down */
+                        float hc[3]; at(0.f, 0.f, 2300.f, hc); const float hr = 0.22f * H;
+                        if (guards == 0 && shooting && now - last_hit > 180) {
+                            const float w[3] = {hc[0] - go[0], hc[1] - go[1], hc[2] - go[2]}, tt = w[0] * gd[0] + w[1] * gd[1] + w[2] * gd[2];
+                            if (tt > 0) { float m2 = 0; for (int q = 0; q < 3; q++) { const float e = w[q] - gd[q] * tt; m2 += e * e; }
+                                if (m2 < hr * hr) { last_hit = now; flinch_at = now; hits++; play_game_sound(4, 110); VPIX_Haptic(0, 0.05f, 0.6f);
+                                    mem_writed(my_cart + 9, mem_readd(my_cart + 9) + 32);
+                                    if (hits >= 32) { win_at = now; mem_writed(my_cart + 9, mem_readd(my_cart + 9) + 3200); trick_word = 7; trick_word_at = now;
+                                        VPIX_Haptic(2, 0.8f, 1.f); play_game_sound(5, 127); lg("HLE: VPIX_DEVILMASTER defeated"); } } }
+                        }
+                        /* he throws glowing 32s and binary bits from the trident */
+                        if (now >= next_throw) { next_throw = now + 1300 + (unsigned long long)(rand() % 700);
+                            Bit bt; at(900.f, -270.f, 4300.f, bt.p); const float aim[3] = {f.cam_T[0] - bt.p[0], f.cam_T[1] - bt.p[1], f.cam_T[2] - 300.f - bt.p[2]};
+                            const float al = sqrtf(aim[0] * aim[0] + aim[1] * aim[1] + aim[2] * aim[2]) + 1e-3f;
+                            for (int q = 0; q < 3; q++) bt.v[q] = aim[q] / al * 11000.f; bt.k = 33 + rand() % 3; bt.live = true; bt.pop = 0; bits.push_back(bt); }
+                    }
+                    for (Bit &bt : bits) {
+                        if (!bt.live) continue;
+                        for (int q = 0; q < 3; q++) bt.p[q] += bt.v[q] / 60.f;
+                        float d2 = 0; for (int q = 0; q < 3; q++) d2 += (bt.p[q] - f.cam_T[q]) * (bt.p[q] - f.cam_T[q]);
+                        if (d2 < 1500.f * 1500.f) { bt.live = false; VPIX_Haptic(2, 0.25f, 0.8f); play_game_sound(5, 100); continue; }   /* it got you */
+                        if (shooting) { const float w[3] = {bt.p[0] - go[0], bt.p[1] - go[1], bt.p[2] - go[2]}, tt = w[0] * gd[0] + w[1] * gd[1] + w[2] * gd[2];
+                            if (tt > 0) { float m2 = 0; for (int q = 0; q < 3; q++) { const float e = w[q] - gd[q] * tt; m2 += e * e; }
+                                if (m2 < 900.f * 900.f) { bt.live = false; mem_writed(my_cart + 9, mem_readd(my_cart + 9) + 10); play_game_sound(4, 80); continue; } } }
+                        sprite(bt.k, bt.p, bt.k == 33 ? 1800.f : 1100.f, 1.f);
+                    }
+                    bits.erase(std::remove_if(bits.begin(), bits.end(), [](const Bit &x) { return !x.live; }), bits.end());
+                    /* the name plate + health bar over his head, the guards prompt, the win banners in front of the rider */
+                    if (!win_at && rise >= 1.f) { float np[3]; at(0.f, 0.f, 4900.f, np); sprite((std::min)(hits, 32), np, 9000.f, 1.f);
+                        if (guards > 0) { float gp2[3]; at(0.f, 0.f, 5600.f, gp2); sprite(36, gp2, 9000.f, 0.6f + 0.4f * flash); } }
+                    if (win_at) {
+                        const float u = (now - win_at) / 1000.f; float wp[3];
+                        for (int q = 0; q < 2; q++) wp[q] = f.cam_T[q] + f.cam_R[1][q] * 6000.f; wp[2] = f.cam_T[2] + 600.f;
+                        if (u < 6.f) sprite(37, wp, 5200.f, (std::min)(1.f, u * 3.f));
+                        else if (u < 10.5f) sprite(38, wp, 4200.f, (std::min)(1.f, (u - 6.f) * 3.f) * (std::min)(1.f, (10.5f - u) * 2.f));
+                    }
+                }
+            }
+            if (ngirls != girls_logged && (frame % 120) == 0) { girls_logged = ngirls; lg("HLE: VPIX_HELL %d devil girls in view, %d Velvets mid-ride", ngirls, (int)vel_keys.size()); }
+        }
+        /* dev VPIX_HIRES_TEST="i,j,k" (10-29, the hi-res exhibits "3/4 invisible"): those exhibits stand 3 m in front of the camera
+           wherever it is (the attract mode too, so no rider is needed), each hi-res version with its low-poly BIN 1.2 m to its left */
+        if (const char *ht = getenv("VPIX_HIRES_TEST")) if (mall_ok && !my_cart) {   /* attract only: never over a ride (10-29 it doubled the museum's models, head-locked) */
+            std::vector<int> ids;
+            if (!strncmp(ht, "all", 3)) {   /* "all[:first group[:seconds]]": every exhibit with a model, three at a time, the next three
+                                               every 10 s from the first frame (one launch + VPIX_SHOT's pictures checks the museum; the
+                                               attract's own 2D screens take over after ~90 s, so long lists need a second launch) */
+                std::vector<int> have; for (int i = 0; i < (int)ex.size(); i++) if (ex[i].pm.ok) have.push_back(i);
+                const char *c1 = strchr(ht, ':'); const int first = c1 ? atoi(c1 + 1) : 0;
+                const char *c2 = c1 ? strchr(c1 + 1, ':') : nullptr; const unsigned long long per = c2 ? (unsigned long long)(atof(c2 + 1) * 1000) : 10000ull;
+                static unsigned long long t0 = 0; if (!t0) t0 = hap_ms_now();
+                const int groups = ((int)have.size() + 2) / 3, gi = groups ? (int)((first + (hap_ms_now() - t0) / per) % (unsigned long long)groups) : 0;
+                for (int k = gi * 3; k < gi * 3 + 3 && k < (int)have.size(); k++) ids.push_back(have[k]);
+                static int last_gi = -1; if (gi != last_gi) { last_gi = gi; std::string s; for (int i : ids) s += " " + std::to_string(i);
+                    lg("HIRES_TEST group %d/%d:%s", gi + 1, groups, s.c_str()); }
+            } else for (const char *p = ht; *p; ) { ids.push_back(atoi(p)); while (*p && *p != ',') p++; if (*p) p++; }
+            const float fx = f.cam_R[1][0], fy = f.cam_R[1][1], fl = sqrtf(fx * fx + fy * fy) + 1e-6f, F2[2] = {fx / fl, fy / fl}, Rt[2] = {F2[1], -F2[0]};
+            for (size_t k = 0; k < ids.size(); k++) { const int i = ids[k]; if (i < 0 || i >= (int)ex.size() || !ex[i].pm.ok) continue;
+                const float h = ex[i].pm.zmax - ex[i].pm.zmin, sc = 1700.f / h;
+                for (int v = 0; v < 2; v++) {
+                    VPIX_Instance g = {}; g.handle = v ? HEX0 + (uint32_t)i : (ex[i].has_near ? 0x7FFF1500u + (uint32_t)i : HEX0 + (uint32_t)i); g.light_mask = 1;
+                    yaw_to(g, -F2[0], -F2[1], 0.f); for (int e = 0; e < 16; e++) g.pal[e] = g.palw[e] = 0xFFFFFF;
+                    const float side = (k - (ids.size() - 1) * 0.5f) * 3200.f - (v ? 1300.f : 0.f);
+                    for (int q = 0; q < 3; q++) g.S[q] = sc;
+                    g.T[0] = f.cam_T[0] + F2[0] * 3500.f + Rt[0] * side; g.T[1] = f.cam_T[1] + F2[1] * 3500.f + Rt[1] * side;
+                    g.T[2] = f.cam_T[2] - 1500.f - ex[i].pm.zmin * sc;
+                    if (!v && ex[i].has_near && ((ex[i].kind == 'p' && (ex[i].name.rfind("POD_", 0) == 0 || ex[i].name.rfind("SU3000", 0) == 0)) || ex[i].kind == 'k'))   /* the ride's gloss */
+                        g.gloss = getenv("VPIX_GLOSS") ? (float)atof(getenv("VPIX_GLOSS")) : 0.55f;
+                    f.inst.push_back(g); } }
+        }
+        /* ---- MALL RIDE ---- */
+        struct Slot { float P[3], face[2], M[3], fwd[2], rl = 0.f; float E[3] = {0, 0, 0}; bool has_e = false; float pw = 0.f; };   /* E: the room's entrance (its doors), hand layout */   /* M: the room's middle on the track, fwd: the track's direction, rl: the room's half length */
+        static std::vector<Slot> slots; static std::set<uint64_t> claimed; static int reached = -1; static unsigned long long reached_at[16] = {0};
+        static bool station_ok = false; static VPIX_Instance station;   /* the first piece claimed: the dark station */
+        static float duck_to = 1.f;
+        static unsigned long long end_t0 = 0; static int end_es = 0;   /* VPIX_ENDING: when the ending started (0 = not yet); 1 = its art loaded */
+        /* the ending carries on through the section after the museum (the end of the line, which finishes the ride: game over, initials) */
+        static const bool tail_on = !getenv("VPIX_ENDING_TAIL") || atoi(getenv("VPIX_ENDING_TAIL"));   /* 0: the museum-first test, where hell comes next */
+        const bool end_tail = tail_on && end_t0 && my_cart && stage == mall_st + 1;
+        /* off the ride (game over, initials, attract: game mode not 1) it all starts again: the attract's demo cart stays "riding", so the
+           last game's ending carried on and its backup zeroed the next game's clock (10-30 self-test: 2nd game over in one frame) */
+        if (!my_cart || (stage != mall_st && !end_tail) || (ghost_gm >= 0 && ghost_gm != 1 && ghost_gm != 9)) { if (!slots.empty() || reached >= 0) { slots.clear(); claimed.clear(); reached = -1; } duck_to = 1.f; station_ok = false; end_t0 = 0; }
+        mall_now = mall_ok && my_cart && (stage == mall_st || end_tail);
+        museum_xy.clear(); for (const Slot &sl : slots) { museum_xy.push_back(sl.P[0]); museum_xy.push_back(sl.P[1]); }
+        if (!mall_now) mall_in_room = false;
+        if (mall_now) dm_fight_now = false;
+        {   /* dev: the 2D pictures on screen in the museum, logged a few times (Bobby 10-28: "a floaty black m under the score") */
+            static int nlog = 0; static unsigned long long last = 0; const unsigned long long t = hap_ms_now();
+            if (mall_now && nlog < 6 && t - last > 4000) { last = t; nlog++; std::string sb;
+                for (const VPIX_Blit &b : f.blits) { if (b.world) continue; auto bf = bitmap_files.find(b.handle); char bb[160];
+                    snprintf(bb, sizeof(bb), " %08X%s%s@%d,%d", b.handle, bf != bitmap_files.end() ? ":" : "", bf != bitmap_files.end() ? bf->second.c_str() : "", b.x, b.y); sb += bb; }
+                lg("MALLHUD f=%lu%s", frame, sb.c_str()); } }
+        if (mall_now) for (VVoice &vv : voices) if (vv.on && vv.sound) {   /* the game's own sounds (wind, rails, carts) off; ours have sound 0 */
+            const std::string &sn = sound_names[vv.sound]; std::string lo = sn; std::transform(lo.begin(), lo.end(), lo.begin(), ::tolower);
+            const bool gun = !mall_in_room && (lo.find("fire") != std::string::npos || lo.find("gun") != std::string::npos || lo.find("shot") != std::string::npos
+                                                || lo.find("laser") != std::string::npos || lo.find("hit") != std::string::npos);
+            if (gun) vv.vol = (std::min)(vv.vol, 32); else vv.on = false; }   /* the guns between rooms, at a quarter volume */
+        if (mall_ok && my_cart && (stage == mall_st || end_tail)) {
+            /* THE WAREHOUSE (Bobby 10-28 ride 5: "we are still outside ... should be like a ride is in a big warehouse", "checkered floor
+               red curtain walls", "make it dark"): the section's own outdoor scenery (huts, valley, trees, the ground, sky things) is not
+               drawn here; along every track piece in view a stretch of hall is: a black-and-white checkered floor, red stage curtains
+               11 m out on both sides, a black ceiling 8.5 m up; near-black fog and sky. The exhibits stand between the track and the
+               curtains. Our own models (handles 0x7FF00000+), the track, carts, riders, guns and shots stay. */
+            {   const uint32_t HFLOOR = 0x7FFF1700u, HCURT = 0x7FFF1701u, HCEIL = 0x7FFF1702u, TCHK = 0x7FFD0700u, TCURT = 0x7FFD0701u, TCEIL = 0x7FFD0702u;
+                static bool made = false;
+                if (!made) { made = true;
+                    std::vector<uint32_t> px(256 * 256);
+                    for (int y = 0; y < 256; y++) for (int x = 0; x < 256; x++) { const bool w = ((x >> 7) ^ (y >> 7)) & 1;
+                        const int n = (int)((x * 7 + y * 13) % 9) - 4, c = (w ? 150 : 14) + n; px[(size_t)y * 256 + x] = 0xFF000000u | (uint32_t)c << 16 | (uint32_t)c << 8 | (uint32_t)c; }
+                    VPIX_Render_AddTextureRGBA(TCHK, 256, 256, px.data());
+                    for (int y = 0; y < 256; y++) for (int x = 0; x < 256; x++) {   /* velvet folds: 8 across, darker toward the floor */
+                        const float fold = 0.55f + 0.45f * sinf(x / 256.f * 6.2831853f * 8.f), lo = 0.45f + 0.55f * y / 255.f;
+                        const int r = (int)(150 * fold * lo), g = (int)(12 * fold * lo), b = (int)(18 * fold * lo);
+                        px[(size_t)y * 256 + x] = 0xFF000000u | (uint32_t)b << 16 | (uint32_t)g << 8 | (uint32_t)r; }
+                    VPIX_Render_AddTextureRGBA(TCURT, 256, 256, px.data());
+                    /* the ceiling (Bobby 10-29: "add a cieling for the museum"; the old one was 5 % grey in the dark, unseen): 60 cm
+                       acoustic tiles with dark seams and a glowing light panel, the 1990s drop ceiling; one picture = 2.4 m */
+                    for (int y = 0; y < 256; y++) for (int x = 0; x < 256; x++) {
+                        const bool seam = (x & 63) < 3 || (y & 63) < 3, panel = x >= 67 && x < 125 && y >= 3 && y < 125;
+                        const int n = (int)(((x * 31) ^ (y * 17)) % 11) - 5, c = seam ? 34 : panel ? 230 : 92 + n;
+                        const uint32_t r = (uint32_t)c, g = (uint32_t)c, b = (uint32_t)(panel ? 200 : c + 6);
+                        px[(size_t)y * 256 + x] = 0xFF000000u | b << 16 | g << 8 | r; }
+                    VPIX_Render_AddTextureRGBA(TCEIL, 256, 256, px.data());
+                    auto quad = [&](uint32_t h, const float c4[4][3], uint32_t tex, float ru, float rv, uint32_t col) {
+                        std::vector<float> v; for (int k = 0; k < 4; k++) for (int q = 0; q < 3; q++) v.push_back(c4[k][q]);
+                        std::vector<VPIX_MeshPoly> ps(1); VPIX_MeshPoly &p = ps[0]; p.n = 4; const float uv[4][2] = {{0, 0}, {ru, 0}, {ru, rv}, {0, rv}};
+                        for (int k = 0; k < 4; k++) { p.idx[k] = (uint32_t)k; p.uv[k][0] = uv[k][0]; p.uv[k][1] = uv[k][1]; }
+                        p.flags = 0x20000000u | col; p.tex = tex; p.nx = 0; p.ny = 0; p.nz = 1; VPIX_Render_AddMesh(h, v, ps); };
+                    const float fl[4][3] = {{-11000, -7000, 0}, {11000, -7000, 0}, {11000, 7000, 0}, {-11000, 7000, 0}};
+                    quad(HFLOOR, fl, TCHK, 22000.f / 2400.f, 14000.f / 2400.f, 0xFFFFFF);   /* 1.2 m tiles */
+                    const float cu[4][3] = {{0, -7000, 0}, {0, 7000, 0}, {0, 7000, 8500}, {0, -7000, 8500}};
+                    quad(HCURT, cu, TCURT, 14000.f / 3000.f, 1.f, 0xFFFFFF);
+                    const float ce[4][3] = {{-11000, -7000, 8500}, {11000, -7000, 8500}, {11000, 7000, 8500}, {-11000, 7000, 8500}};
+                    quad(HCEIL, ce, TCEIL, 22000.f / 2400.f, 14000.f / 2400.f, 0xFFFFFF);
+                }
+                std::vector<VPIX_Instance> keep, hall; keep.reserve(f.inst.size());
+                /* ONE floor and ONE ceiling for the whole hall (10-29: one floor per track piece made "a few levels of floor that the
+                   track went into"): the floor 0.5 m under the lowest track seen in the hall, the ceiling 8.5 m over the highest; the
+                   floor is one big sheet centred under the rider, snapped to the 2.4 m checker so the tiles stay put as it follows */
+                /* section 3 has four levels up to 39 m apart (10-29: "crazy walls floating"): the floor follows the CART's level - the
+                   track piece under it - not the lowest track in sight; the curtains only line pieces at that level */
+                static float floor_z = 1e30f, ceil_z = -1e30f; static int hall_stage = -99;
+                if (hall_stage != stage) { hall_stage = stage; floor_z = 1e30f; ceil_z = -1e30f; }
+                {   float bd = 9000.f * 9000.f, bz = 1e30f;
+                    for (const VPIX_Instance &in : f.inst) { bool st2, ld2; if (!is_track(in.handle, &st2, &ld2)) continue;
+                        float m[3]; for (int c = 0; c < 3; c++) m[c] = in.T[c] + (st2 ? in.R[1][c] * 4500.f : 0.f);
+                        if (fabsf(m[2] - (f.cam_T[2] - 1500.f)) > 4000.f) continue;
+                        const float dx = m[0] - f.cam_T[0], dy = m[1] - f.cam_T[1]; if (dx * dx + dy * dy < bd) { bd = dx * dx + dy * dy; bz = (std::min)(in.T[2], m[2]); } }
+                    if (bz < 1e29f) { const float fz = bz - 60.f;   /* on a slope it eases over, not jumps */
+                        floor_z = floor_z > 1e29f ? fz : floor_z + (fz - floor_z) * 0.08f; ceil_z = floor_z + 60.f + 8500.f; } }
+                for (const VPIX_Instance &in : f.inst) {
+                    bool straight, landing; const bool trk = is_track(in.handle, &straight, &landing);
+                    const bool ours = in.handle >= 0x7FF00000u; bool rider = false;
+                    if (!trk && !ours) { auto mf = model_files.find(in.handle); if (mf != model_files.end()) { std::string lo = mf->second; std::transform(lo.begin(), lo.end(), lo.begin(), ::tolower);
+                        rider = lo.find("cart") != std::string::npos || lo.find("weeman") != std::string::npos || lo.find("gun") != std::string::npos || lo.find("laser") != std::string::npos; } }
+                    if (trk || ours || rider) keep.push_back(in);
+                    if (!trk) continue;
+                    /* a stretch of hall on this piece: the floor at the rails, curtains both sides, the ceiling */
+                    const float dx = in.T[0] - f.cam_T[0], dy = in.T[1] - f.cam_T[1]; if (dx * dx + dy * dy > 90000.f * 90000.f) continue;
+                    float mid[3]; for (int c = 0; c < 3; c++) mid[c] = in.T[c] + (straight ? in.R[1][c] * 4500.f : 0.f);
+                    VPIX_Instance h = {}; h.light_mask = 1; h.prio = in.prio; for (int e = 0; e < 16; e++) h.pal[e] = h.palw[e] = 0xFFFFFF;
+                    if (floor_z > 1e29f) continue;
+                    if (fabsf(in.T[2] - (floor_z + 60.f)) > 1500.f) continue;   /* curtains only beside track at the cart's level */
+                    { const float l0 = sqrtf(in.R[0][0] * in.R[0][0] + in.R[0][1] * in.R[0][1]) + 1e-6f, l1 = sqrtf(in.R[1][0] * in.R[1][0] + in.R[1][1] * in.R[1][1]) + 1e-6f;
+                      h.R[0][0] = in.R[0][0] / l0; h.R[0][1] = in.R[0][1] / l0; h.R[0][2] = 0; h.R[1][0] = in.R[1][0] / l1; h.R[1][1] = in.R[1][1] / l1; h.R[1][2] = 0;
+                      h.R[2][0] = 0; h.R[2][1] = 0; h.R[2][2] = 1; }
+                    for (int q = 0; q < 3; q++) { h.S[q] = 1.f; h.T[q] = mid[q]; } h.T[2] = floor_z;
+                    h.S[2] = (ceil_z - floor_z) / 8500.f;   /* curtains floor to ceiling */
+                    /* the curtains stand 13 m either side of the RECORDED centre line, the same line the exhibits are set out from (10-30
+                       Bobby: "stuff on the right of the track is outside the wall and stuff on the left is inside"; "just widen the right
+                       side of the room"): the piece's own middle sits off that line, so the walls were off to one side */
+                    float off = 0.f;
+                    if (museum_line.size() > 1) { float bd = 12000.f * 12000.f; int bi = -1;
+                        for (size_t k = 0; k < museum_line.size(); k++) { const float ex2 = museum_line[k][0] - mid[0], ey2 = museum_line[k][1] - mid[1];
+                            if (fabsf(museum_line[k][2] - mid[2]) < 3000.f && ex2 * ex2 + ey2 * ey2 < bd) { bd = ex2 * ex2 + ey2 * ey2; bi = (int)k; } }
+                        if (bi >= 0) off = (museum_line[bi][0] - mid[0]) * h.R[0][0] + (museum_line[bi][1] - mid[1]) * h.R[0][1]; }
+                    for (int sd = -1; sd <= 1; sd += 2) { VPIX_Instance w = h; w.handle = HCURT; for (int q = 0; q < 2; q++) w.T[q] = h.T[q] + h.R[0][q] * (off + 13000.f * sd); hall.push_back(w); }
+                }
+                if (floor_z < 1e29f) {   /* the sheet: 10 x 10 floor quads (22 x 14 m each) round the rider, on the checker grid */
+                    VPIX_Instance h = {}; h.light_mask = 1; for (int e = 0; e < 16; e++) h.pal[e] = h.palw[e] = 0xFFFFFF;
+                    h.R[0][0] = 1; h.R[1][1] = 1; h.R[2][2] = 1; h.S[0] = h.S[1] = h.S[2] = 1.f;
+                    const float gx = floorf(f.cam_T[0] / 4800.f) * 4800.f, gy = floorf(f.cam_T[1] / 4800.f) * 4800.f;
+                    for (int a = -5; a < 5; a++) for (int b = -5; b < 5; b++) {
+                        h.T[0] = gx + (a + 0.5f) * 21600.f; h.T[1] = gy + (b + 0.5f) * 14400.f; h.T[2] = floor_z; h.handle = HFLOOR; hall.push_back(h);
+                        h.T[2] = ceil_z - 8500.f; h.handle = HCEIL; h.bright = 1; hall.push_back(h); h.bright = 0; }
+                }
+                f.inst.swap(keep); for (auto &h : hall) f.inst.push_back(h);
+                /* the game's lone "1" under the score (its place in the race: "a floaty black m under the score", Bobby 10-28) */
+                /* (and every other lone game letter, a "B" at the next ride): in the museum only the score (row 10) stays. The clock (rows
+                   ~200) went too 10-29 (Bobby: "the timer remains frozen at 19 sec maybe take that out": the museum holds it at 20 s) */
+                f.blits.erase(std::remove_if(f.blits.begin(), f.blits.end(), [&](const VPIX_Blit &b) { if (b.world || b.y <= 12) return false;
+                    auto bf = bitmap_files.find(b.handle); return bf != bitmap_files.end() && bf->second.find("newchars") != std::string::npos; }), f.blits.end());
+                f.blits.erase(std::remove_if(f.blits.begin(), f.blits.end(), [](const VPIX_Blit &b) { return b.world; }), f.blits.end());   /* sky flyers, bats, ghosts: outside things */
+                for (int c = 0; c < 3; c++) { f.fog_col[c] = 2; f.clear[c] = 2; }
+            }
+            /* the crawl, and time enough for it */
+            if (rd_f(my_cart + 0x37) > mall_sp) { uint32_t u; memcpy(&u, &mall_sp, 4); mem_writed(my_cart + 0x37, u); }
+            if (rd_f(my_cart + 0xD) < 20.f) { const float t = 20.f; uint32_t u; memcpy(&u, &t, 4); mem_writed(my_cart + 0xD, u); }
+            /* PIECE BY PIECE (Bobby 10-29: "maybe dont script it actually do it piece by piece", "just match things to the audio samples and
+               what they are about and do it right"; section 3 crosses over itself, so taking pieces by distance put rooms on pieces met much
+               later: Bobby "up in the sky"):
+               VPIX_TRACK_RECORD=<file> (dev): every track piece the cart rides over, in ride order: n, its middle x y z, straight 0/1,
+               level 0/1; the cart doesn't stop for anything.
+               VPIX_MUSEUM_ROOMS=<file> (events\phantom_freight\museum_rooms.txt) + VPIX_TRACK_FILE=<that record>: each line
+               "scene first last" = the record's pieces that scene's room stands on, chosen by hand; its exhibits go on them in ride order,
+               a pair per piece facing across the track (extra ones spread along the pieces), set out once at the start of the stage. */
+            static const char *trec = getenv("VPIX_TRACK_RECORD");
+            if (trec && *trec) {
+                static FILE *rf = nullptr; static uint64_t lastk = 0; static int nrec = 0; if (!rf) rf = fopen(trec, "w");
+                float bd = 7000.f * 7000.f; int bi = -1; float bm[3] = {0, 0, 0}; bool bs = false, bl = false;
+                for (size_t i = 0; i < f.inst.size(); i++) { bool st2, ld2; if (!is_track(f.inst[i].handle, &st2, &ld2)) continue;
+                    const VPIX_Instance &tp = f.inst[i]; float m[3]; for (int c = 0; c < 3; c++) m[c] = tp.T[c] + (st2 ? tp.R[1][c] * 4500.f : 0.f);
+                    if (fabsf(m[2] - (f.cam_T[2] - 1500.f)) > 4000.f) continue;
+                    const float dx = m[0] - f.cam_T[0], dy = m[1] - f.cam_T[1], d2 = dx * dx + dy * dy;
+                    if (d2 < bd) { bd = d2; bi = (int)i; for (int c = 0; c < 3; c++) bm[c] = m[c]; bs = st2;
+                        const float fl = sqrtf(tp.R[1][0] * tp.R[1][0] + tp.R[1][1] * tp.R[1][1] + tp.R[1][2] * tp.R[1][2]) + 1e-6f; bl = fabsf(tp.R[1][2] / fl) <= 0.035f; } }
+                if (bi >= 0 && rf) { const uint64_t k = key_of(f.inst[bi].T);
+                    /* the piece's own centre line: the curtains, floor and doors are built on it (the eye sits a seat to one side; corrected for that the pictures still floated off the curtains, 10-30) */
+                    if (k != lastk) { lastk = k; fprintf(rf, "%d %.0f %.0f %.0f %d %d\n", nrec++, bm[0], bm[1], bm[2], bs ? 1 : 0, bl ? 1 : 0); fflush(rf); } }
+            }
+            /* the rider sits to one side of the rails (the cart seats riders side by side: the eye ~1.2 m off the track's centre line;
+               Bobby 10-29: "tracks are still not matched with the door"): measured here from the nearest straight piece, toward the
+               cart's right, so the rooms and doors go on the RAILS */
+            static float rider_lat = 0.f; static bool rider_lat_ok = false;
+            static float mvd[2] = {0, 0};   /* the way the cart is really moving (from the eye's travel; the +0x13 heading can point backwards) */
+            {   /* the way the cart is moving, from the eye's own travel (the heading at +0x13/+0x17 came out reversed here: 10-29 the
+                   doors and rows went 1.2 m the wrong way) */
+                static float pc0[2] = {0, 0}; float *cf = mvd; static bool pcok = false; float l = 0.f;
+                { const float dx = f.cam_T[0] - pc0[0], dy = f.cam_T[1] - pc0[1], dd = sqrtf(dx * dx + dy * dy);
+                  if (!pcok) { pc0[0] = f.cam_T[0]; pc0[1] = f.cam_T[1]; pcok = true; }
+                  else if (dd > 600.f && dd < 20000.f) { cf[0] = dx / dd; cf[1] = dy / dd; pc0[0] = f.cam_T[0]; pc0[1] = f.cam_T[1]; }
+                  else if (dd >= 20000.f) { pc0[0] = f.cam_T[0]; pc0[1] = f.cam_T[1]; }
+                  l = sqrtf(cf[0] * cf[0] + cf[1] * cf[1]); }
+                if (l > 0.5f) { float bd = 6000.f * 6000.f; bool got = false; float lat = 0.f;
+                    for (const VPIX_Instance &in : f.inst) { bool st2, ld2; if (!is_track(in.handle, &st2, &ld2) || !st2) continue;
+                        float m[3]; for (int c = 0; c < 3; c++) m[c] = in.T[c] + in.R[1][c] * 4500.f;
+                        const float dx = m[0] - f.cam_T[0], dy = m[1] - f.cam_T[1]; if (dx * dx + dy * dy > bd || fabsf(m[2] - (f.cam_T[2] - 1500.f)) > 3000.f) continue;
+                        bd = dx * dx + dy * dy; got = true; lat = (f.cam_T[0] - m[0]) * cf[1] - (f.cam_T[1] - m[1]) * cf[0]; }
+                    if (got && fabsf(lat) < 2500.f) { rider_lat = rider_lat_ok ? rider_lat + (lat - rider_lat) * 0.1f : lat; rider_lat_ok = true; } } }
+            static const char *rooms_f = getenv("VPIX_MUSEUM_ROOMS"), *track_f = getenv("VPIX_TRACK_FILE");
+            static bool rooms_mode = false;
+            if (slots.empty() && rooms_f && *rooms_f && track_f && *track_f && !(trec && *trec)) {
+                std::vector<std::array<float, 3>> pc; { FILE *fp = fopen(track_f, "r"); int n, s, l; float x, y, z;
+                    if (fp) { while (fscanf(fp, "%d %f %f %f %d %d", &n, &x, &y, &z, &s, &l) == 6) pc.push_back({x, y, z}); fclose(fp); } }
+                museum_line = pc;
+                std::map<int, std::pair<int, int>> rr; { FILE *fp = fopen(rooms_f, "r"); char ln[256];
+                    if (fp) { while (fgets(ln, sizeof(ln), fp)) { int sc, a, b; if (ln[0] != '#' && sscanf(ln, "%d %d %d", &sc, &a, &b) == 3) rr[sc] = {a, b}; } fclose(fp); } }
+                bool ok = pc.size() > 2 && !rr.empty();
+                /* VPIX_MUSEUM_PLACE (museum_place.txt, gen_museum_place.py, Bobby 10-30 "do each by hand"): each exhibit's own spot
+                   "index pos side lat turn" (pieces along, -1/+1, mm from the centre line, degrees toward the cart) */
+                struct Pl { float pos, side, lat, turn, wid = 0.f; }; std::map<int, Pl> place;
+                if (const char *pf = getenv("VPIX_MUSEUM_PLACE")) { FILE *fp = fopen(pf, "r"); char ln[512];
+                    if (fp) { while (fgets(ln, sizeof(ln), fp)) { int ix; Pl q; if (ln[0] != '#' && sscanf(ln, "%d %f %f %f %f %f", &ix, &q.pos, &q.side, &q.lat, &q.turn, &q.wid) >= 5) place[ix] = q; } fclose(fp); } }
+                std::vector<Slot> built;
+                for (size_t i0 = 0; ok && i0 < ex.size(); ) {
+                    const int sc = ex[i0].scene; size_t i1 = i0; while (i1 < ex.size() && ex[i1].scene == sc) i1++;
+                    auto it = rr.find(sc); if (it == rr.end() || it->second.first < 0 || it->second.second >= (int)pc.size() - 1 || it->second.second < it->second.first) { ok = false; break; }
+                    const int a = it->second.first, b = it->second.second, np = b - a + 1; const size_t n = i1 - i0;
+                    /* the 3D pieces in the rows; the pictures, boards and signs ('w') hung big on the curtain walls, apart from them (Bobby
+                       10-29: "all museum pictures can be big on the wall ... then all the 3d items would have more space") */
+                    std::vector<size_t> objs, pics; for (size_t k = 0; k < n; k++) (ex[i0 + k].kind == 'w' ? pics : objs).push_back(k);
+                    bool room_bb = false, room_b = false, room_k = !objs.empty();
+                    for (size_t k : objs) { const Ex &q = ex[i0 + k]; if (q.kind == 'b') { room_b = true; if (q.name.rfind("MALL_STORE", 0) == 0) room_bb = true; } if (q.kind != 'k') room_k = false; }
+                    /* store fronts are 8 m wide: a whole piece between neighbours; arcade cabinets are narrow: 4 m apart (the spare floor at
+                       the entrance); everything else ~5 m, packed toward the room's EXIT (you see them longest there), zig-zagged so nothing
+                       stands straight across from or in front of anything (Bobby 10-29) */
+                    const int m = (int)((objs.size() + 1) / 2); const float step = m ? (std::min)((float)np / (float)m, room_bb ? 1.f : room_k ? 0.45f : 0.6f) : 1.f;
+                    std::vector<Slot> part(n);
+                    for (size_t k = 0; k < n; k++) {
+                        const Ex &xe = ex[i0 + k]; const bool wall = xe.kind == 'w';
+                        size_t r = 0; float pos, side, lat;
+                        if (!wall) { while (objs[r] != k) r++;
+                            pos = a + np - (room_b ? (std::min)(0.35f, (std::max)(0.f, np - m * step)) : 0.f) - (m - (r / 2) - 0.5f) * step + (room_bb ? 0.f : (r % 2) ? 0.25f : -0.25f) * step;
+                            side = (r % 2) ? 1.f : -1.f;
+                            const bool pod = xe.kind == 'p' && (xe.name.rfind("POD_", 0) == 0 || xe.name.rfind("SU3000", 0) == 0);
+                            lat = xe.kind == 'b' ? 6500.f : pod ? 6500.f : xe.kind == 'c' ? 4500.f : xe.kind == 's' ? 5000.f : 5500.f;
+                            /* one distance for a whole room, the farthest its pieces need, so from the cart nothing stands in front of
+                               anything (Bobby 10-29: "no item should be in front of another item from the point of view of the train cart
+                               ... dont stack"); the rotunda keeps its people in front ("unless its people in that rotunda area") */
+                            if (sc != 2) for (size_t q : objs) { const Ex &o = ex[i0 + q]; const bool pd = o.kind == 'p' && (o.name.rfind("POD_", 0) == 0 || o.name.rfind("SU3000", 0) == 0);
+                                lat = (std::max)(lat, o.kind == 'b' ? 6500.f : pd ? 6500.f : o.kind == 'c' ? 4500.f : o.kind == 's' ? 5000.f : 5500.f); }
+                            /* every other piece on a side 1.5 m further back, so neighbours don't line up one behind the other from the cart
+                               (Bobby 10-29: "all the rooms have the items directly in front of each other blocking name plates"); not the
+                               store fronts (they need the room) */
+                            if (!room_bb && ((r / 2) % 2)) lat += 2500.f; }
+                        else { while (pics[r] != k) r++;   /* evenly along the room, sides alternating, on the curtains */
+                            pos = a + (r + 0.5f) * (float)np / (float)pics.size(); side = (r % 2) ? -1.f : 1.f; lat = 10850.f; }   /* 15 cm off the curtain */
+                        float tw_hand = -1.f, pw = 0.f;
+                        { auto pi = place.find((int)(i0 + k)); if (pi != place.end()) { pos = pi->second.pos; side = pi->second.side; lat = pi->second.lat; tw_hand = pi->second.turn * 0.0174533f; pw = pi->second.wid; } }
+                        const int p = (std::max)(0, (std::min)((int)pc.size() - 2, (int)pos)); const float frac = pos - p;
+                        float Fh[2] = {pc[p + 1][0] - pc[p][0], pc[p + 1][1] - pc[p][1]}; { const float l = sqrtf(Fh[0] * Fh[0] + Fh[1] * Fh[1]) + 1e-6f; Fh[0] /= l; Fh[1] /= l; }
+                        const float Rt[2] = {Fh[1], -Fh[0]};
+                        /* the record is the rider's eye: back across to the rails */
+                        const float L[3] = {pc[p][0] + (pc[p + 1][0] - pc[p][0]) * frac, pc[p][1] + (pc[p + 1][1] - pc[p][1]) * frac, pc[p][2]};   /* the record is the track's centre line */
+                        Slot sl; sl.pw = pw; sl.P[0] = L[0] + Rt[0] * lat * side; sl.P[1] = L[1] + Rt[1] * lat * side; sl.P[2] = L[2];
+                        /* turned ~25 deg toward the cart coming up the hall, so each piece and its plaque read on the way in (pictures and store
+                           fronts square to the track) */
+                        { const float tw = tw_hand >= 0.f ? tw_hand : (wall || room_bb) ? 0.f : 0.61f;   /* 35 deg (or the hand placement's) */
+                          sl.face[0] = -Rt[0] * side * cosf(tw) - Fh[0] * sinf(tw); sl.face[1] = -Rt[1] * side * cosf(tw) - Fh[1] * sinf(tw); }
+                        sl.fwd[0] = Fh[0]; sl.fwd[1] = Fh[1];
+                        for (int c = 0; c < 3; c++) sl.M[c] = L[c]; sl.rl = 4500.f;
+                        {   /* the room's entrance: half a piece before its first piece, on the rails */
+                            float Fa[2] = {pc[a + 1][0] - pc[a][0], pc[a + 1][1] - pc[a][1]}; const float la = sqrtf(Fa[0] * Fa[0] + Fa[1] * Fa[1]) + 1e-6f; Fa[0] /= la; Fa[1] /= la;
+                            sl.E[0] = pc[a][0] - Fa[0] * 4500.f; sl.E[1] = pc[a][1] - Fa[1] * 4500.f; sl.E[2] = pc[a][2]; sl.has_e = true; }
+                        part[k] = sl; }
+                    for (const Slot &sl : part) built.push_back(sl);
+                    i0 = i1; }
+                if (ok && built.size() == ex.size()) { slots.swap(built); rooms_mode = true; lg("HLE: VPIX_MUSEUM_ROOMS %s: %u pieces set out by hand on %u recorded track pieces", rooms_f, (unsigned)slots.size(), (unsigned)pc.size()); }
+                else { static bool warned = false; if (!warned) { warned = true; lg("HLE: VPIX_MUSEUM_ROOMS ** not used (track %u pieces, %u room lines): the automatic layout", (unsigned)pc.size(), (unsigned)rr.size()); } }
+            }
+            /* claim the track pieces ahead, nearest first, two slots each (left, right) */
+            const float *fw = f.cam_R[1];
+            std::vector<std::pair<float, size_t>> fresh;
+            for (size_t i = 0; i < f.inst.size(); i++) { bool straight, landing;
+                if (!is_track(f.inst[i].handle, &straight, &landing) || claimed.count(key_of(f.inst[i].T))) continue;
+                const float d[3] = {f.inst[i].T[0] - f.cam_T[0], f.inst[i].T[1] - f.cam_T[1], f.inst[i].T[2] - f.cam_T[2]};
+                const float dist = sqrtf(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+                if (dist < 45000.f && d[0] * fw[0] + d[1] * fw[1] > 0.f) fresh.push_back({dist, i}); }
+            std::sort(fresh.begin(), fresh.end());
+            for (auto &fr : fresh) {
+                const VPIX_Instance &tp = f.inst[fr.second]; bool straight, landing; is_track(tp.handle, &straight, &landing);
+                if (!station_ok) { station_ok = true; station = tp; }   /* the orb hallway runs on from here */
+                if (slots.size() >= ex.size()) break;   /* (by hand, VPIX_MUSEUM_ROOMS: all set out already) */
+                claimed.insert(key_of(tp.T));
+                /* exhibits only beside level track (Bobby 10-29: "bobby the host is like half way down that hill so move him further
+                   along in the flat so we see him better"): a sloping piece gets none */
+                { const float fl = sqrtf(tp.R[1][0] * tp.R[1][0] + tp.R[1][1] * tp.R[1][1] + tp.R[1][2] * tp.R[1][2]) + 1e-6f;
+                  if (fabsf(tp.R[1][2] / fl) > 0.035f) continue; }
+                float mid[3]; for (int c = 0; c < 3; c++) mid[c] = tp.T[c] + (straight ? tp.R[1][c] * 4500.f : 0.f);
+                /* SCENES AS ROOMS, on section 3 (Bobby 10-29: "Scenes as rooms", "Yes, use section 3", "some of those rooms can be
+                   lengthened so you dont have to put a back row of exhibits behind another", "seemed a little packed in"): a room is a run
+                   of level track pieces, one pair of exhibits per piece facing each other across the track (5.5 m out, one row each side,
+                   following the track's own bends so nothing ends up in the walls); store buildings one per piece, sides alternating.
+                   One bare piece between rooms holds the doors. A scene's pieces never share a piece with the next scene. */
+                {   static int gap_for = -1;   /* the scene whose room ended: the next level piece stays bare (its doors) */
+                    if (slots.empty()) gap_for = -1;
+                    const size_t i0 = slots.size(); const int sc0 = ex[i0].scene;
+                    /* the orb hallway's run (7-50 m on from the station, its line) stays clear of rooms (10-29: the fountain and a door guard
+                       stood inside the orb hall); the station's own cabinets sit on the station piece */
+                    if (sc0 >= 1 && station_ok) { const float d[3] = {tp.T[0] - station.T[0], tp.T[1] - station.T[1], tp.T[2] - station.T[2]};
+                        const float al = d[0] * station.R[1][0] + d[1] * station.R[1][1] + d[2] * station.R[1][2], la = d[0] * station.R[0][0] + d[1] * station.R[0][1] + d[2] * station.R[0][2];
+                        if (al > 3000.f && al < 54000.f && fabsf(la) < 1500.f && fabsf(d[2]) < 2500.f) continue; }
+                    if (i0 > 0 && ex[i0 - 1].scene != sc0 && gap_for != sc0) { gap_for = sc0; continue; }
+                    float Fh[2] = {tp.R[1][0], tp.R[1][1]}, Rt[2] = {tp.R[0][0], tp.R[0][1]};
+                    { const float l = sqrtf(Fh[0] * Fh[0] + Fh[1] * Fh[1]) + 1e-6f, l2 = sqrtf(Rt[0] * Rt[0] + Rt[1] * Rt[1]) + 1e-6f; Fh[0] /= l; Fh[1] /= l; Rt[0] /= l2; Rt[1] /= l2; }
+                    const bool bld = ex[i0].kind == 'b';
+                    int take = bld ? 1 : (i0 + 1 < ex.size() && ex[i0 + 1].scene == sc0 && ex[i0 + 1].kind != 'b') ? 2 : 1;
+                    if (ex[i0].kind == 'e') { take = 0; for (size_t j = i0; j < ex.size() && ex[j].scene == sc0; j++) take++; }   /* the station: all its cabinets on its piece */
+                    for (int k = 0; k < take; k++) {
+                        const size_t ii = slots.size();
+                        const float side = bld ? ((ii % 2) ? 1.f : -1.f) : (k % 2 ? 1.f : -1.f), lat = bld ? 6500.f : 5500.f;
+                        const float al = (take > 2) ? (k / 2 - (take - 1) / 4.f) * 3000.f : 0.f;   /* 3+ on one piece (the station): spread along it */
+                        Slot sl; sl.P[0] = mid[0] + Rt[0] * lat * side + Fh[0] * al; sl.P[1] = mid[1] + Rt[1] * lat * side + Fh[1] * al; sl.P[2] = mid[2];
+                        sl.face[0] = -Rt[0] * side; sl.face[1] = -Rt[1] * side; sl.fwd[0] = Fh[0]; sl.fwd[1] = Fh[1];
+                        for (int c = 0; c < 3; c++) sl.M[c] = mid[c]; sl.rl = 4500.f;
+                        slots.push_back(sl); }
+                    if (slots.size() == ex.size() || ex[slots.size()].scene != sc0) lg("HLE: VPIX_MALLRIDE room for scene %d done (%u placed)", sc0, (unsigned)slots.size());
+                }
+            }
+            /* in a room = within 12 m of any exhibit, on its level: the guns hold fire there, so nobody shoots the statues of people
+               (Bobby 10-29) and the trigger pops the BANG! flag */
+            {   bool in = false;
+                for (const Slot &sl : slots) { const float dx = sl.P[0] - f.cam_T[0], dy = sl.P[1] - f.cam_T[1];
+                    if (dx * dx + dy * dy < 12000.f * 12000.f && fabsf(sl.P[2] - (f.cam_T[2] - 1500.f)) < 3000.f) { in = true; break; } }
+                mall_in_room = in; }
+            /* scenes reached (within 14 m of the scene's first exhibit) -> narration */
+            /* one scene at a time, in order (Bobby 10-28: "seemed like all the audio clips played at once as i got in there"): the
+               scenes sit close together, so several came within 14 m in the same frame and every narration started. Now only the next
+               scene (reached + 1) can start, once the line before it has finished, when the cart is near it or already past it. */
+            static unsigned long long narr_free_at = 0;
+            /* THE ANIMATRONIC HOST (Bobby 10-29: "how you had bobby look at riders and talk ... sub in my voice", "like the animatronics
+               at disney rides"): when the narrator's line for a scene with a BOBBY_<scene>.wav ends, Bobby's figure (already turned to
+               face the rider) says his own line; the cart holds until he's done and he nods / sways with the loudness of the words. */
+            static int bob_sc = -1; static unsigned long long bob_t0 = 0, bob_until = 0; static bool bob_done[16] = {false}; float bob_amp = 0.f;
+            if (reached < 0) for (bool &bd : bob_done) bd = false;   /* every ride he talks again */
+            if (bob_ready && reached > 0 && reached < 16 && !bob_done[reached] && !bob_says[reached].pcm.empty() && narr_ready && reached < (int)narr.size()
+                && now >= reached_at[reached] + narr[reached].pcm.size() * 1000ull / 22050 + 400) {
+                bob_done[reached] = true; bob_sc = reached; bob_t0 = now; bob_until = now + bob_says[reached].pcm.size() * 1000ull / 22050;
+                for (int v = 31; v >= 0; v--) if (!voices[v].on) { voices[v] = VVoice(); voices[v].s = &bob_says[reached]; voices[v].vol = 127; voices[v].on = true; break; }
+                duck_to = 0.12f; narr_free_at = (std::max)(narr_free_at, bob_until + 700); lg("HLE: VPIX_MALLRIDE Bobby speaks (scene %d)", reached);
+            }
+            if (now < bob_until && bob_sc >= 0) {   /* how loud he is right now (RMS of the next ~40 ms) -> 0..1 */
+                const std::vector<int16_t> &pc = bob_says[bob_sc].pcm; const size_t i0 = (size_t)((now - bob_t0) * 22050ull / 1000ull);
+                double acc = 0; size_t nn = 0; for (size_t k = i0; k < i0 + 900 && k < pc.size(); k++, nn++) acc += (double)pc[k] * pc[k];
+                bob_amp = nn ? (std::min)(1.f, (float)sqrt(acc / nn) / 9000.f) : 0.f;
+            } else if (bob_sc >= 0 && now >= bob_until + 300 && duck_to < 0.2f) duck_to = 0.45f;
+            /* the cart held at a room's entrance (the wait below) for 3 s with nothing said: that room's line starts anyway (10-30 ride: it
+               stood at the Simon room's door for minutes, no voice) */
+            static unsigned long long wait_since = 0; static int wait_sc = -1;
+            /* only once the line before has finished (10-30 self-test: held 3 s at the hosts' door with the station's line 8 s from its
+               end, it went on in: the cart left the thank-you sign and ran up to Bobby mid-line, "it sped up right to bobby") */
+            const bool force_in = wait_sc == reached + 1 && wait_since && now - wait_since > 3000 && now >= bob_until + 600 && now + 300 >= narr_free_at;
+            if (force_in) { static int nf = 0; if (nf++ < 20) lg("HLE: VPIX_MALLRIDE scene %d forced in (held %llu ms, line free in %lld ms)", wait_sc, now - wait_since, (long long)narr_free_at - (long long)now); }
+            if (now >= narr_free_at || force_in) for (size_t i = 0; i < slots.size(); i++) {
+                const int sc = ex[i].scene; if (sc != reached + 1 || sc >= 16) continue;
+                /* the line starts when the cart is BESIDE the scene's first piece (3 m short of it along the track, where it stops), not
+                   14 m out: the cart stops for the line, so 14 m early it stood at the piece before (Bobby 10-29: "audio talks about the
+                   exibit at the next stop so its off by one") */
+                const float dx = slots[i].M[0] - f.cam_T[0], dy = slots[i].M[1] - f.cam_T[1];   /* rooms: as the cart comes into the room */
+                float cf[2] = {mvd[0], mvd[1]};   /* the real travel direction (with the stored heading the arcade's line started 15 m early, 10-29) */
+                if (cf[0] * cf[0] + cf[1] * cf[1] < 0.25f && !force_in) break;
+                if (force_in || (dx * cf[0] + dy * cf[1] < (sc == 1 ? 5500.f : 3000.f) && dx * dx + dy * dy < 15000.f * 15000.f && fabsf(slots[i].M[2] - (f.cam_T[2] - 1500.f)) < 3000.f)) {   /* beside it, on its level (section 3 has four) */
+                    wait_since = 0; wait_sc = -1;
+                    reached = sc; reached_at[sc] = now; lg("HLE: VPIX_MALLRIDE scene %d", sc);
+                    narr_free_at = now + 1500;
+                    if (narr_ready && sc < (int)narr.size()) {
+                        for (int v = 31; v >= 0; v--) if (!voices[v].on) { voices[v] = VVoice(); voices[v].s = &narr[sc]; voices[v].vol = 127; voices[v].on = true; break; }
+                        duck_to = 0.12f; narr_free_at = now + narr[sc].pcm.size() * 1000ull / 22050 + 700;
+                    }
+                    break;
+                }
+            }
+            if (reached >= 0 && reached < (int)narr.size() && narr_ready && now - reached_at[reached] > narr[reached].pcm.size() * 1000ull / 22050 + 500) duck_to = 0.45f;   /* subtle music between lines (Bobby 10-28) */
+            /* the hosts (scene 1: Bobby + Static) hold the cart still for 7 s (Bobby 10-28: "maybe have it stop on the model of me at the
+               start for a bit") */
+            /* the ride drives itself (Bobby 10-28 ride 5: "take over cart control when we get to this section ... we pass it to fast"):
+               a steady crawl whatever the stick or brake say, and a stop in front of the next scene's first exhibit until that
+               scene's line has started (the line before it may still be playing), so every piece is talked about while you face it */
+            {   float want = mall_sp;
+                float cfw[2] = {mvd[0], mvd[1]};   /* the real travel direction */
+                for (size_t i = 0; i < slots.size() && i < ex.size(); i++) if (ex[i].scene == reached + 1) {
+                    const float dx = slots[i].M[0] - f.cam_T[0], dy = slots[i].M[1] - f.cam_T[1], along = dx * cfw[0] + dy * cfw[1];
+                    /* the hosts' room stops a few metres short, Bobby ahead of the cart (Bobby 10-30: "make it stop a little before so bobbys
+                       sort of in front of the cart") */
+                    if (along < (reached + 1 == 1 ? 5000.f : 2500.f) && along > -4500.f && dx * dx + dy * dy < 15000.f * 15000.f && fabsf(slots[i].M[2] - (f.cam_T[2] - 1500.f)) < 3000.f) {
+                        want = 0.f; if (wait_sc != reached + 1) { wait_sc = reached + 1; wait_since = now;
+                            lg("HLE: VPIX_MALLRIDE held for scene %d (along %.0f, line free in %lld ms, mvd %.2f %.2f)", wait_sc, along, (long long)narr_free_at - (long long)now, cfw[0], cfw[1]); } }   /* waits just inside the room (the line starts at 3 m, so it always can) */
+                    break; }
+                /* while a scene is being talked about (its line, the host's 7 s, Bobby speaking) the cart creeps up to the piece and stops
+                   level with it, so it arrives as the words do (Bobby 10-29: "make it stop at bobby for the bobby reading part or slowly
+                   track in and get right to bobby by the time hes done talking", "make sure my cart is near the attraction we are talking
+                   about for audio clip"); it never rolls on past while anything is said */
+                const bool speaking = (reached == 1 && now - reached_at[1] < 7000) || now < bob_until + 600
+                    || (reached >= 0 && narr_ready && reached < (int)narr.size() && now - reached_at[reached] < narr[reached].pcm.size() * 1000ull / 22050 + 500);
+                if (speaking) { want = 0.f;
+                    size_t i0 = slots.size(), i1 = 0;   /* the room's first and last placed pieces: on to its middle */
+                    for (size_t i = 0; i < slots.size() && i < ex.size(); i++) if (ex[i].scene == reached) { if (i0 == slots.size()) i0 = i; i1 = i; }
+                    if (i0 < slots.size()) { const size_t im = reached == 1 ? i0 : (i0 + i1) / 2;   /* the hosts: up to Bobby, not past him */
+                        const float dx = slots[im].M[0] - f.cam_T[0], dy = slots[im].M[1] - f.cam_T[1], along = dx * cfw[0] + dy * cfw[1];
+                        if (along > (reached == 1 ? 4000.f : 400.f)) want = mall_sp * 0.25f; } }
+                if (trec && *trec) want = mall_sp * 2.f;   /* VPIX_TRACK_RECORD: one steady run through the section */
+                if (end_t0 && now - end_t0 < 41000ull) want = 0.f;   /* the ending: the cart waits in the tunnel; at its end it rolls again (a parked cart never hit game over, 10-29 test) */
+                if (end_t0 && now - end_t0 >= 41000ull) want = mall_sp * 6.f;   /* then off quickly to the section's end, never left floating in the cyberspace (10-29: "it just hangs") */
+                /* out of track (10-29 full ride: the museum's 72 pieces need far more level track than its section has; the tour stopped at
+                   scene 3 and the ending never came): once the cart is past the last piece that found a place, nothing new has found one
+                   for 3 s and nothing is being said, the ending starts anyway */
+                {   static size_t last_n = 0; static unsigned long long grow_ms = 0;
+                    if (slots.size() != last_n) { last_n = slots.size(); grow_ms = now; }
+                    if (end_es == 1 && !end_t0 && !speaking && reached >= 1 && !slots.empty() && slots.size() < ex.size() && now - grow_ms > 3000) {
+                        const float dx = slots.back().M[0] - f.cam_T[0], dy = slots.back().M[1] - f.cam_T[1];
+                        if (dx * cfw[0] + dy * cfw[1] < -(slots.back().rl + 3000.f)) { end_t0 = now; lg("HLE: VPIX_ENDING starts (out of museum track: %u of %u pieces placed, scene %d)", (unsigned)slots.size(), (unsigned)ex.size(), reached); } } }
+                uint32_t u; memcpy(&u, &want, 4); mem_writed(my_cart + 0x37, u); }
+            /* the end: with the clock held up (VPIX_FLOOR_STAGES) the ride never ran out, so it never ended (Bobby 10-28: "i had to x
+               out of the window to close"): 12 s after the last scene's line starts, the clock goes to 0 -> the game's own game over,
+               end song and initials. The floor only lifts a clock that is still above 0, so it stays at 0.
+               With VPIX_ENDING the ending runs first (below) and sets the clock to 0 when it's over. */
+            { int last_sc = 0; for (const auto &e : ex) last_sc = (std::max)(last_sc, e.scene);
+              if (reached >= last_sc && last_sc > 0 && now - reached_at[last_sc] > 1000ull + (narr_ready && last_sc < (int)narr.size() ? narr[last_sc].pcm.size() * 1000ull / 22050 : 12000ull) && now > bob_until + 600 && (bob_says[last_sc].pcm.empty() || bob_done[last_sc]) && rd_f(my_cart + 0xD) > 0.f) {   /* and after Bobby's goodbye (10-29: it skipped him) */
+                  if (end_es == 1) { if (!end_t0) { end_t0 = now; lg("HLE: VPIX_ENDING starts"); } }
+                  else { const float z = 0.f; uint32_t u; memcpy(&u, &z, 4); mem_writed(my_cart + 0xD, u); lg("HLE: VPIX_MALLRIDE end of the tour: time 0"); } } }
+            /* lighting: the dark station until scene 1, then warm and clear */
+            if (reached < 1) { for (int c = 0; c < 3; c++) { f.fog_col[c] = 4; f.clear[c] = 4; } f.fog_start *= 0.6f; f.fog_end *= 0.6f; }
+            else { const float u = (std::min)(1.f, (now - reached_at[1]) / 3000.f);
+                const uint8_t warm[3] = {6, 5, 8};   /* the warehouse stays dark (Bobby 10-28: "make it dark and spotlight the item") */
+                for (int c = 0; c < 3; c++) { f.fog_col[c] = (uint8_t)(4 + (warm[c] - 4) * u); f.clear[c] = f.fog_col[c]; }
+                f.fog_start *= 1.f + 1.5f * u; f.fog_end *= 1.f + 1.5f * u; }
+            /* indoors: the haze far back (10-29: the 1.5-16 m outdoor fog faded every exhibit a few metres off into the black hall) */
+            f.fog_start = (std::max)(f.fog_start, 25000.f); f.fog_end = (std::max)(f.fog_end, 80000.f);
+            /* THE ORB HALLWAY (Bobby 10-28: "the mall vr scene in our sitcom can be a tunnel or hallway in the game, the glowing mall
+               with the orbs", "just as an entrance to our real mall"; art: events\phantom_freight\make_orb_hallway.py, VPIX_ORB_HALL):
+               the sitcom's cyberspace mall (EP01 beat b05) wraps the straight run after the dark station (the pieces 7-50 m on, on its
+               line): a neon wireframe grid floor 15 m wide, pastel flat-shaded storefront blocks with neon edges down both sides,
+               chrome mirror-ball orbs floating and turning overhead, pastel cubes and prisms tumbling, and at the far end a "WELCOME TO
+               STARLITE COMMONS" arch. Inside it the world is a black void (only the neon, orbs and sign glow); past the arch the warm
+               mall light comes up. All drawn lit from within. */
+            {
+                static const char *ohd = getenv("VPIX_ORB_HALL"); static int ohs = 0;
+                const uint32_t HFLOOR = 0x7FFF1240u, HWALL = 0x7FFF1241u, HORB = 0x7FFF1244u, HCUBE = 0x7FFF1245u, HPRISM = 0x7FFF1246u, HARCH = 0x7FFF1247u;
+                const uint32_t TGRID = 0x7FFD0640u, TORB = 0x7FFD0641u, TARCH = 0x7FFD0642u;
+                if (ohs == 0) { ohs = -1;
+                    if (ohd && *ohd) {
+                        int nt = 0; const char *tn[3] = {"GRID", "ORB", "ARCH"};
+                        for (int k = 0; k < 3; k++) { FILE *fp = fopen((std::string(ohd) + "\\" + tn[k] + ".rgba").c_str(), "rb"); int32_t wh[2] = {0, 0};
+                            if (fp && fread(wh, 4, 2, fp) == 2 && wh[0] > 0 && wh[1] > 0 && wh[0] <= 2048 && wh[1] <= 2048) { std::vector<uint32_t> px((size_t)wh[0] * wh[1]);
+                                if (fread(px.data(), 4, px.size(), fp) == px.size() && VPIX_Render_AddTextureRGBA(TGRID + (uint32_t)k, wh[0], wh[1], px.data())) nt++; }
+                            if (fp) fclose(fp); }
+                        auto quadt = [](std::vector<float> &v, std::vector<VPIX_MeshPoly> &ps, const float c[4][3], const float uv[4][2], uint32_t tex, float nx, float ny, float nz) {
+                            const uint32_t b = (uint32_t)(v.size() / 3); VPIX_MeshPoly q; q.n = 4;
+                            for (int k = 0; k < 4; k++) { v.push_back(c[k][0]); v.push_back(c[k][1]); v.push_back(c[k][2]); q.idx[k] = b + (uint32_t)k; q.uv[k][0] = uv[k][0]; q.uv[k][1] = uv[k][1]; }
+                            q.flags = 0x20FFFFFF; q.tex = tex; q.nx = nx; q.ny = ny; q.nz = nz; ps.push_back(q); };
+                        auto boxc = [](std::vector<float> &v, std::vector<VPIX_MeshPoly> &ps, float x0, float x1, float y0, float y1, float z0, float z1, uint32_t col) {
+                            const uint32_t b = (uint32_t)(v.size() / 3);
+                            const float c[8][3] = {{x0, y0, z0}, {x1, y0, z0}, {x1, y1, z0}, {x0, y1, z0}, {x0, y0, z1}, {x1, y0, z1}, {x1, y1, z1}, {x0, y1, z1}};
+                            for (auto &q : c) { v.push_back(q[0]); v.push_back(q[1]); v.push_back(q[2]); }
+                            const int f6[6][4] = {{0, 1, 5, 4}, {1, 2, 6, 5}, {2, 3, 7, 6}, {3, 0, 4, 7}, {4, 5, 6, 7}, {3, 2, 1, 0}};
+                            const float nn[6][3] = {{0, -1, 0}, {1, 0, 0}, {0, 1, 0}, {-1, 0, 0}, {0, 0, 1}, {0, 0, -1}};
+                            for (int fi = 0; fi < 6; fi++) { VPIX_MeshPoly q; q.n = 4; for (int k = 0; k < 4; k++) q.idx[k] = b + (uint32_t)f6[fi][k];
+                                q.flags = 0x20000000 | col; q.nx = nn[fi][0]; q.ny = nn[fi][1]; q.nz = nn[fi][2]; ps.push_back(q); } };
+                        {   /* the grid floor: 10 x 6 tiles of 1.5 m, piece space, centred on the piece's middle */
+                            std::vector<float> v; std::vector<VPIX_MeshPoly> ps; const float uv[4][2] = {{0, 0}, {1, 0}, {1, 1}, {0, 1}};
+                            for (int i = 0; i < 10; i++) for (int j = 0; j < 6; j++) { const float x0 = -7500.f + i * 1500.f, y0 = -4500.f + j * 1500.f;
+                                const float c[4][3] = {{x0, y0, -30}, {x0 + 1500, y0, -30}, {x0 + 1500, y0 + 1500, -30}, {x0, y0 + 1500, -30}}; quadt(v, ps, c, uv, TGRID, 0, 0, 1); }   /* 3 cm over the checkered floor (-60): the same height flickered, 10-29 */
+                            VPIX_Render_AddMesh(HFLOOR, v, ps); }
+                        /* three storefront wall segments (the right side; the left is the same turned round): pastel blocks with neon edges,
+                           fronts at x 0 facing the track (-x), 9 m long. Colours 0xBBGGRR */
+                        static const uint32_t pastel[6] = {0xC2B6F4, 0x8AE3FC, 0xC4E79B, 0xE1B1C3, 0xA2C8FF, 0xEFD8A0}, neon[3] = {0xDC3CFF, 0xFFE63C, 0x3CF0FF};
+                        for (int w = 0; w < 3; w++) { std::vector<float> v; std::vector<VPIX_MeshPoly> ps;
+                            for (int b = 0; b < 3; b++) { const float y0 = -4400.f + b * 2950.f, y1 = y0 + 2750.f, h = 2600.f + ((w * 3 + b) * 1700 % 3000);
+                                boxc(v, ps, 0, 2200, y0, y1, -60, h, pastel[(w * 3 + b) % 6]);
+                                const uint32_t nc = neon[(w + b) % 3];
+                                boxc(v, ps, -80, 0, y0, y1, h - 160, h, nc);                 /* the neon edge along the top */
+                                boxc(v, ps, -80, 0, y0, y0 + 120, -60, h, nc); boxc(v, ps, -80, 0, y1 - 120, y1, -60, h, nc);   /* and down the sides */
+                                if ((w + b) % 2) boxc(v, ps, -40, 0, y0 + 600, y1 - 600, 400, h - 700, 0x281408); }   /* a dark doorway */
+                            VPIX_Render_AddMesh(HWALL + (uint32_t)w, v, ps); }
+                        {   /* the orb: a sphere of radius 1000 wearing the mirror-ball picture */
+                            std::vector<float> v; std::vector<VPIX_MeshPoly> ps; const int NA = 12, NO = 20;
+                            for (int i = 0; i < NA; i++) for (int j = 0; j < NO; j++) { float c[4][3], uv[4][2]; const int ii[4] = {i, i + 1, i + 1, i}, jj[4] = {j, j, j + 1, j + 1};
+                                float n[3] = {0, 0, 0};
+                                for (int k = 0; k < 4; k++) { const float th = 3.14159265f * ii[k] / NA, ph = 6.2831853f * jj[k] / NO;
+                                    c[k][0] = 1000.f * sinf(th) * cosf(ph); c[k][1] = 1000.f * sinf(th) * sinf(ph); c[k][2] = 1000.f * cosf(th);
+                                    uv[k][0] = (float)jj[k] / NO; uv[k][1] = 1.f - (float)ii[k] / NA; for (int q = 0; q < 3; q++) n[q] += c[k][q] / 4000.f; }
+                                quadt(v, ps, c, uv, TORB, n[0], n[1], n[2]); }
+                            VPIX_Render_AddMesh(HORB, v, ps); }
+                        {   std::vector<float> v; std::vector<VPIX_MeshPoly> ps;   /* a pastel cube, 1.2 m, each face its own colour */
+                            const float a = 600.f; const float c8[8][3] = {{-a, -a, -a}, {a, -a, -a}, {a, a, -a}, {-a, a, -a}, {-a, -a, a}, {a, -a, a}, {a, a, a}, {-a, a, a}};
+                            for (auto &q : c8) { v.push_back(q[0]); v.push_back(q[1]); v.push_back(q[2]); }
+                            const int f6[6][4] = {{0, 1, 5, 4}, {1, 2, 6, 5}, {2, 3, 7, 6}, {3, 0, 4, 7}, {4, 5, 6, 7}, {3, 2, 1, 0}};
+                            const float nn[6][3] = {{0, -1, 0}, {1, 0, 0}, {0, 1, 0}, {-1, 0, 0}, {0, 0, 1}, {0, 0, -1}};
+                            for (int fi = 0; fi < 6; fi++) { VPIX_MeshPoly q; q.n = 4; for (int k = 0; k < 4; k++) q.idx[k] = (uint32_t)f6[fi][k];
+                                q.flags = 0x20000000 | pastel[fi]; q.nx = nn[fi][0]; q.ny = nn[fi][1]; q.nz = nn[fi][2]; ps.push_back(q); }
+                            VPIX_Render_AddMesh(HCUBE, v, ps); }
+                        {   std::vector<float> v; std::vector<VPIX_MeshPoly> ps;   /* a pastel triangular prism */
+                            const float p6[6][3] = {{-700, -500, -600}, {700, -500, -600}, {0, -500, 700}, {-700, 500, -600}, {700, 500, -600}, {0, 500, 700}};
+                            for (auto &q : p6) { v.push_back(q[0]); v.push_back(q[1]); v.push_back(q[2]); }
+                            const int fq[3][4] = {{0, 1, 4, 3}, {1, 2, 5, 4}, {2, 0, 3, 5}}; const float fn[3][3] = {{0, 0, -1}, {0.88f, 0, 0.47f}, {-0.88f, 0, 0.47f}};
+                            for (int k = 0; k < 3; k++) { VPIX_MeshPoly q; q.n = 4; for (int c = 0; c < 4; c++) q.idx[c] = (uint32_t)fq[k][c]; q.flags = 0x20000000 | pastel[k + 2]; q.nx = fn[k][0]; q.ny = fn[k][1]; q.nz = fn[k][2]; ps.push_back(q); }
+                            for (int k = 0; k < 2; k++) { VPIX_MeshPoly q; q.n = 3; for (int c = 0; c < 3; c++) q.idx[c] = (uint32_t)(k ? 5 - c : c); q.flags = 0x20000000 | pastel[5 - k]; q.nx = 0; q.ny = k ? 1.f : -1.f; q.nz = 0; ps.push_back(q); }
+                            VPIX_Render_AddMesh(HPRISM, v, ps); }
+                        {   /* the arch: the sign 12 x 3 m, 5.5 m up, facing the cart coming in (-y), two neon posts */
+                            std::vector<float> v; std::vector<VPIX_MeshPoly> ps; const float uv[4][2] = {{0, 0}, {1, 0}, {1, 1}, {0, 1}};
+                            const float c[4][3] = {{-6000, -100, 5500}, {6000, -100, 5500}, {6000, -100, 8500}, {-6000, -100, 8500}}; quadt(v, ps, c, uv, TARCH, 0, -1, 0);
+                            const float c2[4][3] = {{6000, 100, 5500}, {-6000, 100, 5500}, {-6000, 100, 8500}, {6000, 100, 8500}}; quadt(v, ps, c2, uv, TARCH, 0, 1, 0);
+                            boxc(v, ps, -6300, -6000, -150, 150, -60, 8700, 0xDC3CFF); boxc(v, ps, 6000, 6300, -150, 150, -60, 8700, 0xDC3CFF);
+                            boxc(v, ps, -6300, 6300, -150, 150, 8500, 8700, 0xFFE63C);
+                            VPIX_Render_AddMesh(HARCH, v, ps); }
+                        ohs = nt == 3 ? 1 : -1;
+                        lg("HLE: VPIX_ORB_HALL %s: %s", ohd, ohs == 1 ? "built" : "** pictures missing");
+                    }
+                }
+                if (ohs == 1 && station_ok) {
+                    const VPIX_Instance &S0 = station; bool in_hall = false; float far_along = -1.f; VPIX_Instance far_piece = S0;
+                    const size_t n1 = f.inst.size();
+                    for (size_t i = 0; i < n1; i++) {
+                        bool st2, ld; if (!is_track(f.inst[i].handle, &st2, &ld) || !st2) continue;
+                        const VPIX_Instance tp = f.inst[i];
+                        const float d[3] = {tp.T[0] - S0.T[0], tp.T[1] - S0.T[1], tp.T[2] - S0.T[2]};
+                        const float along = d[0] * S0.R[1][0] + d[1] * S0.R[1][1] + d[2] * S0.R[1][2], lat = d[0] * S0.R[0][0] + d[1] * S0.R[0][1] + d[2] * S0.R[0][2];
+                        static const float oh_end = getenv("VPIX_ORB_HALL_END") ? (float)atof(getenv("VPIX_ORB_HALL_END")) : 50000.f;   /* section 2's museum: one piece (16000) */
+                        if (along < 7000.f || along > oh_end || fabsf(lat) > 1500.f || fabsf(d[2]) > 2500.f) continue;
+                        float mid[3]; for (int q = 0; q < 3; q++) mid[q] = tp.T[q] + tp.R[1][q] * 4500.f;
+                        const uint32_t hh = (uint32_t)(key_of(tp.T) * 2654435761ull >> 9);
+                        auto put = [&](uint32_t h, const float T[3], bool turn, float sc, float spin_z, float tilt) {
+                            VPIX_Instance g = {}; g.handle = h; g.light_mask = 1; g.bright = 1;
+                            for (int r = 0; r < 3; r++) for (int q = 0; q < 3; q++) g.R[r][q] = tp.R[r][q] * (turn && r < 2 ? -1.f : 1.f);
+                            if (spin_z != 0.f || tilt != 0.f) { const float cz = cosf(spin_z), sz = sinf(spin_z), ct = cosf(tilt), st = sinf(tilt);
+                                const float X[3] = {cz, sz, 0}, Y[3] = {-sz * ct, cz * ct, st}, Z[3] = {sz * st, -cz * st, ct};
+                                for (int q = 0; q < 3; q++) { g.R[0][q] = X[q]; g.R[1][q] = Y[q]; g.R[2][q] = Z[q]; } }
+                            for (int q = 0; q < 3; q++) { g.T[q] = T[q]; g.S[q] = sc; }
+                            for (int e = 0; e < 16; e++) g.pal[e] = g.palw[e] = 0xFFFFFF;
+                            f.inst.push_back(g); };
+                        put(HFLOOR, mid, false, 1.f, 0.f, 0.f);
+                        bool near_ex = false;   /* (10-29: the host stood inside a storefront block / "inside piller") */
+                        for (const Slot &sl : slots) { const float dx = sl.P[0] - mid[0], dy = sl.P[1] - mid[1]; if (dx * dx + dy * dy < 10000.f * 10000.f) { near_ex = true; break; } }
+                        if (!near_ex) for (int sd = -1; sd <= 1; sd += 2) { float wp[3]; for (int q = 0; q < 3; q++) wp[q] = mid[q] + tp.R[0][q] * 7500.f * sd;
+                            put(HWALL + (hh >> (sd + 1)) % 3, wp, sd < 0, 1.f, 0.f, 0.f); }
+                        const float tt = now / 1000.f;
+                        for (int k = 0; k < 3; k++) {   /* orbs floating and turning overhead */
+                            const uint32_t oh = hh * 7u + (uint32_t)k * 911u;
+                            float op[3]; const float side = ((int)(oh % 9) - 4) * 1200.f, ahead = ((int)((oh >> 4) % 7) - 3) * 1300.f, up = 3500.f + (oh >> 8) % 5000;
+                            for (int q = 0; q < 3; q++) op[q] = mid[q] + tp.R[0][q] * side + tp.R[1][q] * ahead; op[2] += up + 400.f * sinf(tt * 0.8f + k * 2.1f + (oh % 7));
+                            const float sc = 0.6f + (oh >> 12) % 6 * 0.15f;
+                            put(HORB, op, false, sc, tt * 0.5f + k, 0.25f);
+                            put_glow(GWARM, op, 3500.f * sc, 0.35f);
+                        }
+                        {   float sp[3]; const float side = (hh & 1 ? 1.f : -1.f) * 4800.f;   /* a pastel shape tumbling */
+                            for (int q = 0; q < 3; q++) sp[q] = mid[q] + tp.R[0][q] * side; sp[2] += 4200.f + 300.f * sinf(tt + hh % 5);
+                            put(hh % 2 ? HCUBE : HPRISM, sp, false, 1.f, tt * 0.7f + hh % 9, tt * 0.5f); }
+                        if (along > far_along) { far_along = along; far_piece = tp; }
+                        const float dc[3] = {f.cam_T[0] - mid[0], f.cam_T[1] - mid[1], 0.f};
+                        if (dc[0] * dc[0] + dc[1] * dc[1] < 6000.f * 6000.f) in_hall = true;
+                    }
+                    if (station_ok) {   /* OUR BUGGY BALL (Bobby 10-29: "our buggy ball with our logo on it", "let sword hit it"): 3 m across,
+                                            floating at the rider's height 3.5 m off the track in the orb hall, turning; the sword bats it away
+                                            (thunk + buzz, spin) and it drifts home */
+                        static float bd[3] = {0, 0, 0}, bv[3] = {0, 0, 0}, bspin = 0.f, bspv = 0.6f; static unsigned long long bms = 0, bhit = 0;
+                        static float lastB[3] = {0, 0, 0}; static unsigned long long lastBms = 0;
+                        const float dts = bms ? (std::min)(0.1f, (now - bms) / 1000.f) : 0.f; bms = now;
+                        float home[3]; const float Rx[3] = {S0.R[0][0], S0.R[0][1], 0.f}; const float rl = sqrtf(Rx[0] * Rx[0] + Rx[1] * Rx[1]) + 1e-6f;
+                        for (int q = 0; q < 3; q++) home[q] = S0.T[q] + S0.R[1][q] * 13500.f + Rx[q] / rl * 3500.f;
+                        home[2] = f.cam_T[2] - 200.f + 150.f * sinf(now / 1000.f * 0.8f);
+                        for (int q = 0; q < 3; q++) { bv[q] -= bd[q] * 0.5f * dts; bv[q] *= powf(0.5f, dts); bd[q] += bv[q] * dts; }
+                        bspv += (0.6f - bspv) * (std::min)(1.f, dts * 0.5f); bspin += bspv * dts;
+                        float bp[3]; for (int q = 0; q < 3; q++) bp[q] = home[q] + bd[q];
+                        const bool sw = sword_ms && now - sword_ms < 200; float sv[3] = {0, 0, 0};
+                        if (sw && lastBms && sword_ms > lastBms) { const float d = (sword_ms - lastBms) / 1000.f; for (int q = 0; q < 3; q++) sv[q] = (sword_B[q] - lastB[q]) / d; }
+                        if (sw) { memcpy(lastB, sword_B, sizeof(lastB)); lastBms = sword_ms; }
+                        if (sw && now - bhit > 400) {
+                            float ab[3], ap[3], l2 = 0, u = 0; for (int q = 0; q < 3; q++) { ab[q] = sword_B[q] - sword_A[q]; ap[q] = bp[q] - sword_A[q]; l2 += ab[q] * ab[q]; u += ab[q] * ap[q]; }
+                            u = l2 > 0 ? (std::max)(0.f, (std::min)(1.f, u / l2)) : 0.f; float nv[3], dd = 0;
+                            for (int q = 0; q < 3; q++) { nv[q] = bp[q] - (sword_A[q] + ab[q] * u); dd += nv[q] * nv[q]; } dd = sqrtf(dd);
+                            if (dd < 1600.f) { bhit = now; const float spd = sqrtf(sv[0] * sv[0] + sv[1] * sv[1] + sv[2] * sv[2]);
+                                for (int q = 0; q < 3; q++) bv[q] += (dd > 1.f ? nv[q] / dd : 0.f) * 3000.f + sv[q] * 0.6f;
+                                bspv += 4.f + spd / 3000.f; play_game_sound(2, 110); VPIX_Haptic(1, 0.2f + (std::min)(0.5f, spd / 20000.f), 1.f); } }
+                        VPIX_Instance g = {}; g.handle = 0x7FFF1765u; g.light_mask = 1; g.bright = 1; for (int e = 0; e < 16; e++) g.pal[e] = g.palw[e] = 0xFFFFFF;
+                        g.R[0][0] = cosf(bspin); g.R[0][1] = sinf(bspin); g.R[1][0] = -sinf(bspin); g.R[1][1] = cosf(bspin); g.R[2][2] = 1.f;
+                        for (int q = 0; q < 3; q++) { g.T[q] = bp[q]; g.S[q] = 1.5f; } f.inst.push_back(g); }
+                    bool arch_clear = true;
+                    if (far_along > 0.f) { float aq[3]; for (int q = 0; q < 3; q++) aq[q] = far_piece.T[q] + far_piece.R[1][q] * 9000.f;
+                        for (const Slot &sl : slots) { const float dx = sl.P[0] - aq[0], dy = sl.P[1] - aq[1]; if (dx * dx + dy * dy < 10000.f * 10000.f) { arch_clear = false; break; } } }
+                    if (far_along > 0.f && arch_clear) { float ap[3]; for (int q = 0; q < 3; q++) ap[q] = far_piece.T[q] + far_piece.R[1][q] * 9000.f;
+                        VPIX_Instance g = {}; g.handle = HARCH; g.light_mask = 1; g.bright = 1;
+                        /* facing from the track's direction alone, right-handed: some pieces are stored mirrored (a left piece = the right
+                           one flipped), and the sign came out backwards on section 2 (Bobby 10-29: "backwards text on sign") */
+                        { float y[2] = {far_piece.R[1][0], far_piece.R[1][1]}; const float l = sqrtf(y[0] * y[0] + y[1] * y[1]) + 1e-6f; y[0] /= l; y[1] /= l;
+                          /* the side that reads right toward the rider, whichever side they're on: in this world's handedness that is the
+                             +y face (the -y one showed the sign mirrored, 10-29 twice) */
+                          if ((f.cam_T[0] - ap[0]) * y[0] + (f.cam_T[1] - ap[1]) * y[1] < 0.f) { y[0] = -y[0]; y[1] = -y[1]; }
+                          g.R[0][0] = y[1]; g.R[0][1] = -y[0]; g.R[0][2] = 0; g.R[1][0] = y[0]; g.R[1][1] = y[1]; g.R[1][2] = 0; g.R[2][0] = 0; g.R[2][1] = 0; g.R[2][2] = 1; }
+                        for (int q = 0; q < 3; q++) { g.T[q] = ap[q]; g.S[q] = 1.f; } for (int e = 0; e < 16; e++) g.pal[e] = g.palw[e] = 0xFFFFFF;
+                        f.inst.push_back(g); }
+                    if (in_hall) { for (int c = 0; c < 3; c++) { f.fog_col[c] = (uint8_t)(c == 2 ? 10 : 3); f.clear[c] = f.fog_col[c]; } f.fog_start *= 2.f; f.fog_end *= 2.5f; }
+                }
+            }
+            /* the exhibits */
+            for (size_t i = 0; i < slots.size(); i++) {
+                const Ex &e = ex[i]; const Slot &sl = slots[i];
+                const bool lit = e.scene <= reached;
+                const bool small = e.kind == 's';
+                VPIX_Instance pl = {}; pl.handle = HPLINTH + (small ? 1 : 0); pl.light_mask = 1; pl.bright = lit ? 1 : 0;
+                yaw_to(pl, sl.face[0], sl.face[1], 0.f); for (int q = 0; q < 3; q++) { pl.S[q] = 1.f; pl.T[q] = sl.P[q]; }
+                for (int k = 0; k < 16; k++) pl.pal[k] = pl.palw[k] = 0xFFFFFF;
+                if (e.kind != 'e' && e.kind != 'w' && e.kind != 'b' && e.kind != 'f') f.inst.push_back(pl);   /* 'f' = mall furniture on the floor */   /* 'b' = a building piece on the floor (make_mall_shells.py) */
+                const float top = (e.kind == 'e' || e.kind == 'b' || e.kind == 'f') ? 0.f : small ? 1100.f : 300.f;
+                if (e.pm.ok) {
+                    const float h = e.pm.zmax - e.pm.zmin;
+                    /* VPIX_EXHIBIT_SCALE (default 1.2; Bobby 10-29: "all museum items should be scaled up a bit to small"); buildings stay */
+                    static const float ex_up = getenv("VPIX_EXHIBIT_SCALE") ? (float)atof(getenv("VPIX_EXHIBIT_SCALE")) : 1.2f;
+                    /* the arcade's real machines ('k') a third bigger (Bobby 10-30: "they are all like %25 to small", "the space invaders etc"); Beach Head more: its
+                       model still looked small, 10-30 night: "the beach head arcade did not scale up enough") */
+                    const float sc = (e.kind == 'c' ? 1750.f / h : e.kind == 'k' ? (e.name == "CAB_BEACH_HEAD" ? 3100.f : 2400.f) / h : e.kind == 'e' ? 1800.f / h : small ? 700.f / (std::max)(h, e.pm.ext) : 1.f) * (e.kind == 'b' || small ? 1.f : ex_up);   /* small: 70 cm across its biggest side (by height, flat headsets came out tiny, 10-29) */
+                    VPIX_Instance g = pl; g.handle = HEX0 + (uint32_t)i;
+                    if (e.has_near) { const float dx = sl.P[0] - f.cam_T[0], dy = sl.P[1] - f.cam_T[1];   /* within 12 m: the textured NEAR model */
+                        const float nr = e.kind == 'b' ? 40000.f : 12000.f;   /* buildings: out to 40 m, so the store signs read */
+                        if (e.hires || dx * dx + dy * dy < nr * nr) g.handle = 0x7FFF1500u + (uint32_t)i; }
+                    /* the spotlight (Bobby 10-28: "make it dark and spotlight the item narration is talking about"): hi-res pieces of the
+                       scene being talked about full bright, the ones already passed dim, the ones ahead dimmer still */
+                    if (e.hires && g.handle == 0x7FFF1500u + (uint32_t)i) { g.bright = 0; g.lum = e.scene == reached ? 1.6f : lit ? 1.05f : 0.85f;
+                        /* gloss on the plastic and lacquer (pods, the SU3000, cabinets), never on people (10-29); VPIX_GLOSS=<0..1> to tune */
+                        static const float gl_amt = getenv("VPIX_GLOSS") ? (float)atof(getenv("VPIX_GLOSS")) : 0.55f;
+                        if ((e.kind == 'p' && (e.name.rfind("POD_", 0) == 0 || e.name.rfind("SU3000", 0) == 0)) || e.kind == 'k') g.gloss = gl_amt; }   /* 10-29: 0.45 / 0.22 hid the dark-textured pieces in the black hall */
+                    /* every exhibit stands still, facing the track (Bobby 10-29: "dont have the museum items face us as we pass ... have them
+                       set still"; the 10-28 Omnimover turn-to-face and the small pieces' slow spin are gone). Only the host still nods
+                       while he talks. */
+                    static std::vector<float> turn; if (turn.size() != ex.size()) turn.assign(ex.size(), 1e9f);
+                    float tx = sl.face[0], ty = sl.face[1];
+                    const float want = atan2f(tx, -ty); float &cur = turn[i];
+                    if (cur > 1e8f) cur = want;
+                    { float dd = want - cur; while (dd > 3.14159f) dd -= 6.28318f; while (dd < -3.14159f) dd += 6.28318f; cur += dd * 0.04f; }
+                    const bool talking = now < bob_until && e.scene == bob_sc && e.kind == 'c' && e.name.rfind("CHAR_BOBBY", 0) == 0;
+                    const float tt = now / 1000.f;
+                    yaw_to(g, sinf(cur), -cosf(cur), (talking ? 0.07f * sinf(tt * 1.7f) + 0.05f * bob_amp * sinf(tt * 9.f) : 0.f));
+                    for (int q = 0; q < 3; q++) g.S[q] = sc;
+                    /* stood on its own bottom: the hi-res mesh's lowest point, not the low-poly BIN's (they differ; 10-29 "floating fountain") */
+                    { const bool nearm = g.handle == 0x7FFF1500u + (uint32_t)i && e.nzmax > e.nzmin; g.T[2] = sl.P[2] + top - (nearm ? e.nzmin : e.pm.zmin) * sc; }
+                    if (talking) {   /* the animatronic: a nod toward the rider with each loud word, a slow lean, a little bounce */
+                        const float pch = 0.05f * bob_amp + 0.015f * sinf(tt * 1.1f), c = cosf(pch), sn = sinf(pch);
+                        for (int q = 0; q < 3; q++) { const float r1 = g.R[1][q], r2 = g.R[2][q]; g.R[1][q] = c * r1 + sn * r2; g.R[2][q] = -sn * r1 + c * r2; }
+                        g.T[2] += 18.f * bob_amp; }
+                    f.inst.push_back(g);
+                    if (e.kind == 'e') {   /* the red eye on the screen, coming on one by one after the station goes dark */
+                        int nth = 0; for (size_t j = 0; j < i; j++) if (ex[j].kind == 'e') nth++;
+                        if (reached >= 0 && now - reached_at[0] > 1500ull + nth * 1300ull) {
+                            float ep[3] = {sl.P[0] + sl.face[0] * 0.1f, sl.P[1] + sl.face[1] * 0.1f, sl.P[2] + 1450.f};
+                            const float fl = 0.85f + 0.15f * sinf(now / 1000.f * 3.f + nth);
+                            put_glow(GEYE, ep, 900.f * fl, 1.f); put_glow(GEYE, ep, 2600.f * fl, 0.4f);
+                        }
+                    }
+                }
+                if (e.plq >= 0) {
+                    VPIX_Instance q = pl; q.handle = HPLQ0 + (uint32_t)i; q.bright = 1;
+                    const float l = sqrtf(sl.face[0] * sl.face[0] + sl.face[1] * sl.face[1]) + 1e-3f, out = e.kind == 'w' ? 0.f : 1500.f;
+                    q.T[0] = sl.P[0] + sl.face[0] / l * out; q.T[1] = sl.P[1] + sl.face[1] / l * out;
+                    if (e.kind == 'w' && sl.pw > 0.f) for (int c = 0; c < 3; c++) q.S[c] *= sl.pw / 4500.f;   /* the hand layout's width: neighbours never overlap */
+                    f.inst.push_back(q);
+                }
+                if (lit && e.kind != 'e' && e.scene == reached) {   /* the spotlight's glow, on the scene being talked about only */
+                    const float u = (std::min)(1.f, (now - reached_at[e.scene]) / 1200.f);
+                    float gp[3] = {sl.P[0], sl.P[1], sl.P[2] + top + 1400.f};
+                    put_glow(GWARM, gp, 5200.f, 0.45f * u);
+                    float hp[3] = {sl.P[0], sl.P[1], sl.P[2] + 7200.f}; put_glow(GWARM, hp, 1400.f, 0.9f * u);   /* the lamp in the ceiling */
+                    {   /* and its beam down to the piece (10-29, "more grand": the dark-ride spotlight you can see in the haze) */
+                        VPIX_Blit b = {}; b.handle = 0x7FFD0028u; b.sw = 32; b.sh = 64; b.key = -1; b.world = true; b.dw = 2400.f; b.dh = 7200.f - top;
+                        b.pivot[0] = b.dw * 0.5f; b.pivot[1] = b.dh * 0.5f; b.pos[0] = sl.P[0]; b.pos[1] = sl.P[1]; b.pos[2] = sl.P[2] + (7200.f + top) * 0.5f;
+                        b.alpha = 0.35f * u; b.prio = 99300; f.blits.push_back(b); }
+                }
+            }
+            /* VISITORS FROM THE GAMES (Bobby 10-29: "take characters from all the games and place them in the museum randomly", "esp in
+               rotunda room and mall room", "fill out empty areas leaving some empty area for asthetic so dont do to much"): the models
+               of VPIX_MUSEUM_GUESTS ("file|height;..", the player's own games: Dactyl Nightmare's human) standing in the gaps behind the
+               rows (7.4 m out, between the pieces and the boards), facing the track, a fixed random pick per room: 3 in the rotunda, 2 in
+               the food court, 3 in the stores, 2 with the people, 1 in the pods, Simon's and the arcade rooms */
+            /* a guest file ending _00.BIN is the first frame of a clip (_01, _02 ... beside it; pose_bake.py --frames, Bobby 10-30: "you
+               can animate them"): the figure's own moves from its game, played back and forth at 15 a second, each guest at its own point */
+            {   struct GM { PM pm; float ht; uint32_t h0; int nf; int room; }; static std::vector<GM> gm; static int gs = 0; const uint32_t HG0 = 0x7FFF12E0u, HGA = 0x7FFF2000u;
+                if (gs == 0) { gs = -1; const char *gv = getenv("VPIX_MUSEUM_GUESTS");
+                    if (gv && *gv) { std::string all = gv; size_t p0 = 0;
+                        while (p0 < all.size() && gm.size() < 40) { size_t q = all.find(';', p0); if (q == std::string::npos) q = all.size();
+                            std::string it = all.substr(p0, q - p0); p0 = q + 1; size_t bar = it.find('|'); float ht = 1800.f;
+                            int room = -1;   /* "file|height|room": only in that room (the boxers on their stools sit in the food court, 6) */
+                            if (bar != std::string::npos) { ht = (float)atof(it.c_str() + bar + 1); const size_t b2 = it.find('|', bar + 1);
+                                if (b2 != std::string::npos) room = atoi(it.c_str() + b2 + 1); it = it.substr(0, bar); }
+                            std::string up = it; std::transform(up.begin(), up.end(), up.begin(), ::toupper);
+                            const bool clip = up.size() > 7 && up.compare(up.size() - 7, 7, "_00.BIN") == 0;
+                            if (!clip && gm.size() >= 16) continue;   /* still models: 16 handles (0x7FFF12F0 on is taken); clips: 40 x 64 */
+                            const uint32_t h0 = clip ? HGA + (uint32_t)gm.size() * 64u : HG0 + (uint32_t)gm.size();
+                            PM pm = load_bin(it, h0); int nf = pm.ok ? 1 : 0;
+                            if (pm.ok && clip) for (; nf < 64; nf++) { char nn[12]; snprintf(nn, sizeof(nn), "_%02d.BIN", nf);
+                                if (!load_bin(it.substr(0, it.size() - 7) + nn, h0 + (uint32_t)nf).ok) break; }
+                            if (pm.ok) gm.push_back({pm, ht, h0, nf, room});
+                            lg("HLE: VPIX_MUSEUM_GUESTS %s: %s, %d frames", it.c_str(), pm.ok ? "loaded" : "** not loaded", nf); }
+                        gs = gm.empty() ? -1 : 1; } }
+                if (gs == 1 && !slots.empty()) {
+                    /* a dozen of them now (the boxers, aliens, divers ... from the other games, pose_bake.py), where the museum is thin
+                       (Bobby 10-30: "the rooms about the mall and the stores and the rotunda are the ones that need help and the area bobby
+                       is in"): the hosts' room, the rotunda, the food court, the stores, the goodbye; the full exhibit rooms get none */
+                    static const int per_scene[16] = {0, 3, 6, 0, 0, 0, 12, 12, 3, 2, 0, 0, 0, 0, 0, 0};   /* food court + stores filled (10-30 night: "they are almost empty") */
+                    int turn = 0;   /* the guests take turns: every model shows before one repeats */
+                    for (int sc = 0; sc < 16; sc++) { if (!per_scene[sc]) continue;
+                        std::vector<size_t> ids; for (size_t i = 0; i < slots.size() && i < ex.size(); i++) if (ex[i].scene == sc) ids.push_back(i);
+                        if (ids.size() < 2) continue;
+                        /* never two on one spot (10-30 night: "a little blue guy he's covering the ring girl"): a taken spot moves on to the next free one */
+                        std::vector<int> taken;
+                        for (int g2 = 0; g2 < per_scene[sc]; g2++) {
+                            const uint32_t hh = (uint32_t)(sc * 7919 + g2 * 104729) * 2654435761u;
+                            /* 4 spots per gap between two pieces: either side, 2.2 m back or on */
+                            const int nsp = (int)(ids.size() - 1) * 4; int sp = (int)(((hh >> 8) % (ids.size() - 1)) * 4 + (hh & 3));
+                            for (int t = 0; t < nsp && std::find(taken.begin(), taken.end(), sp) != taken.end(); t++) sp = (sp + 3) % nsp;
+                            if (std::find(taken.begin(), taken.end(), sp) != taken.end()) continue;
+                            taken.push_back(sp);
+                            const size_t a0 = ids[(size_t)(sp / 4)], a1 = ids[(size_t)(sp / 4) + 1];
+                            const Slot &s0 = slots[a0], &s1 = slots[a1];
+                            const float side = (sp & 1) ? 1.f : -1.f, Rt[2] = {s0.fwd[1], -s0.fwd[0]}, off = (sp & 2) ? 2200.f : -2200.f;
+                            const float glat = sc == 7 ? 4200.f : 7400.f;   /* the stores: in front of the shop fronts (6.5 m out), not inside them */
+                            const float L2[2] = {(s0.M[0] + s1.M[0]) * 0.5f + s0.fwd[0] * off, (s0.M[1] + s1.M[1]) * 0.5f + s0.fwd[1] * off};   /* between two pieces, on the line */
+                            /* this room's own guests first (each once), then the free ones taking turns */
+                            size_t gi = gm.size(); { int k = 0; for (size_t j = 0; j < gm.size(); j++) if (gm[j].room == sc && k++ == g2) { gi = j; break; } }
+                            if (gi == gm.size()) { std::vector<size_t> fre; for (size_t j = 0; j < gm.size(); j++) if (gm[j].room < 0) fre.push_back(j);
+                                if (fre.empty()) continue; gi = fre[(size_t)(turn++) % fre.size()]; }
+                            const float dx = L2[0] - f.cam_T[0], dy = L2[1] - f.cam_T[1]; if (dx * dx + dy * dy > 60000.f * 60000.f) continue;
+                            const GM &G = gm[gi]; const float sc2 = G.ht / (G.pm.zmax - G.pm.zmin);
+                            /* still on its first pose until the cart comes within 14 m, then the move once, and it stays on the last pose
+                               (Bobby 10-30: "as you approach it plays and stops on end frame"); ready again for the next ride */
+                            int fr = 0; if (G.nf > 1) { static unsigned long long went[16][16]; if (reached < 0) memset(went, 0, sizeof(went));
+                                unsigned long long &w = went[sc][g2 & 15];
+                                const float gx = L2[0] + Rt[0] * glat * side - f.cam_T[0], gy = L2[1] + Rt[1] * glat * side - f.cam_T[1];
+                                if (!w && gx * gx + gy * gy < 14000.f * 14000.f) w = hap_ms_now();
+                                if (w) fr = (int)(std::min)((unsigned long long)(G.nf - 1), (hap_ms_now() - w) / 66ull); }
+                            VPIX_Instance g = {}; g.handle = G.h0 + (uint32_t)fr; g.light_mask = 1; g.bright = 1;
+                            for (int e = 0; e < 16; e++) g.pal[e] = g.palw[e] = 0xFFFFFF;
+                            yaw_to(g, -Rt[0] * side, -Rt[1] * side, ((int)((hh >> 4) & 7) - 3) * 0.12f);
+                            for (int q = 0; q < 3; q++) g.S[q] = sc2;
+                            g.T[0] = L2[0] + Rt[0] * glat * side; g.T[1] = L2[1] + Rt[1] * glat * side; g.T[2] = s0.M[2] - G.pm.zmin * sc2;
+                            f.inst.push_back(g); } } } }
+            /* the gallery doors: before each gallery's first exhibit (half a track piece back), across the hall; the doors swing
+               open (away from the cart, ~2 s) once the cart is within 14 m, and stay open; the marquee's bulbs chase */
+            {   static float open_amt[16] = {0}; static bool door_heard[16] = {false};
+                if (reached < 0) for (int s = 0; s < 16; s++) { open_amt[s] = 0.f; door_heard[s] = false; }   /* shut again for the next ride */
+                /* 1.5x wide (Bobby 10-29: "tracks still off"): the pieces carry two lanes, ours and the rival cart's, round the track's
+                   centre line; a 4.8 m doorway on the centre left our cart brushing a door leaf, on our lane the other lane's rails ran
+                   outside it. 7.2 m on the centre takes both */
+                const float DW = 1.5f;
+                auto put = [&](uint32_t h, const float T[3], const float r0[2], const float r1[2], int bright) {
+                    VPIX_Instance g = {}; g.handle = h; g.light_mask = 1; g.bright = bright; for (int k = 0; k < 16; k++) g.pal[k] = g.palw[k] = 0xFFFFFF;
+                    g.R[0][0] = r0[0]; g.R[0][1] = r0[1]; g.R[1][0] = r1[0]; g.R[1][1] = r1[1]; g.R[2][2] = 1.f;
+                    for (int q = 0; q < 3; q++) { g.T[q] = T[q]; g.S[q] = 1.f; } g.S[0] = DW; f.inst.push_back(g); };
+                for (int s = 2; s < 16; s++) {
+                    if (!gate_ok[s]) continue;
+                    size_t i0 = slots.size(); for (size_t i = 0; i < slots.size() && i < ex.size(); i++) if (ex[i].scene == s) { i0 = i; break; }
+                    if (i0 >= slots.size()) continue;
+                    const Slot &sl = slots[i0]; const float fx = sl.fwd[0], fy = sl.fwd[1];
+                    float G[3] = {sl.M[0] - fx * 6000.f, sl.M[1] - fy * 6000.f, sl.M[2] - 500.f};   /* the room's front door, on the bare piece before it */
+                    if (sl.has_e) { G[0] = sl.E[0]; G[1] = sl.E[1]; G[2] = sl.E[2] - 500.f; }   /* hand layout: at the room's entrance, wherever its first piece stands */
+                    {   /* centred on the rider coming through it (Bobby 10-29: "doors still off center"), whatever the track data says */
+                        /* snapped onto the centre line of the track piece it stands on (10-29: centring on the rider, then on the rider minus
+                           the seat offset, both came out off the rails, "tracks still off") */
+                        float bd = 12000.f * 12000.f, lat = 0.f; bool got = false;
+                        for (const VPIX_Instance &in : f.inst) { bool st2, ld2; if (!is_track(in.handle, &st2, &ld2)) continue;
+                            float m[3]; for (int c = 0; c < 3; c++) m[c] = in.T[c] + (st2 ? in.R[1][c] * 4500.f : 0.f);
+                            if (fabsf(m[2] - (G[2] + 500.f)) > 3000.f) continue;
+                            const float dx = m[0] - G[0], dy = m[1] - G[1]; if (dx * dx + dy * dy >= bd) continue;
+                            bd = dx * dx + dy * dy; got = true; lat = dx * fy - dy * fx; }
+                        if (got && fabsf(lat) < 4000.f) { G[0] += fy * lat; G[1] -= fx * lat; }
+                        static int nlog = 0; if (nlog < 10 && got) { nlog++; lg("HLE: door scene %d snapped %.0f mm to the track's centre line (rider %.0f mm off it)", s, lat, rider_lat); } }
+                    const float dx = G[0] - f.cam_T[0], dy = G[1] - f.cam_T[1];
+                    if (dx * dx + dy * dy > 90000.f * 90000.f) continue;
+                    if (dx * fx + dy * fy < 14000.f) { open_amt[s] += (1.f - open_amt[s]) * 0.02f;
+                        if (!door_heard[s] && door_ready) { door_heard[s] = true;   /* the creak as they swing (Bobby 10-29) */
+                            for (int v = 31; v >= 0; v--) if (!voices[v].on) { voices[v] = VVoice(); voices[v].s = &door_snd; voices[v].vol = 120; voices[v].on = true; break; } } }
+                    const float o = (std::min)(1.f, open_amt[s] * 1.05f), a = o * o * (3.f - 2.f * o) * 1.66f;   /* up to 95 degrees */
+                    const float r0[2] = {fy, -fx}, r1[2] = {fx, fy};
+                    put(0x7FFF1720u, G, r0, r1, 0); put(0x7FFF1721u, G, r0, r1, 1); put(0x7FFF1730u + (uint32_t)s, G, r0, r1, 1); f.inst.back().S[0] = 1.f;   /* the marquee keeps its own width (its letters) */
+                    /* door guards (Bobby 10-29: "add some devil girls to the museum", "and the bat girl" = Velvet with her baseball bat, "like
+                       door guards maybe"): a devil girl left of each gallery doorway, Velvet right, standing still in front of the wall,
+                       facing the cart coming (hell's models, 1.2 x life size like the exhibits) */
+                    for (int side = -1; side <= 1; side += 2) { const PM &pm = side < 0 ? girl : velvet; if (!pm.ok) continue;
+                        VPIX_Instance g = {}; g.handle = side < 0 ? HGIRL : HVEL; g.light_mask = 1; g.bright = 1; for (int k = 0; k < 16; k++) g.pal[k] = g.palw[k] = 0xFFFFFF;
+                        yaw_to(g, -fx, -fy, side * -0.25f);   /* turned a little in toward the doorway */
+                        const float gsc = 1900.f * 1.2f / (pm.zmax - pm.zmin);
+                        for (int q = 0; q < 3; q++) g.S[q] = gsc;
+                        g.T[0] = G[0] + r0[0] * (2400.f * DW + 1500.f) * side - fx * 900.f; g.T[1] = G[1] + r0[1] * (2400.f * DW + 1500.f) * side - fy * 900.f;
+                        g.T[2] = G[2] + 500.f - pm.zmin * gsc;
+                        f.inst.push_back(g); }
+                    for (int side = -1; side <= 1; side += 2) {   /* the leaves: left hinge at -2.4 m turns +a, right at +2.4 m turns -a */
+                        const float an = a * -side, c = cosf(an), sn = sinf(an);
+                        const float l0[2] = {c * r0[0] + sn * r1[0], c * r0[1] + sn * r1[1]}, l1[2] = {-sn * r0[0] + c * r1[0], -sn * r0[1] + c * r1[1]};
+                        const float H[3] = {G[0] + r0[0] * 2400.f * DW * side, G[1] + r0[1] * 2400.f * DW * side, G[2]};
+                        put(side < 0 ? 0x7FFF1722u : 0x7FFF1723u, H, l0, l1, 1); }
+                    /* chasing bulbs round the marquee + a soft halo */
+                    const int step = (int)(now / 140ull);
+                    for (int row = 0; row < 2; row++) for (int k = 0; k < 18; k++) {
+                        const float x = -3500.f + 7000.f * k / 17.f, z = row ? 5000.f + 450.f + 1800.f + 120.f : 5000.f + 450.f - 120.f;
+                        const float bp[3] = {G[0] + r0[0] * x - r1[0] * 200.f, G[1] + r0[1] * x - r1[1] * 200.f, G[2] + z};
+                        put_glow(GWARM, bp, 420.f, ((k + step + row) % 3) == 0 ? 1.f : 0.3f); }
+                    const float hc[3] = {G[0] - r1[0] * 400.f, G[1] - r1[1] * 400.f, G[2] + 5000.f + 1350.f}; put_glow(GWARM, hc, 8500.f, 0.16f);
+                }
+            }
+            /* THE ENDING (Bobby 10-29, HANDOFF_MUSEUM "IDEA ... THE ENDING"; art + sounds: events\phantom_freight\make_ending.py,
+               VPIX_ENDING=<its folder>). After Bobby's goodbye the hall goes and the cart sits in a dark tunnel; a train's headlight and
+               horn come AT it down the rails; just before impact the track drops away (everything flies up: we fall), black, then a
+               fall through neon rings that slows to a float in an original early-90s cyberspace: a rainbow nebula sky, a neon grid far
+               below, a tunnel of neon rings ahead, chrome orbs, and the "statue people" (Bobby: "the early colorful statue people" of
+               that CGI era): our own character models drawn untextured in bold glossy single colours, turning as they float, and
+               Bobby's own figure floating beside the rider in shifting colours. The LAWN PEOPLE title (the Thanksgiving game,
+               events\lawn_people\IDEA.md), "COMING THIS THANKSGIVING", fade to black, two credit cards, then the clock goes to 0 =
+               the game's own game over, end song and initials (over the cyberspace, which stays). Genre look only, nothing traced.
+               VPIX_ENDING_NOW=1 (dev): start it as soon as the mall ride begins. */
+            {
+                const uint32_t HTUN = 0x7FFF1760u, HTRAIN = 0x7FFF1761u, HSKY = 0x7FFF1762u, HGRID = 0x7FFF1763u, HORB2 = 0x7FFF1764u, HRING = 0x7FFF1768u;   /* rings: 4 colours */
+                const uint32_t TSKY = 0x7FFD0760u, TGRID2 = 0x7FFD0761u, TORB2 = 0x7FFD0762u;
+                const uint32_t BLITE = 0x7FFD00E0u, BTITLE = 0x7FFD00E2u, BSOON = 0x7FFD00E3u, BCRED1 = 0x7FFD00E4u, BCRED2 = 0x7FFD00E5u, BPINK = 0x7FFD00E6u;
+                static std::vector<VSound> esnd(5); static std::atomic<bool> esnd_ready(false);   /* RUMBLE, HORN, WHOOSH, SHIMMER, HONK (the BANG! flag) */
+                if (end_es == 0) { end_es = -1;
+                    const char *ed = getenv("VPIX_ENDING");
+                    if (ed && *ed) {
+                        auto rd_rgba = [&](const char *n, uint32_t h, bool bitmap) -> int {
+                            FILE *fp = fopen((std::string(ed) + "\\" + n + ".rgba").c_str(), "rb"); int32_t wh[2] = {0, 0}; bool ok = false;
+                            if (fp && fread(wh, 4, 2, fp) == 2 && wh[0] > 0 && wh[1] > 0 && wh[0] <= 2048 && wh[1] <= 2048) { std::vector<uint32_t> px((size_t)wh[0] * wh[1]);
+                                ok = fread(px.data(), 4, px.size(), fp) == px.size() && (bitmap ? VPIX_Render_AddBitmapRGBA(h, wh[0], wh[1], px.data()) : VPIX_Render_AddTextureRGBA(h, wh[0], wh[1], px.data())); }
+                            if (fp) fclose(fp); return ok ? 1 : 0; };
+                        rd_rgba("BANG", 0x7FFD00E7u, true);   /* the museum's joke-gun flag (extra: the ending runs without it) */
+                        const int nt = rd_rgba("NEBULA", TSKY, false) + rd_rgba("GRID", TGRID2, false) + rd_rgba("ORB", TORB2, false) + rd_rgba("TITLE", BTITLE, true)
+                                     + rd_rgba("SOON", BSOON, true) + rd_rgba("CREDITS_1", BCRED1, true) + rd_rgba("CREDITS_2", BCRED2, true);
+                        glow(BLITE, 0xE8FAFFu); glow(BPINK, 0xE040FFu);   /* the headlight (warm white), the neon haze (0xBBGGRR) */
+                        auto boxc = [](std::vector<float> &v, std::vector<VPIX_MeshPoly> &ps, float x0, float x1, float y0, float y1, float z0, float z1, uint32_t col) {
+                            const uint32_t b = (uint32_t)(v.size() / 3);
+                            const float c[8][3] = {{x0, y0, z0}, {x1, y0, z0}, {x1, y1, z0}, {x0, y1, z0}, {x0, y0, z1}, {x1, y0, z1}, {x1, y1, z1}, {x0, y1, z1}};
+                            for (auto &q : c) { v.push_back(q[0]); v.push_back(q[1]); v.push_back(q[2]); }
+                            const int f6[6][4] = {{0, 1, 5, 4}, {1, 2, 6, 5}, {2, 3, 7, 6}, {3, 0, 4, 7}, {4, 5, 6, 7}, {3, 2, 1, 0}};
+                            const float nn[6][3] = {{0, -1, 0}, {1, 0, 0}, {0, 1, 0}, {-1, 0, 0}, {0, 0, 1}, {0, 0, -1}};
+                            for (int fi = 0; fi < 6; fi++) { VPIX_MeshPoly q; q.n = 4; for (int k = 0; k < 4; k++) q.idx[k] = b + (uint32_t)f6[fi][k];
+                                q.flags = 0x20000000 | col; q.nx = nn[fi][0]; q.ny = nn[fi][1]; q.nz = nn[fi][2]; ps.push_back(q); } };
+                        auto sphere = [](uint32_t h, uint32_t tex, int NA, int NO) {   /* radius 1000, u round, v up (the orb hall's ball) */
+                            std::vector<float> v; std::vector<VPIX_MeshPoly> ps;
+                            for (int i = 0; i < NA; i++) for (int j = 0; j < NO; j++) { const int ii[4] = {i, i + 1, i + 1, i}, jj[4] = {j, j, j + 1, j + 1};
+                                const uint32_t b = (uint32_t)(v.size() / 3); VPIX_MeshPoly q; q.n = 4; float n[3] = {0, 0, 0};
+                                for (int k = 0; k < 4; k++) { const float th = 3.14159265f * ii[k] / NA, ph = 6.2831853f * jj[k] / NO;
+                                    const float c[3] = {1000.f * sinf(th) * cosf(ph), 1000.f * sinf(th) * sinf(ph), 1000.f * cosf(th)};
+                                    v.push_back(c[0]); v.push_back(c[1]); v.push_back(c[2]); q.idx[k] = b + (uint32_t)k;
+                                    q.uv[k][0] = (float)jj[k] / NO; q.uv[k][1] = 1.f - (float)ii[k] / NA; for (int qq = 0; qq < 3; qq++) n[qq] += c[qq] / 4000.f; }
+                                q.flags = 0x20FFFFFF; q.tex = tex; q.nx = n[0]; q.ny = n[1]; q.nz = n[2]; ps.push_back(q); }
+                            VPIX_Render_AddMesh(h, v, ps); };
+                        {   /* one tunnel section, 4 m along +y: floor, walls, a round-topped ceiling of ribs, rails + sleepers, a dim lamp */
+                            std::vector<float> v; std::vector<VPIX_MeshPoly> ps;
+                            boxc(v, ps, -3200, 3200, 0, 4000, -200, 0, 0x101214);                  /* floor (ballast) */
+                            boxc(v, ps, -3400, -3200, 0, 4000, 0, 4600, 0x141618); boxc(v, ps, 3200, 3400, 0, 4000, 0, 4600, 0x141618);   /* walls */
+                            boxc(v, ps, -3400, 3400, 0, 4000, 4600, 4800, 0x101112);               /* ceiling */
+                            boxc(v, ps, -3500, -3150, 3700, 4000, 0, 4800, 0x26282C); boxc(v, ps, 3150, 3500, 3700, 4000, 0, 4800, 0x26282C);   /* the rib */
+                            boxc(v, ps, -3500, 3500, 3700, 4000, 4450, 4800, 0x26282C);
+                            boxc(v, ps, -760, -640, 0, 4000, 0, 160, 0x6A6A70); boxc(v, ps, 640, 760, 0, 4000, 0, 160, 0x6A6A70);   /* rails */
+                            for (int k = 0; k < 4; k++) boxc(v, ps, -1200, 1200, 300 + k * 1000.f, 550 + k * 1000.f, 0, 60, 0x1A2430);   /* sleepers (brown) */
+                            boxc(v, ps, 3050, 3200, 1800, 2200, 3300, 3500, 0x40A0FF);             /* a dim amber wall lamp */
+                            VPIX_Render_AddMesh(HTUN, v, ps); }
+                        {   /* the train's front: a dark nose 3 x 4 m with a yellow band (facing -y) */
+                            std::vector<float> v; std::vector<VPIX_MeshPoly> ps;
+                            boxc(v, ps, -1500, 1500, 0, 6000, 200, 4200, 0x1C1C20); boxc(v, ps, -1510, 1510, -20, 0, 1400, 1800, 0x10C8F0);
+                            boxc(v, ps, -1100, 1100, -20, 0, 2600, 3500, 0x302820);   /* the windscreen */
+                            VPIX_Render_AddMesh(HTRAIN, v, ps); }
+                        sphere(HSKY, TSKY, 16, 32); sphere(HORB2, TORB2, 12, 20);
+                        if (rd_rgba("BBALL", 0x7FFD0763u, false)) sphere(0x7FFF1765u, 0x7FFD0763u, 12, 24);   /* the museum's Buggy Ball (orb hall) */
+                        {   /* the neon grid: 16 x 16 tiles of 6 m, centred */
+                            std::vector<float> v; std::vector<VPIX_MeshPoly> ps; const float uv[4][2] = {{0, 0}, {1, 0}, {1, 1}, {0, 1}};
+                            for (int i = 0; i < 16; i++) for (int j = 0; j < 16; j++) { const float x0 = -48000.f + i * 6000.f, y0 = -48000.f + j * 6000.f;
+                                const uint32_t b = (uint32_t)(v.size() / 3); VPIX_MeshPoly q; q.n = 4;
+                                const float c[4][3] = {{x0, y0, 0}, {x0 + 6000, y0, 0}, {x0 + 6000, y0 + 6000, 0}, {x0, y0 + 6000, 0}};
+                                for (int k = 0; k < 4; k++) { v.push_back(c[k][0]); v.push_back(c[k][1]); v.push_back(c[k][2]); q.idx[k] = b + (uint32_t)k; q.uv[k][0] = uv[k][0]; q.uv[k][1] = uv[k][1]; }
+                                q.flags = 0x20FFFFFF; q.tex = TGRID2; q.nx = 0; q.ny = 0; q.nz = 1; ps.push_back(q); }
+                            VPIX_Render_AddMesh(HGRID, v, ps); }
+                        {   /* neon rings, radius 3 m, in the local x-z plane (facing y), 32 segments: magenta, cyan, yellow, green (0xBBGGRR) */
+                            static const uint32_t rc[4] = {0xDC3CFF, 0xFFE63C, 0x3CE6FF, 0x60FF60};
+                            for (int r = 0; r < 4; r++) { std::vector<float> v; std::vector<VPIX_MeshPoly> ps; const int N = 32;
+                                for (int k = 0; k < N; k++) { const float a0 = 6.2831853f * k / N, a1 = 6.2831853f * (k + 1) / N;
+                                    const uint32_t b = (uint32_t)(v.size() / 3);
+                                    const float p8[8][3] = {{2850 * cosf(a0), -120, 2850 * sinf(a0)}, {3150 * cosf(a0), -120, 3150 * sinf(a0)}, {3150 * cosf(a1), -120, 3150 * sinf(a1)}, {2850 * cosf(a1), -120, 2850 * sinf(a1)},
+                                                            {2850 * cosf(a0), 120, 2850 * sinf(a0)}, {3150 * cosf(a0), 120, 3150 * sinf(a0)}, {3150 * cosf(a1), 120, 3150 * sinf(a1)}, {2850 * cosf(a1), 120, 2850 * sinf(a1)}};
+                                    for (auto &q : p8) { v.push_back(q[0]); v.push_back(q[1]); v.push_back(q[2]); }
+                                    const int fq[4][4] = {{0, 1, 2, 3}, {7, 6, 5, 4}, {1, 5, 6, 2}, {4, 0, 3, 7}};   /* front, back, outside, inside */
+                                    const float am = 0.5f * (a0 + a1); const float fn[4][3] = {{0, -1, 0}, {0, 1, 0}, {cosf(am), 0, sinf(am)}, {-cosf(am), 0, -sinf(am)}};
+                                    for (int s = 0; s < 4; s++) { VPIX_MeshPoly q; q.n = 4; for (int c = 0; c < 4; c++) q.idx[c] = b + (uint32_t)fq[s][c];
+                                        q.flags = 0x20000000 | rc[r]; q.nx = fn[s][0]; q.ny = fn[s][1]; q.nz = fn[s][2]; ps.push_back(q); } }
+                                VPIX_Render_AddMesh(HRING + (uint32_t)r, v, ps); } }
+                        end_es = nt == 7 ? 1 : -1;
+                        lg("HLE: VPIX_ENDING %s: %s", ed, end_es == 1 ? "built" : "** pictures missing");
+                        if (end_es == 1) std::thread([ed]() {
+                            static const char *ff = getenv("VPIX_FFMPEG") ? getenv("VPIX_FFMPEG") : "ffmpeg";
+                            const char *names[6] = {"RUMBLE", "HORN", "WHOOSH", "SHIMMER", "HONK", "DOOR"}; std::vector<VSound> got(6);
+                            for (int n = 0; n < 6; n++) {
+                                char cmd[2048]; snprintf(cmd, sizeof(cmd), "\"%s\" -v quiet -i \"%s\\%s.wav\" -f s16le -ac 1 -ar 22050 -", ff, ed, names[n]);
+                                got[n].rate = 22050;
+                                if (void *pa = VPIX_PipeOpen(cmd)) { std::vector<int16_t> chunk(32768); size_t r;
+                                    while ((r = VPIX_PipeRead(pa, chunk.data(), chunk.size() * 2)) > 0) got[n].pcm.insert(got[n].pcm.end(), chunk.begin(), chunk.begin() + r / 2);
+                                    VPIX_PipeClose(pa); }
+                            }
+                            door_snd = got[5]; door_ready = !door_snd.pcm.empty(); got.resize(5);
+                            esnd.swap(got); esnd_ready = true; lg("HLE: VPIX_ENDING sounds %u %u %u %u", (unsigned)esnd[0].pcm.size(), (unsigned)esnd[1].pcm.size(), (unsigned)esnd[2].pcm.size(), (unsigned)esnd[3].pcm.size());
+                        }).detach();
+                    }
+                }
+                /* THE JOKE GUN (Bobby 10-29: "if you shoot a little flag that says bang comes out"): the museum's guns don't fire, so a pull
+                   of the right trigger pops a little BANG! flag out of the barrel: it shoots out 25 cm in a blink, wobbles, hangs ~1 s, goes */
+                {   static unsigned long long bang_at = 0; static bool was = false;
+                    const bool tr = (cur_in.buttons & VPIX_BTN_TRIGGER) != 0;
+                    if (tr && !was && !end_t0 && mall_in_room) { bang_at = now;   /* + the clown horn (Bobby 10-29: "clown horn honk noise") */
+                        if (esnd_ready && !esnd[4].pcm.empty()) for (int v = 31; v >= 0; v--) if (!voices[v].on) { voices[v] = VVoice(); voices[v].s = &esnd[4]; voices[v].vol = 110; voices[v].on = true; break; } }
+                    was = tr;
+                    const float e = bang_at ? (now - bang_at) / 1000.f : 99.f;
+                    float go[3], gd[3];
+                    if (e < 1.4f && gun_ray_now(my_cart, go, gd)) {
+                        const float out = 120.f + 250.f * (std::min)(1.f, e / 0.08f), wob = e < 0.5f ? 40.f * sinf(e * 40.f) * (0.5f - e) : 0.f;
+                        float bp[3]; for (int c = 0; c < 3; c++) bp[c] = go[c] + gd[c] * out; bp[2] += 90.f + wob;
+                        VPIX_Blit b = {}; b.handle = 0x7FFD00E7u; b.sw = 256; b.sh = 128; b.key = -1; b.world = true; b.dw = 260.f; b.dh = 130.f;
+                        b.pivot[0] = b.dw * 0.5f; b.pivot[1] = b.dh * 0.5f; for (int c = 0; c < 3; c++) b.pos[c] = bp[c];
+                        b.alpha = e > 1.1f ? (1.4f - e) / 0.3f : 1.f; b.prio = 100060; b.top = true; f.blits.push_back(b); } }
+                static const bool end_now = getenv("VPIX_ENDING_NOW") && atoi(getenv("VPIX_ENDING_NOW"));
+                if (end_es == 1 && end_now && !end_t0 && reached >= 0) { end_t0 = now; lg("HLE: VPIX_ENDING starts (VPIX_ENDING_NOW)"); }
+                if (end_es == 1 && end_t0) {
+                    static unsigned long long was_t0 = 0; static float P0[3], F0[2]; static int cue = 0;
+                    if (was_t0 != end_t0) { was_t0 = end_t0; cue = 0;   /* the ending's frame: where the rider is and which way the cart faces, fixed at its start */
+                        for (int q = 0; q < 3; q++) P0[q] = f.cam_T[q];
+                        F0[0] = rd_f(my_cart + 0x13); F0[1] = rd_f(my_cart + 0x17); const float l = sqrtf(F0[0] * F0[0] + F0[1] * F0[1]);
+                        if (l > 1e-3f) { F0[0] /= l; F0[1] /= l; } else { F0[0] = f.cam_R[1][0]; F0[1] = f.cam_R[1][1]; const float l2 = sqrtf(F0[0] * F0[0] + F0[1] * F0[1]) + 1e-6f; F0[0] /= l2; F0[1] /= l2; } }
+                    const float t = (now - end_t0) / 1000.f;
+                    if (t >= 41.f) { P0[0] = f.cam_T[0]; P0[1] = f.cam_T[1]; }   /* riding on: the cyberspace travels with the cart */
+                    const float T_DROP = 7.5f, T_BLACK = 10.5f, T_TITLE = 21.f, T_SOON = 24.5f, T_FADE = 31.f, T_CRED1 = 32.5f, T_CRED2 = 36.7f, T_END = 41.f;   /* tighter after the title (10-29: "stays in lawn people to long after the text") */
+                    const float Rt[2] = {F0[1], -F0[0]};   /* the cart's right */
+                    /* sounds, each once at its time */
+                    auto play = [&](int n, int vol) { if (!esnd_ready || esnd[n].pcm.empty()) return;
+                        for (int v = 31; v >= 0; v--) if (!voices[v].on) { voices[v] = VVoice(); voices[v].s = &esnd[n]; voices[v].vol = vol; voices[v].on = true; break; } };
+                    static const float cues[6] = {0.f, 2.f, 5.f, 6.8f, T_DROP, T_BLACK + 0.5f}; static const int cue_snd[6] = {0, 1, 1, 1, 2, 3};
+                    while (cue < 6 && t >= cues[cue]) { play(cue_snd[cue], cue_snd[cue] == 3 ? 100 : 127); cue++; }
+                    /* the ride music: gone in the tunnel, back soft for the float, up for the credits */
+                    duck_to = t < T_BLACK + 1.f ? 0.f : t < T_FADE ? 0.3f : 0.45f;
+                    /* the world goes: everything drawn so far (the hall, exhibits, track, carts, the game's sprites) except our own
+                       hands; anything added later in the frame goes too (end_scrub, before the frame is sent) */
+                    f.inst.erase(std::remove_if(f.inst.begin(), f.inst.end(), [](const VPIX_Instance &g) { return !g.own_hand; }), f.inst.end());
+                    const bool world_sprites = t < T_END;   /* after game over the game's initials are world sprites: they stay (our own glows and beams never) */
+                    /* + the 2D layer (the score sat on the LAWN PEOPLE title, 10-29 test) until game over */
+                    f.blits.erase(std::remove_if(f.blits.begin(), f.blits.end(), [&](const VPIX_Blit &b) {
+                        return world_sprites || (b.world && b.handle >= 0x7FFD0000u && b.handle < 0x7FFE0000u); }), f.blits.end());
+                    auto put = [&](uint32_t h, float x, float y, float z, const float R[3][3], float sc) -> VPIX_Instance & {
+                        VPIX_Instance g = {}; g.handle = h; g.light_mask = 1; g.bright = 1; for (int k = 0; k < 16; k++) g.pal[k] = g.palw[k] = 0xFFFFFF;
+                        for (int r = 0; r < 3; r++) for (int q = 0; q < 3; q++) g.R[r][q] = R[r][q];
+                        g.T[0] = x; g.T[1] = y; g.T[2] = z; g.S[0] = g.S[1] = g.S[2] = sc; f.inst.push_back(g); return f.inst.back(); };
+                    auto blit = [&](uint32_t h, int sw, int sh, const float p[3], float w, float hh, float alpha, bool top) {
+                        if (alpha <= 0.003f) return;
+                        VPIX_Blit b = {}; b.handle = h; b.sw = sw; b.sh = sh; b.key = -1; b.world = true; b.dw = w; b.dh = hh; b.pivot[0] = w * 0.5f; b.pivot[1] = hh * 0.5f;
+                        for (int q = 0; q < 3; q++) b.pos[q] = p[q]; b.alpha = (std::min)(1.f, alpha); b.prio = 99400; b.top = top; b.nofog = true; f.blits.push_back(b); };
+                    /* the cart frame as a rotation: x = right, y = ahead, z = up */
+                    const float RF[3][3] = {{Rt[0], Rt[1], 0}, {F0[0], F0[1], 0}, {0, 0, 1}};
+                    uint8_t sky[3] = {0, 0, 0}; float fs = 0.f, fe = 0.f;
+                    if (t < T_BLACK) {
+                        /* ---- the tunnel + the train ---- */
+                        const float fallz = t > T_DROP ? 0.5f * 9800.f * (t - T_DROP) * (t - T_DROP) : 0.f;   /* we fall = the tunnel flies up */
+                        const float floor_z = P0[2] - 1700.f + fallz;
+                        for (int k = -3; k < 30; k++) { const float y = k * 4000.f;
+                            put(HTUN, P0[0] + F0[0] * y, P0[1] + F0[1] * y, floor_z, RF, 1.f); }
+                        /* the train: from 150 m out, faster and faster, at the cart at 8 s (the drop comes first) */
+                        const float u = (std::min)(1.f, t / 8.f), D = 150000.f * (1.f - powf(u, 1.6f)) + 2500.f;
+                        const float tp[3] = {P0[0] + F0[0] * D, P0[1] + F0[1] * D, floor_z};
+                        const float RT[3][3] = {{Rt[0], Rt[1], 0}, {F0[0], F0[1], 0}, {0, 0, 1}};
+                        if (D < 60000.f) put(HTRAIN, tp[0], tp[1], tp[2], RT, 1.f);
+                        const float hp[3] = {tp[0] - F0[0] * 60.f, tp[1] - F0[1] * 60.f, floor_z + 3900.f};
+                        const float near_ = 1.f - (std::min)(1.f, D / 150000.f);
+                        blit(BLITE, 32, 32, hp, 1800.f + 3000.f * near_, 1800.f + 3000.f * near_, 0.6f + 0.4f * near_, false);   /* the lamp */
+                        blit(BLITE, 32, 32, hp, 9000.f + 30000.f * near_ * near_, 9000.f + 30000.f * near_ * near_, 0.25f + 0.5f * near_ * near_, false);   /* its glare */
+                        fs = 3000.f; fe = 38000.f;
+                        if (t > T_DROP) { const float k = (t - T_DROP) / (T_BLACK - T_DROP); fe = 38000.f * (1.f - 0.7f * k); }
+                    } else {
+                        /* ---- the fall, then the float ---- */
+                        const float tc = t - T_BLACK;
+                        const float p = 22000.f * 1.6f * (1.f - expf(-tc / 1.6f)) + 150.f * tc;   /* how far we've fallen (slowing to a slow sink) */
+                        const float base = P0[2] + p - 35200.f;   /* the cyberspace's level: comes up from 35 m below to the rider, then drifts */
+                        /* FLYING (Bobby 10-29: "LawnPeople we should be able to slowly fly around"): in the float the stick drifts the rider
+                           through the space (2.5 m/s, on the flat): the space is moved the other way; the cards stay in front */
+                        static float fly[2] = {0, 0}; static unsigned long long fly_ms = 0; static unsigned long long fly_t0 = 0;
+                        if (fly_t0 != end_t0) { fly_t0 = end_t0; fly[0] = fly[1] = 0; fly_ms = now; }
+                        { const float dts = (std::min)(0.1f, (now - fly_ms) / 1000.f); fly_ms = now;
+                          if (tc > 3.f && t < T_FADE) { const float jx = fabsf(cur_in.joy[0]) > 0.15f ? cur_in.joy[0] : 0.f, jy = fabsf(cur_in.joy[1]) > 0.15f ? cur_in.joy[1] : 0.f;
+                              for (int q = 0; q < 2; q++) fly[q] += (F0[q] * jy + Rt[q] * jx) * 2500.f * dts; } }
+                        const float PV[3] = {P0[0] - fly[0], P0[1] - fly[1], P0[2]};
+                        {   VPIX_Instance &g = put(HSKY, f.cam_T[0], f.cam_T[1], f.cam_T[2], RF, 120.f); g.backdrop = 1;   /* the nebula, round the rider, first */
+                            const float a = t * 0.02f, c = cosf(a), s = sinf(a); g.R[0][0] = c; g.R[0][1] = s; g.R[0][2] = 0; g.R[1][0] = -s; g.R[1][1] = c; g.R[1][2] = 0;
+                            g.R[2][0] = 0; g.R[2][1] = 0; g.R[2][2] = 1;
+                            VPIX_Instance sk = g; f.inst.pop_back(); f.inst.insert(f.inst.begin(), sk); }
+                        put(HGRID, PV[0], PV[1], base - 18000.f, RF, 1.f);   /* the grid far below */
+                        /* the rings we fall through (flat, round the rider), then the ring tunnel ahead */
+                        const float RH[3][3] = {{1, 0, 0}, {0, 0, -1}, {0, 1, 0}};
+                        for (int i = 0; i < 6; i++) { const float z = P0[2] - 6000.f - 7000.f * i + p;
+                            if (z > P0[2] + 30000.f || z < P0[2] - 60000.f) continue;
+                            put(HRING + (uint32_t)(i % 4), PV[0], PV[1], z, RH, 1.6f); }
+                        for (int i = 0; i < 9; i++) { const float y = 22000.f + i * 6000.f, wob = sinf(t * 0.6f + i * 0.7f) * 600.f;   /* centred on the eye: reads as a tunnel (above it, a stack: 10-29 test) */
+                            VPIX_Instance &g = put(HRING + (uint32_t)((i + (int)(t * 2.f)) % 4), PV[0] + F0[0] * y + Rt[0] * wob, PV[1] + F0[1] * y + Rt[1] * wob, f.cam_T[2], RF, 2.2f);
+                            const float a = t * 0.4f + i * 0.35f, c = cosf(a), s = sinf(a);   /* each turning slowly about the tunnel's line */
+                            g.R[0][0] = c * Rt[0]; g.R[0][1] = c * Rt[1]; g.R[0][2] = s; g.R[2][0] = -s * Rt[0]; g.R[2][1] = -s * Rt[1]; g.R[2][2] = c; }
+                        /* chrome orbs, bobbing and turning */
+                        for (int i = 0; i < 6; i++) { const float an = 0.6f + i * 1.05f, rr = 11000.f + (i % 3) * 5000.f;
+                            const float ca = cosf(an), sa = sinf(an), x = Rt[0] * ca * rr + F0[0] * sa * rr, y = Rt[1] * ca * rr + F0[1] * sa * rr;
+                            const float sp = t * (0.3f + 0.1f * i), RS[3][3] = {{cosf(sp), sinf(sp), 0}, {-sinf(sp), cosf(sp), 0}, {0, 0, 1}};
+                            put(HORB2, PV[0] + x, PV[1] + y, base + 1500.f + (i % 4) * 2200.f + 600.f * sinf(t * 0.7f + i), RS, 1.f + (i % 3) * 0.6f); }
+                        /* BALLS for the sword (Bobby 10-29: "balls hit with sward are like buggy balls"): four small chrome balls floating in
+                           reach round the rider; the blade bats one away along the swing (thunk + buzz), it drifts, then floats home */
+                        {   struct Ball { float d[3], v[3]; unsigned long long hit = 0; }; static Ball bl[4]; static unsigned long long bt0 = 0, bms = 0;
+                            if (bt0 != end_t0) { bt0 = end_t0; for (auto &b : bl) { b = Ball(); } bms = now; }
+                            const float dts = (std::min)(0.1f, (now - bms) / 1000.f); bms = now;
+                            static float lastB[3] = {0, 0, 0}; static unsigned long long lastBms = 0; float sv[3] = {0, 0, 0};
+                            const bool sw = sword_ms && now - sword_ms < 200;
+                            if (sw && lastBms && sword_ms > lastBms) { const float d = (sword_ms - lastBms) / 1000.f; for (int q = 0; q < 3; q++) sv[q] = (sword_B[q] - lastB[q]) / d; }
+                            if (sw) { memcpy(lastB, sword_B, sizeof(lastB)); lastBms = sword_ms; }
+                            for (int i = 0; i < 4; i++) { Ball &b = bl[i];
+                                const float an = 0.8f + i * 1.57f, hr = 2200.f + (i % 2) * 600.f;
+                                const float home[3] = {f.cam_T[0] + (Rt[0] * cosf(an) + F0[0] * sinf(an)) * hr, f.cam_T[1] + (Rt[1] * cosf(an) + F0[1] * sinf(an)) * hr,
+                                                       f.cam_T[2] - 300.f + 250.f * sinf(t * 0.9f + i)};
+                                for (int q = 0; q < 3; q++) { b.v[q] -= b.d[q] * 0.6f * dts; b.v[q] *= powf(0.55f, dts); b.d[q] += b.v[q] * dts; }   /* drift, slow down, float home */
+                                float bp[3]; for (int q = 0; q < 3; q++) bp[q] = home[q] + b.d[q];
+                                if (sw && now - b.hit > 350) {   /* the blade against the ball (radius 350 mm) */
+                                    float ab[3], ap[3], l2 = 0, u = 0; for (int q = 0; q < 3; q++) { ab[q] = sword_B[q] - sword_A[q]; ap[q] = bp[q] - sword_A[q]; l2 += ab[q] * ab[q]; u += ab[q] * ap[q]; }
+                                    u = l2 > 0 ? (std::max)(0.f, (std::min)(1.f, u / l2)) : 0.f; float dd = 0, nv[3];
+                                    for (int q = 0; q < 3; q++) { nv[q] = bp[q] - (sword_A[q] + ab[q] * u); dd += nv[q] * nv[q]; } dd = sqrtf(dd);
+                                    if (dd < 450.f) { b.hit = now; const float spd = sqrtf(sv[0] * sv[0] + sv[1] * sv[1] + sv[2] * sv[2]);
+                                        for (int q = 0; q < 3; q++) b.v[q] += (dd > 1.f ? nv[q] / dd : F0[q % 2]) * 2500.f + sv[q] * 0.8f;
+                                        play_game_sound(2, 100); VPIX_Haptic(1, 0.15f + (std::min)(0.4f, spd / 20000.f), 1.f); } }
+                                const float sp = t * 0.8f + i, RS2[3][3] = {{cosf(sp), sinf(sp), 0}, {-sinf(sp), cosf(sp), 0}, {0, 0, 1}};
+                                VPIX_Instance &g = put(HORB2, bp[0], bp[1], bp[2], RS2, 0.35f); (void)g; } }
+                        /* the statue people: every character with a hi-res model, each a bold glossy colour, floating round the rider */
+                        {   static const uint32_t col[6] = {0xE8202Au, 0x2050F0u, 0x10C060u, 0xF0B020u, 0x9030E0u, 0xFF7020u};   /* candy red, cobalt, emerald, gold, violet, tangerine */
+                            std::vector<int> chars; int host = -1;
+                            for (int i = 0; i < (int)ex.size(); i++) if (ex[i].has_near && ex[i].hires && ex[i].pm.ok && ex[i].name.rfind("CHAR_", 0) == 0) {
+                                bool dup = false; for (int c : chars) if (ex[c].name == ex[i].name) dup = true;   /* the host is in the tour twice */
+                                if (!dup) chars.push_back(i);
+                                if (host < 0 && ex[i].name.rfind("CHAR_BOBBY", 0) == 0) host = i; }
+                            const int NS = chars.empty() ? 0 : 7;
+                            for (int k = 0; k < NS; k++) { const int i = chars[k % chars.size()];
+                                const float h = ex[i].pm.zmax - ex[i].pm.zmin, sc = 1750.f / h * (0.9f + 0.1f * (k % 3));
+                                const float an = 0.6f + k * 0.8f, rr = 6500.f + (k % 3) * 2500.f;   /* round the rider, the title's spot (straight ahead) left clear */
+                                const float ca = cosf(an + 1.5708f), sa = sinf(an + 1.5708f);
+                                const float x = PV[0] + Rt[0] * ca * rr + F0[0] * sa * rr, y = PV[1] + Rt[1] * ca * rr + F0[1] * sa * rr;
+                                VPIX_Instance g = {}; g.handle = 0x7FFF1500u + (uint32_t)i; g.light_mask = 1; for (int e = 0; e < 16; e++) g.pal[e] = g.palw[e] = 0xFFFFFF;
+                                yaw_to(g, cosf(t * 0.35f + k), sinf(t * 0.35f + k), 0.f);   /* turning slowly */
+                                for (int q = 0; q < 3; q++) g.S[q] = sc;
+                                g.T[0] = x; g.T[1] = y; g.T[2] = base - 1800.f + (k % 4) * 1300.f + 500.f * sinf(t * 0.5f + k * 1.3f) - ex[i].pm.zmin * sc;
+                                g.statue = col[k % 6]; g.gloss = 0.9f; g.lum = 1.25f; f.inst.push_back(g); }
+                            if (host >= 0) {   /* Bobby floating beside the rider, in the space's shifting colours */
+                                const int i = host; const float h = ex[i].pm.zmax - ex[i].pm.zmin, sc = 1750.f / h;
+                                VPIX_Instance g = {}; g.handle = 0x7FFF1500u + (uint32_t)i; g.light_mask = 1; for (int e = 0; e < 16; e++) g.pal[e] = g.palw[e] = 0xFFFFFF;
+                                yaw_to(g, F0[0], F0[1], 0.25f * sinf(t * 0.3f)); for (int q = 0; q < 3; q++) g.S[q] = sc;
+                                g.T[0] = f.cam_T[0] + Rt[0] * 2400.f + F0[0] * 900.f; g.T[1] = f.cam_T[1] + Rt[1] * 2400.f + F0[1] * 900.f;
+                                g.T[2] = base - 1500.f + 300.f * sinf(t * 0.6f) - ex[i].pm.zmin * sc;
+                                const float hu = t * 0.12f; auto ch = [&](float o) { return (uint32_t)(150.f + 105.f * sinf(6.2831853f * (hu + o))); };
+                                g.statue = ch(0.f) << 16 | ch(0.33f) << 8 | ch(0.67f); g.gloss = 1.f; g.lum = 1.3f; f.inst.push_back(g); } }
+                        /* the neon haze in the space */
+                        for (int i = 0; i < 5; i++) { const float an = i * 1.2566f + t * 0.05f;
+                            const float gp[3] = {PV[0] + (Rt[0] * cosf(an) + F0[0] * sinf(an)) * 30000.f, PV[1] + (Rt[1] * cosf(an) + F0[1] * sinf(an)) * 30000.f, base + 4000.f};
+                            blit(BPINK, 32, 32, gp, 26000.f, 26000.f, 0.18f * (t < T_FADE ? 1.f : (std::max)(0.f, 1.f - (t - T_FADE) / 1.5f)), false); }   /* glows ignore the fog: faded with the black by hand */
+                        /* the cards, straight ahead of the cart */
+                        const float ahead[3] = {P0[0] + F0[0] * 12000.f, P0[1] + F0[1] * 12000.f, f.cam_T[2] + 2600.f};   /* above the ring tunnel, big (10-29 test: small, behind the rings) */
+                        auto fade_in = [&](float a, float b) { return (std::max)(0.f, (std::min)(1.f, (t - a) / (b - a))); };
+                        if (t < T_END) {
+                            const float out = 1.f - fade_in(T_FADE - 0.5f, T_FADE + 1.f);
+                            blit(BTITLE, 1024, 256, ahead, 19000.f, 4750.f, fade_in(T_TITLE, T_TITLE + 1.5f) * out, true);
+                            const float sp[3] = {ahead[0], ahead[1], ahead[2] - 3300.f};
+                            blit(BSOON, 1024, 128, sp, 13000.f, 1625.f, fade_in(T_SOON, T_SOON + 1.f) * out, true);
+                        }
+                        fs = 0.f; fe = 0.f;   /* no fog out here */
+                        /* the sky colour behind the nebula: a slow violet - magenta - blue cycle */
+                        sky[0] = (uint8_t)(18 + 14 * sinf(t * 0.3f)); sky[1] = 4; sky[2] = (uint8_t)(34 + 14 * sinf(t * 0.3f + 2.f));
+                    }
+                    /* the black: in at the drop, out as the fall starts; again at the end, under the credits */
+                    float veil = 0.f;
+                    if (t > T_DROP + 1.6f && t < T_BLACK + 2.f) veil = t < T_BLACK ? (t - T_DROP - 1.6f) / (T_BLACK - T_DROP - 1.6f) : 1.f - (t - T_BLACK) / 2.f;
+                    if (t > T_FADE) veil = (std::min)(1.f, (t - T_FADE) / 1.5f);   /* and black on through the run to the end of the line (the game's own end clears it) */
+                    /* done with the fog, not black cards (10-29 test: the cards came out smaller than the view: a black square): the
+                       fog closes in to black at the eye, so every direction goes dark; the title and credit cards (nofog) still show */
+                    if (veil > 0.f) { veil = (std::min)(1.f, veil);
+                        const float fe0 = fe > 0.f ? fe : 300000.f, k = 1.f - veil;
+                        for (int c = 0; c < 3; c++) sky[c] = (uint8_t)(sky[c] * k);
+                        fs = fs * k * k; fe = (std::max)(2.f, fe0 * k * k * k); }
+                    if (t > T_CRED1 && t < T_END) {   /* the credits, over the black */
+                        const float cp[3] = {f.cam_T[0] + F0[0] * 4000.f, f.cam_T[1] + F0[1] * 4000.f, f.cam_T[2] + 100.f};
+                        auto io = [&](float a, float b) { return (std::min)((std::min)(1.f, (t - a) / 0.6f), (std::min)(1.f, (b - t) / 0.6f)); };
+                        if (t < T_CRED2) blit(BCRED1, 1024, 256, cp, 7600.f, 1900.f, io(T_CRED1, T_CRED2 - 0.2f), true);
+                        else blit(BCRED2, 1024, 256, cp, 7600.f, 1900.f, io(T_CRED2, T_END - 0.3f), true);
+                    }
+                    for (int c = 0; c < 3; c++) { f.clear[c] = sky[c]; f.fog_col[c] = sky[c]; } f.fog_start = fs; f.fog_end = fe;
+                    end_scrub.on = true; end_scrub.world = world_sprites; for (int c = 0; c < 3; c++) end_scrub.clear[c] = sky[c]; end_scrub.fog_start = fs; end_scrub.fog_end = fe;
+                    /* over: the clock to 0 -> the game's game over, end song, initials (the cyberspace stays behind them) */
+                    /* over: the cart rides on (fast) through the rest of the track and the end of the line, which finishes the ride the
+                       game's own way (game over, initials). The clock to 0 here left it hanging in the cyberspace (10-29 full ride: the
+                       museum isn't the last section any more) */
+                    if (t >= T_END) { static unsigned long long logged = 0; if (logged != end_t0) { logged = end_t0; lg("HLE: VPIX_ENDING over: riding on to the end of the line"); } }
+                    if (t >= T_END + 8.f && rd_f(my_cart + 0xD) > 0.f) {   /* backup, 20 s on: the clock to 0 (that ends it too, slowly: 10-29 "now it restarted") */
+                        const float z = 0.f; uint32_t uu; memcpy(&uu, &z, 4); mem_writed(my_cart + 0xD, uu); }
+                }
+            }
+        }
+        narr_duck += ((hap_ms_now() < dm_duck_until ? (std::min)(duck_to, 0.12f) : duck_to) - narr_duck) * 0.05f;   /* + DevilMaster's line */
+        /* VPIX_REDEYE_CABS=<CAB_REDEYE_WRESTLEFEST.BIN> (Bobby 10-28: "add the red eye arcades in pairs randomly in the game maybe along the
+           sides in the cave sections or in the village with the dogs places where these ground but not to many unless you line the
+           tunnel at a part with a row"): the sitcom's red-eye cabinets in pairs on the ground beside about 1 in 11 trees (the village)
+           and stalagmites (the caves), never in the hell or mall stages; one stalagmite per ride gets a row of six instead. Turned to
+           face the rider when first seen (then fixed), screens glowing Static's red eye. Looks only. */
+        {
+            static const char *rc = getenv("VPIX_REDEYE_CABS"); static int rcs = 0; static PM cab; const uint32_t HCAB = 0x7FFF1202u;
+            /* Bobby's own cabinets for the town (10-28: "the arcade machines looked great you can add more in the town"): the CAB_*.BIN
+               next to the red-eye one */
+            static const char *town_names[] = {"CAB_ASTRO_FIGHTER", "CAB_SPACE_INVADERS", "CAB_SSF2_TURBO", "CAB_METAL_SLUG", "CAB_WRESTLEFEST",
+                "CAB_CRUISN_USA", "CAB_CRAZY_TAXI", "CAB_BEACH_HEAD", "CAB_SHOOTOUT", "CAB_SILVER_STRIKE", "CAB_WORLD_SERIES", "CAB_SEARS_MULTICADE",
+                "CAB_CRANE_CLAW", "CAB_GUMBALL_PINBALL"};
+            static std::vector<std::pair<uint32_t, PM>> town;
+            if (rcs == 0) { rcs = -1; if (rc && *rc) { cab = load_bin(rc, HCAB); rcs = cab.ok ? 1 : -1;
+                std::string dir = rc; const size_t sl2 = dir.find_last_of("\\/"); dir = sl2 == std::string::npos ? "." : dir.substr(0, sl2);
+                for (int k = 0; k < (int)(sizeof(town_names) / sizeof(town_names[0])); k++) { PM pm = load_bin(dir + "\\" + town_names[k] + ".BIN", 0x7FFF1220u + (uint32_t)k);
+                    if (pm.ok) town.push_back({0x7FFF1220u + (uint32_t)k, pm}); }
+                lg("HLE: VPIX_REDEYE_CABS %s: %s, %u town cabinets", rc, cab.ok ? "loaded" : "** missing", (unsigned)town.size()); } }
+            static std::map<uint64_t, float> facing; static uint64_t row_key = 0;
+            if (!my_cart) { facing.clear(); row_key = 0; }
+            if (rcs == 1 && my_cart && stage != hell_st && stage != mall_st) {
+                static std::map<uint32_t, int> gk;   /* 1 tree, 2 stalagmite */
+                const size_t n0 = f.inst.size();
+                for (size_t i = 0; i < n0; i++) {
+                    const VPIX_Instance src = f.inst[i];
+                    auto kd = gk.find(src.handle);
+                    if (kd == gk.end()) { int kk = 0; auto mf = model_files.find(src.handle);
+                        if (mf != model_files.end()) { std::string lo = mf->second; std::transform(lo.begin(), lo.end(), lo.begin(), ::tolower);
+                            if (lo.find("tree_1.bin") != std::string::npos || lo.find("tree_2.bin") != std::string::npos) kk = 1;
+                            else if (lo.find("rmite01.bin") != std::string::npos || lo.find("redmite.bin") != std::string::npos) kk = 2; }
+                        kd = gk.emplace(src.handle, kk).first; }
+                    if (!kd->second) continue;
+                    const uint64_t pk = key_of(src.T); const uint32_t hsh = (uint32_t)(pk ^ pk >> 31) * 2246822519u;
+                    if (kd->second == 2 && !row_key && hsh % 5 == 2) row_key = pk;
+                    const bool row = pk == row_key;
+                    const bool village = kd->second == 1;
+                    {   const uint32_t dh = (uint32_t)((int)(src.T[0] / 100.f) * 73856093) ^ (uint32_t)((int)(src.T[1] / 100.f) * 19349663);
+                        if (village && dh % 6 == 5) continue; }   /* a billboard tree (VPIX_DECOR) */
+                    const bool town_pair = village && !town.empty() && hsh % 5 == 1;   /* about 1 in 5 village trees: two of Bobby's cabinets */
+                    if (!row && !town_pair && hsh % 11 != 4) continue;
+                    float P[3] = {src.T[0] + 2300.f * cosf((hsh >> 8) % 628 / 100.f), src.T[1] + 2300.f * sinf((hsh >> 8) % 628 / 100.f), src.T[2]};
+                    auto fc = facing.find(pk);
+                    if (fc == facing.end()) fc = facing.emplace(pk, atan2f(f.cam_T[0] - P[0], -(f.cam_T[1] - P[1]))).first;
+                    const float a = fc->second, ax = cosf(a), ay = sinf(a);   /* the pair / row runs along the cabinets' local x */
+                    const int n = row ? 6 : 2;
+                    for (int k = 0; k < n; k++) {
+                        const float off = (k - (n - 1) * 0.5f) * 1500.f;
+                        const std::pair<uint32_t, PM> *tc = town_pair ? &town[(hsh / 5 + (uint32_t)k * 7) % town.size()] : NULL;
+                        const PM &cm = tc ? tc->second : cab; const float csc = 1800.f / (cm.zmax - cm.zmin);
+                        VPIX_Instance g = {}; g.handle = tc ? tc->first : HCAB; g.light_mask = 1;
+                        g.R[0][0] = ax; g.R[0][1] = ay; g.R[1][0] = -ay; g.R[1][1] = ax; g.R[2][2] = 1.f;
+                        if (front != 0.f) { const float b = a + front; g.R[0][0] = cosf(b); g.R[0][1] = sinf(b); g.R[1][0] = -sinf(b); g.R[1][1] = cosf(b); }
+                        for (int q = 0; q < 3; q++) g.S[q] = csc;
+                        g.T[0] = P[0] + ax * off; g.T[1] = P[1] + ay * off; g.T[2] = P[2] - cm.zmin * csc;
+                        for (int e = 0; e < 16; e++) g.pal[e] = g.palw[e] = 0xFFFFFF;
+                        f.inst.push_back(g);
+                        if (tc) continue;   /* the town cabinets: no red eye */
+                        const float fl = 0.85f + 0.15f * sinf(now / 1000.f * 2.5f + k + (float)(hsh % 5));
+                        float ep[3] = {g.T[0] + ay * 300.f, g.T[1] - ax * 300.f, P[2] + 1450.f};   /* in front of the screen (local -y) */
+                        put_glow(GEYE, ep, 700.f * fl, 1.f); put_glow(GEYE, ep, 2000.f * fl, 0.35f);
+                    }
+                }
+            }
+        }
+        /* CRITTER BALLS (Bobby 10-28: the critter ball on the track is "like a cereal bowl" until it's shot - its 8 chunks sit in the
+           barrier's own part poses - and "put the critter graphic on it"): while a ball's 8 chunks are still together, MallVR hides them
+           and draws one solid sphere wearing the picture; once shot, the chunks fly apart as before (the effect Bobby likes).
+           ROLLING BALLS (his boulder picture: "have it roll towards us", "in random spots", "it should bounce off you like buggy ball",
+           "rider went inside the ball dont let that happen"): every 18-35 s of riding (not in the mall ride) a giant critter ball (5 m)
+           appears on the track 60-75 m ahead and rolls at the cart. It never passes through: at contact it bounces off up and away
+           over the side, the cart jolts (speed cut, crash sound, both hands buzz). Six shots burst it into critters (+200). */
+        if (ball_solid && ball_chunks == 8) {
+            std::vector<int> part(f.inst.size(), -1);
+            {   static std::map<uint32_t, int> pk2;
+                for (size_t i = 0; i < f.inst.size(); i++) {
+                    auto it = pk2.find(f.inst[i].handle);
+                    if (it == pk2.end()) { int k = -1; auto mf = model_files.find(f.inst[i].handle);
+                        if (mf != model_files.end()) { std::string lo = mf->second; std::transform(lo.begin(), lo.end(), lo.begin(), ::tolower);
+                            const size_t at = lo.find("pfball\\ball_"); if (at != std::string::npos && at + 12 < lo.size()) k = lo[at + 12] - '0'; }
+                        it = pk2.emplace(f.inst[i].handle, k >= 0 && k < 8 ? k : -1).first; }
+                    part[i] = it->second;
+                }
+            }
+            std::vector<bool> drop(f.inst.size(), false); const size_t n0 = f.inst.size();
+            for (size_t i = 0; i < n0; i++) {
+                if (part[i] != 0) continue;
+                /* before it's shot the game draws only the base chunk (the bottom cap = the "bowl", Bobby 10-28 screenshot); once shot the
+                   other 7 fly off it. Intact = no chunk of it in flight (300 mm - 8 m away) */
+                std::vector<size_t> mine{i}; bool together = true;
+                for (size_t j = 0; j < n0 && together; j++) if (part[j] > 0) { float d = 0; for (int q = 0; q < 3; q++) d += (f.inst[j].T[q] - f.inst[i].T[q]) * (f.inst[j].T[q] - f.inst[i].T[q]);
+                    if (d < 300.f * 300.f) mine.push_back(j); else if (d < 8000.f * 8000.f) together = false; }
+                if (!together) continue;
+                for (size_t j : mine) drop[j] = true;
+                VPIX_Instance g = f.inst[i]; g.handle = 0x7FFF1218u; for (int e = 0; e < 16; e++) g.pal[e] = g.palw[e] = 0xFFFFFF;
+                f.inst.push_back(g); drop.push_back(false);
+            }
+            {   size_t w = 0; for (size_t i = 0; i < f.inst.size(); i++) if (!drop[i]) f.inst[w++] = f.inst[i]; f.inst.resize(w); }
+
+            struct RB { bool on = false; float p[3], v[3]; float roll = 0; int hits = 0; unsigned long long burst = 0, bounced = 0; };
+            static RB rb; static unsigned long long next_at = 0, last_hit = 0;
+            const bool riding_ok = my_cart && stage >= 0 && stage != mall_st && rd_f(my_cart + 0xD) > 0.f;
+            if (!riding_ok) { rb.on = false; next_at = now + 12000; }
+            else {
+                const float cp[3] = {rd_f(my_cart + 0x98), rd_f(my_cart + 0x9C), rd_f(my_cart + 0xA0)};
+                float fw[2] = {rd_f(my_cart + 0x13), rd_f(my_cart + 0x17)}; { const float l = sqrtf(fw[0] * fw[0] + fw[1] * fw[1]) + 1e-6f; fw[0] /= l; fw[1] /= l; }
+                const float R0 = 4.f, rad = 620.f * R0;
+                if (!rb.on && now >= next_at) {   /* a track piece 60-75 m ahead, on the cart's line */
+                    float best = 1e30f;
+                    for (size_t i = 0; i < f.inst.size(); i++) { bool st2, ld; if (!is_track(f.inst[i].handle, &st2, &ld)) continue;
+                        const float d[3] = {f.inst[i].T[0] - cp[0], f.inst[i].T[1] - cp[1], f.inst[i].T[2] - cp[2]};
+                        const float along = d[0] * fw[0] + d[1] * fw[1], lat = fabsf(d[0] * fw[1] - d[1] * fw[0]);
+                        if (along < 60000.f || along > 75000.f || lat > 6000.f || fabsf(d[2]) > 6000.f) continue;
+                        if (lat < best) { best = lat; for (int q = 0; q < 3; q++) rb.p[q] = f.inst[i].T[q]; } }
+                    if (best < 1e29f) { rb.on = true; rb.hits = 0; rb.burst = rb.bounced = 0; rb.roll = 0; }
+                    next_at = now + 18000 + (unsigned long long)(rand() % 17000);
+                }
+                if (rb.on) {
+                    const float dt3 = 1.f / 60.f;
+                    float d[3] = {cp[0] - rb.p[0], cp[1] - rb.p[1], cp[2] - rb.p[2]}; const float dist = sqrtf(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]) + 1e-3f;
+                    if (!rb.bounced && !rb.burst) {   /* rolling at the cart, along the ground toward where it is */
+                        const float sp = 9000.f;
+                        for (int q = 0; q < 3; q++) rb.v[q] = d[q] / dist * sp;
+                        if (dist < rad + 1600.f) {   /* contact: it bounces off, never through */
+                            rb.bounced = now; rb.v[0] = -d[0] / dist * 7000.f + fw[1] * 6000.f; rb.v[1] = -d[1] / dist * 7000.f - fw[0] * 6000.f; rb.v[2] = 11000.f;
+                            const float slow = rd_f(my_cart + 0x37) * 0.35f; uint32_t u; memcpy(&u, &slow, 4); mem_writed(my_cart + 0x37, u);
+                            play_game_sound(5, 127); VPIX_Haptic(2, 0.5f, 1.f);
+                        } else if ((now / 80) % 2 && dist < 30000.f) VPIX_Haptic(2, 0.06f, 0.1f + 0.5f * (1.f - dist / 30000.f));
+                    } else rb.v[2] -= 20000.f * dt3;   /* flying off: gravity */
+                    for (int q = 0; q < 3; q++) rb.p[q] += rb.v[q] * dt3;
+                    rb.roll += sqrtf(rb.v[0] * rb.v[0] + rb.v[1] * rb.v[1]) * dt3 / rad;
+                    if (!rb.bounced && !rb.burst && shooting && now - last_hit > 150) {
+                        const float w[3] = {rb.p[0] - go[0], rb.p[1] - go[1], rb.p[2] + rad - go[2]};
+                        const float tt = w[0] * gd[0] + w[1] * gd[1] + w[2] * gd[2];
+                        if (tt > 0) { float m2 = 0; for (int q = 0; q < 3; q++) { const float e = w[q] - gd[q] * tt; m2 += e * e; }
+                            if (m2 < rad * rad * 1.1f) { last_hit = now; play_game_sound(4, 90);
+                                if (++rb.hits >= 6) { rb.burst = now; mem_writed(my_cart + 9, mem_readd(my_cart + 9) + 200); trick_word = 7; trick_word_at = now; VPIX_Haptic(0, 0.3f, 1.f); } } }
+                    }
+                    if ((rb.bounced && now - rb.bounced > 2500) || (rb.burst && now - rb.burst > 1500) || (!rb.bounced && !rb.burst && (d[0] * fw[0] + d[1] * fw[1]) < -8000.f)) rb.on = false;
+                    if (rb.on) {   /* rolling toward us: turning about the axis across its motion */
+                        float mv[2] = {rb.v[0], rb.v[1]}; const float ml = sqrtf(mv[0] * mv[0] + mv[1] * mv[1]) + 1e-6f; mv[0] /= ml; mv[1] /= ml;
+                        const float ca = cosf(rb.roll), sa = sinf(rb.roll), sx[3] = {mv[1], -mv[0], 0.f}, f3[3] = {mv[0], mv[1], 0.f}, up3[3] = {0, 0, 1};
+                        const int n = rb.burst ? 8 : 1;
+                        for (int c = 0; c < n; c++) {
+                            VPIX_Instance b = {}; b.handle = rb.burst ? 0x7FFF1210u + (uint32_t)c : 0x7FFF1218u; b.light_mask = 1;
+                            for (int q = 0; q < 3; q++) { b.R[0][q] = sx[q]; b.R[1][q] = ca * f3[q] - sa * up3[q]; b.R[2][q] = sa * f3[q] + ca * up3[q]; b.S[q] = R0; }
+                            for (int q = 0; q < 3; q++) b.T[q] = rb.p[q] + up3[q] * rad - b.R[2][q] * rad;
+                            if (rb.burst) { const float u = (now - rb.burst) / 1000.f, dir[3] = {(c & 1) ? 1.f : -1.f, (c & 2) ? 1.f : -1.f, (c & 4) ? 1.4f : 0.4f};
+                                for (int q = 0; q < 3; q++) b.T[q] += dir[q] * 9000.f * u; b.T[2] -= 9800.f * u * u; }
+                            for (int e = 0; e < 16; e++) b.pal[e] = b.palw[e] = 0xFFFFFF;
+                            f.inst.push_back(b);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    /* VPIX_PUMPKINS=1 (Phantom Freight, dev, Bobby 10-27: "a pumpkin patch in the town with the wolves, all over, to shoot different
+       pumpkin jack-o'-lanterns"): around every 3rd tree (TREE_1 / TREE_2: the town and woods of section 1) a cluster of 4 carved
+       pumpkins (PK_0..PK_3 from VPIX_DECOR: classic, scary, surprised, sleepy) on the ground. MallVR tests the game's gun ray against
+       them while the trigger is held: a hit pumpkin spins and swells away, the game's point ding, +25 on the score, "SMASHED +25".
+       Smashed ones stay gone until the next ride. */
+    {
+        static const bool pk_on = getenv("VPIX_PUMPKINS") && atoi(getenv("VPIX_PUMPKINS"));
+        static int pk_state = 0; const uint32_t HPK = 0x7FFF0E10u;
+        if (pk_on && pk_state == 0) {
+            pk_state = -1; const char *dd = getenv("VPIX_DECOR"); int ok = 0;
+            if (dd && *dd) for (int k = 0; k < 4; k++) {
+                std::string fn = std::string(dd) + "\\PK_" + std::to_string(k) + ".BIN"; std::vector<uint8_t> d; FILE *fp = fopen(fn.c_str(), "rb");
+                if (fp) { uint8_t buf[65536]; size_t nr; while ((nr = fread(buf, 1, sizeof(buf), fp)) > 0) d.insert(d.end(), buf, buf + nr); fclose(fp); }
+                if (!d.empty() && VPIX_Render_AddModel(HPK + k, d.data(), d.size())) ok++;
+            }
+            pk_state = ok == 4 ? 1 : -1;
+            lg("HLE: VPIX_PUMPKINS: %s", pk_state == 1 ? "4 pumpkin faces loaded" : "** PK_0..3.BIN not found (VPIX_DECOR)");
+        }
+        if (pk_state == 1) {
+            static std::map<uint32_t, unsigned long long> smashed;   /* pumpkin id -> when it was hit */
+            static unsigned long long last_ride = 0;
+            const unsigned long long now = hap_ms_now();
+            if (my_cart) { if (last_ride && now - last_ride > 20000) smashed.clear(); last_ride = now; }   /* a new ride: all back */
+            float go[3] = {0, 0, 0}, gd[3] = {0, 0, 0}; bool shooting = false;
+            if (my_cart) {
+                const int seat = (int)(int16_t)mem_readw(my_cart + 3) + (int)(int8_t)mem_readb(0xFCDFA + data_delta);
+                const uint32_t gb = 0x11FF7C + data_delta + (uint32_t)(seat < 0 ? 0 : seat) * 0xAC;
+                for (int c = 0; c < 3; c++) { go[c] = rd_f(gb + 0x34 + 4 * c); gd[c] = rd_f(gb + 4 + 0x10 + 4 * c); }
+                const float l = sqrtf(gd[0] * gd[0] + gd[1] * gd[1] + gd[2] * gd[2]);
+                if (l > 1e-3f) { for (float &v : gd) v /= l; shooting = mem_readw(my_cart + 0x11) != 0; }
+                ghost_shot_ray(my_cart, go, gd);   /* the ray the game's shot really used (the right gun: the controller) */
+            }
+            const size_t n0 = f.inst.size();
+            for (size_t i = 0; i < n0; i++) {
+                const VPIX_Instance tree = f.inst[i];
+                auto mf = model_files.find(tree.handle); if (mf == model_files.end()) continue;
+                std::string lo = mf->second; std::transform(lo.begin(), lo.end(), lo.begin(), ::tolower);
+                if (lo.find("tree_1.bin") == std::string::npos && lo.find("tree_2.bin") == std::string::npos) continue;
+                const uint32_t hsh = (uint32_t)((int)(tree.T[0] / 100.f) * 83492791) ^ (uint32_t)((int)(tree.T[1] / 100.f) * 2654435761u);
+                if (hsh % 3) continue;
+                for (int k = 0; k < 4; k++) {
+                    const uint32_t id = hsh * 4 + (uint32_t)k;
+                    const float a = (hsh % 360) * 0.01745f + k * 1.5708f, r = 1100.f + ((hsh >> (k * 3)) & 7) * 120.f;
+                    const float c[3] = {tree.T[0] + r * cosf(a), tree.T[1] + r * sinf(a), tree.T[2]};
+                    auto sm = smashed.find(id);
+                    float spin = 0.f, sc = 1.f;
+                    if (sm != smashed.end()) { const float u = (now - sm->second) / 300.f; if (u >= 1.f) continue; spin = u * 10.f; sc = 1.f + 0.8f * u; }
+                    else if (shooting) {   /* ray vs the pumpkin (radius 420 round its middle, 330 up) */
+                        const float w[3] = {c[0] - go[0], c[1] - go[1], c[2] + 330.f - go[2]};
+                        const float tt = w[0] * gd[0] + w[1] * gd[1] + w[2] * gd[2];
+                        if (tt > 0) { float m2 = 0; for (int q = 0; q < 3; q++) { const float e = w[q] - gd[q] * tt; m2 += e * e; }
+                            if (m2 < 420.f * 420.f) {
+                                smashed[id] = now;
+                                if (my_cart) mem_writed(my_cart + 9, mem_readd(my_cart + 9) + 25);
+                                play_game_sound(4, 120); trick_word = 6; trick_word_at = now;   /* "SMASHED +25" */
+                                VPIX_Haptic(0, 0.04f, 0.5f);
+                            } }
+                    }
+                    VPIX_Instance pk = {}; pk.handle = HPK + (uint32_t)((hsh + k) % 4); pk.light_mask = 1; pk.bright = 1;   /* lit from within */
+                    const float ya = a + 3.14159f + spin;   /* faces turned toward the tree's middle, then the track side varies */
+                    pk.R[0][0] = cosf(ya); pk.R[0][1] = sinf(ya); pk.R[1][0] = -sinf(ya); pk.R[1][1] = cosf(ya); pk.R[2][2] = 1.f;
+                    for (int q = 0; q < 3; q++) { pk.T[q] = c[q]; pk.S[q] = sc; }
+                    for (int e = 0; e < 16; e++) pk.pal[e] = pk.palw[e] = 0xFFFFFF;
+                    f.inst.push_back(pk);
+                    {   /* the candle inside (Bobby 10-27: "inner glow, like a light source inside"): a flickering orange glow at its middle */
+                        const uint32_t PGL = 0x7FFD0009u; static bool gm = false;
+                        if (!gm) { gm = true; std::vector<uint32_t> px(32 * 32);
+                            for (int y = 0; y < 32; y++) for (int x = 0; x < 32; x++) { const float dx = (x - 15.5f) / 16.f, dy = (y - 15.5f) / 16.f, r = sqrtf(dx * dx + dy * dy);
+                                px[y * 32 + x] = (uint32_t)((std::max)(0.f, 1.f - r) * (std::max)(0.f, 1.f - r) * 255.f) << 24 | 0x2090FFu; }   /* 0xAABBGGRR orange */
+                            VPIX_Render_AddBitmapRGBA(PGL, 32, 32, px.data()); }
+                        const float tt = hap_ms_now() / 1000.f, fl = 0.75f + 0.15f * sinf(tt * 9.f + k * 2.f) + 0.1f * sinf(tt * 23.f + k);
+                        VPIX_Blit b = {}; b.handle = PGL; b.sw = b.sh = 32; b.key = -1; b.world = true;
+                        b.dw = b.dh = 1500.f * sc * fl; b.pivot[0] = b.pivot[1] = b.dw * 0.5f;
+                        for (int q = 0; q < 3; q++) b.pos[q] = c[q]; b.pos[2] += 330.f * sc;
+                        b.alpha = 0.55f * fl; b.prio = 99300;
+                        f.blits.push_back(b);
+                    }
+                }
+            }
+        }
+    }
+    /* VPIX_COASTER_FX=1 (Phantom Freight, dev, Bobby 10-27: "rollercoaster sound effects ... air gassing like they do at slow downs",
+       "pulling you up hill noise", "force feedback of the tracks as you go, rumble"): sounds made here (no files): an air-brake hiss
+       when the cart sheds speed fast (braking, a crash), a chain-lift clack while it climbs slowly, a rail rattle that grows with
+       speed; the controllers buzz with the rattle and tick at each rail joint (every ~4.5 m). */
+    {
+        static const bool fx = getenv("VPIX_COASTER_FX") && atoi(getenv("VPIX_COASTER_FX"));
+        static VSound hiss, clack, rattle; static bool made = false;
+        if (fx && !made) {
+            made = true; uint32_t r = 12345; auto rnd = [&]() { r = r * 1103515245u + 12345u; return ((int)(r >> 16) & 0x7FFF) / 16384.f - 1.f; };
+            hiss.rate = clack.rate = rattle.rate = 22050;
+            float lp = 0;   /* hiss: 1.1 s of bright noise, sharp start, long tail */
+            for (int i = 0; i < 24000; i++) { const float t = i / 22050.f, env = (t < 0.03f ? t / 0.03f : expf(-(t - 0.03f) * 2.6f)); const float nz = rnd(); lp += 0.55f * (nz - lp);
+                hiss.pcm.push_back((int16_t)(9000.f * env * (nz - lp))); }
+            for (int i = 0; i < 1500; i++) { const float t = i / 22050.f; clack.pcm.push_back((int16_t)(14000.f * expf(-t * 90.f) * (0.6f * sinf(t * 2 * 3.14159f * 900.f) + 0.4f * rnd()))); }
+            float lr = 0;   /* rattle loop: low rumble + a 20 Hz knock */
+            for (int i = 0; i < 22050; i++) { const float t = i / 22050.f, nz = rnd(); lr += 0.05f * (nz - lr);
+                rattle.pcm.push_back((int16_t)(6000.f * lr * 4.f + 2500.f * expf(-fmodf(t, 0.05f) * 120.f) * rnd())); }
+            rattle.loop = true;
+        }
+        if (fx && made) {
+            static int rv = -1; static float last_sp = 0, joint = 0; static unsigned long long last_ms = 0, next_clack = 0, hiss_cool = 0, next_buzz = 0;
+            const unsigned long long now = hap_ms_now(); const float dt = last_ms ? (std::min)(0.2f, (now - last_ms) / 1000.f) : 0.f; last_ms = now;
+            const float sp = my_cart ? rd_f(my_cart + 0x37) : 0.f;
+            if (my_cart && sp > 300.f) {
+                if (rv < 0 || !voices[rv].on || voices[rv].s != &rattle) { rv = -1; for (int i = 31; i >= 0; i--) if (!voices[i].on) { rv = i; voices[i] = VVoice(); voices[i].s = &rattle; voices[i].loop = true; voices[i].on = true; break; } }
+                if (rv >= 0) voices[rv].vol = (int)(20 + 70 * (std::min)(1.f, sp / 14000.f));
+                const float slope = rd_f(my_cart + 0x717);
+                if (slope > 0.12f && sp < 7000.f && now >= next_clack) {   /* chain lift pulling you uphill */
+                    for (int i = 31; i >= 0; i--) if (!voices[i].on) { voices[i] = VVoice(); voices[i].s = &clack; voices[i].vol = 90; voices[i].on = true; break; }
+                    next_clack = now + 110; VPIX_Haptic(2, 0.02f, 0.35f);
+                }
+                joint += sp * dt; if (joint > 4500.f) { joint = 0; VPIX_Haptic(2, 0.025f, 0.25f + 0.35f * (std::min)(1.f, sp / 14000.f)); }
+                if (now >= next_buzz) { next_buzz = now + 120; VPIX_Haptic(2, 0.1f, 0.06f + 0.12f * (std::min)(1.f, sp / 14000.f)); }
+            } else if (rv >= 0 && voices[rv].s == &rattle) { voices[rv].on = false; rv = -1; }
+            if (dt > 0 && last_sp - sp > 2500.f * (dt / 0.25f) && last_sp > 3000.f && now >= hiss_cool) {   /* sudden slowdown: air brakes */
+                for (int i = 31; i >= 0; i--) if (!voices[i].on) { voices[i] = VVoice(); voices[i].s = &hiss; voices[i].vol = 100; voices[i].on = true; break; }
+                hiss_cool = now + 1500;
+            }
+            last_sp = sp;
+        }
+    }
+    /* VPIX_SWORD=<blade mm> (Phantom Freight, Bobby 10-27: "one gun on your right hand and a sword like the skeletons have for your left
+       hand ... long enough to hit the other cart across the track ... vibrate the haptics if you hit the opponent ... if you jam the
+       sword in the tire between it and the front of the track it spills the opponent, stopping them for a second"). The renderer draws
+       the sword in the left hand; here the blade (grip -> tip, the left controller's pose put on the game camera like the right gun)
+       is tested against the other carts: within 65 cm of a rider's body = a hit (left hand buzz + clank, game sound 2 hit1.wav, 0.3 s
+       apart); the tip within 25 cm of a cart's front wheel (Bobby: "kind of hard to do") = JAMMED: that cart stops for 1.2 s (speed +0x37 held at 0), crash sound,
+       both hands buzz, GOTCHA! pops. */
+    {
+        static const float sword_mm = getenv("VPIX_SWORD") ? (float)atof(getenv("VPIX_SWORD")) : 0.f;
+        if (sword_mm > 0.f && my_cart && cur_in.hand2.valid && head_fed.valid && rd_f(my_cart + 0xD) > 0.f) {
+            static float mpitch = 0, off[3] = {0, 0, -20}; static bool rd = false;
+            if (!rd) { rd = true; float sc; if (const char *e = getenv("VPIX_DUAL_GUN_POSE")) sscanf(e, "%f,%f,%f,%f,%f", &mpitch, &sc, &off[0], &off[1], &off[2]); }
+            const VPIX_Pose &h = cur_in.hand2, &hd = head_fed;
+            const VPIX_Pose hp = pitched(h, cur_in.gun_pitch + mpitch);
+            auto tw = [&](const float v3[3], float o[3]) { for (int i = 0; i < 3; i++) o[i] = 0;
+                for (int j = 0; j < 3; j++) { const float cj = v3[0] * hd.R[j][0] + v3[1] * hd.R[j][1] + v3[2] * hd.R[j][2]; for (int i = 0; i < 3; i++) o[i] += cj * f.cam_R[j][i]; } };
+            float d[3], w[3], dir[3], A[3], B[3];
+            for (int i = 0; i < 3; i++) d[i] = h.p[i] - off[0] * h.R[0][i] + off[1] * h.R[1][i] + off[2] * h.R[2][i] - hd.p[i];
+            d[2] -= crouch_fed;   /* from the real head: seated, the blade sat ~0.5 m low and dragged on the track (Bobby 10-28) */
+            tw(d, w); tw(hp.R[1], dir);
+            for (int i = 0; i < 3; i++) { A[i] = f.cam_T[i] + world_scale * w[i]; B[i] = A[i] + world_scale * sword_mm * dir[i]; }
+            memcpy(sword_A, A, sizeof(A)); memcpy(sword_B, B, sizeof(B)); sword_ms = hap_ms_now();
+            auto segd = [&](const float P[3]) { float ab[3], ap[3], l2 = 0, t = 0; for (int i = 0; i < 3; i++) { ab[i] = B[i] - A[i]; ap[i] = P[i] - A[i]; l2 += ab[i] * ab[i]; t += ab[i] * ap[i]; }
+                t = l2 > 0 ? (std::max)(0.f, (std::min)(1.f, t / l2)) : 0.f; float s = 0; for (int i = 0; i < 3; i++) { const float q = A[i] + ab[i] * t - P[i]; s += q * q; } return sqrtf(s); };
+            const unsigned long long now = hap_ms_now();
+            static unsigned long long last_hit = 0; static std::map<uint32_t, unsigned long long> jam_until;
+            std::vector<std::array<float, 3>> spark_at, blood_at;
+            {   /* the tip dragged on the track (below the rider's rails: path z +0x6E0 + 6 cm): sparks + a buzz. Back 10-29 (Bobby: "give the
+                   sword back the drag effects that it used to have"); it never catches now: the sword is drawn on top and only sparks here */
+                const float rail = rd_f(my_cart + 0x6E0) + 60.f;
+                if (B[2] < rail) spark_at.push_back({B[0], B[1], rail});
+            }
+            float mp[3] = {rd_f(my_cart + 0x98), rd_f(my_cart + 0x9C), rd_f(my_cart + 0xA0)};
+            for (int g = 0; g < 2; g++) for (int k = 0; k < 2; k++) {
+                const uint32_t c = mem_readd(0xEDB7C + data_delta + g * 8 + k * 4); if (!c || c == my_cart) continue;
+                const int st = mem_readb(0xEDB9C + data_delta + g * 16 + k * 2); if (st != 1 && st != 2) continue;
+                const float cp[3] = {rd_f(c + 0x98), rd_f(c + 0x9C), rd_f(c + 0xA0)}, fw[3] = {rd_f(c + 0x13), rd_f(c + 0x17), rd_f(c + 0x1B)};
+                float dm = 0; for (int i = 0; i < 3; i++) dm += (cp[i] - mp[i]) * (cp[i] - mp[i]); if (dm > 9000.f * 9000.f) continue;
+                /* the rider: the weeman body nearest this cart */
+                const VPIX_Instance *rb = NULL; float bd = 2500.f * 2500.f;
+                for (const VPIX_Instance &in : f.inst) { auto mf = model_files.find(in.handle); if (mf == model_files.end()) continue;
+                    std::string lo = mf->second; std::transform(lo.begin(), lo.end(), lo.begin(), ::tolower); if (lo.find("weeman") == std::string::npos || lo.find("pbody.bin") == std::string::npos) continue;
+                    float q = 0; for (int i = 0; i < 3; i++) q += (in.T[i] - cp[i]) * (in.T[i] - cp[i]); if (q < bd) { bd = q; rb = &in; } }
+                if (rb && segd(rb->T) < 650.f * world_scale && now - last_hit > 300) {
+                    last_hit = now; VPIX_Haptic(1, 0.12f, 1.f); play_game_sound(2, 110);
+                    static int nl = 0; if (nl < 30) { nl++; lg("SWORD hit rider of cart %06X f=%lu", c, frame); }
+                }
+                float wh[3]; for (int i = 0; i < 3; i++) wh[i] = cp[i] + fw[i] * 800.f; wh[2] -= 150.f;   /* its front wheel */
+                float tq = 0; for (int i = 0; i < 3; i++) tq += (B[i] - wh[i]) * (B[i] - wh[i]);
+                if (sqrtf(tq) < 600.f * world_scale) spark_at.push_back({wh[0], wh[1], wh[2]});   /* the blade on its wheel: sparks */
+                if (sqrtf(tq) < 250.f * world_scale && (!jam_until.count(c) || now > jam_until[c] + 1500)) {   /* "kind of hard to do": 25 cm */
+                    jam_until[c] = now + 1200; VPIX_Haptic(2, 0.35f, 1.f); play_game_sound(5, 120);
+                    trick_word = 7; trick_word_at = now;   /* GOTCHA! */
+                    lg("SWORD jammed the wheel of cart %06X f=%lu", c, frame);
+                }
+                if (jam_until.count(c) && now < jam_until[c]) { const float z = 0.f; uint32_t u; memcpy(&u, &z, 4); mem_writed(c + 0x37, u); }
+            }
+            /* finishers (Bobby 10-27: "special hits can cut your opponent's arm off or head off ... fatality it would say and blood
+               squirts out ... an upper sword cut would uppercut the head off"): only a fast swing counts (the blade tip over 9 m/s).
+               Rising fast (up > 60 % of the speed) through the head = the head flies off spinning; a fast cut through an arm (upper arm,
+               forearm, hand, fingers of that side) = that arm falls. Blood squirts from the cut for 1.5 s, FATALITY pops (head) and the
+               controller bangs. The rider's parts come back after 6 s (it's a ride). Looks only: the game's rider is untouched. */
+            {
+                static float lastB[3] = {0, 0, 0}; static unsigned long long lastB_ms = 0;
+                float tv[3] = {0, 0, 0}, tspd = 0;
+                if (lastB_ms && now > lastB_ms) { const float dts = (now - lastB_ms) / 1000.f; for (int i = 0; i < 3; i++) { tv[i] = (B[i] - lastB[i]) / dts; tspd += tv[i] * tv[i]; } tspd = sqrtf(tspd); }
+                memcpy(lastB, B, sizeof(lastB)); lastB_ms = now;
+                struct Cut { unsigned long long until = 0, at = 0; bool head = false, arm[2] = {false, false}; float fly[3], flyv[3], neck[3]; uint32_t fly_h = 0; float fR[3][3]; };
+                static std::map<uint32_t, Cut> cuts;   /* by cart */
+                const bool fast = tspd > 9000.f * world_scale;
+                for (int g = 0; g < 2; g++) for (int k = 0; k < 2; k++) {
+                    const uint32_t c = mem_readd(0xEDB7C + data_delta + g * 8 + k * 4); if (!c || c == my_cart) continue;
+                    const int st = mem_readb(0xEDB9C + data_delta + g * 16 + k * 2); if (st != 1 && st != 2) continue;
+                    const float cp[3] = {rd_f(c + 0x98), rd_f(c + 0x9C), rd_f(c + 0xA0)};
+                    Cut &cu = cuts[c];
+                    if (cu.until && now > cu.until) cu = Cut();
+                    /* this rider's parts: weeman instances within 2.5 m of the cart */
+                    for (VPIX_Instance &in : f.inst) {
+                        auto mf = model_files.find(in.handle); if (mf == model_files.end()) continue;
+                        std::string lo = mf->second; std::transform(lo.begin(), lo.end(), lo.begin(), ::tolower); if (lo.find("weeman") == std::string::npos) continue;
+                        float q = 0; for (int i = 0; i < 3; i++) q += (in.T[i] - cp[i]) * (in.T[i] - cp[i]); if (q > 2500.f * 2500.f) continue;
+                        const bool is_head = lo.find("phead") != std::string::npos;
+                        const size_t nm = lo.find_last_of("\\/"); const std::string base = nm == std::string::npos ? lo : lo.substr(nm + 1);
+                        const int side = (base == "parmur.bin" || base == "parmlr.bin" || base == "phandr.bin" || base == "pfingr.bin") ? 0
+                                       : (base == "parmul.bin" || base == "parmll.bin" || base == "phandl.bin" || base == "pfingl.bin") ? 1 : -1;
+                        if (fast && !cu.head && is_head && segd(in.T) < 400.f * world_scale && tv[2] > 0.6f * tspd) {   /* the uppercut */
+                            cu.head = true; cu.at = now; cu.until = now + 6000; cu.fly_h = in.handle; memcpy(cu.fR, in.R, sizeof(cu.fR));
+                            for (int i = 0; i < 3; i++) { cu.fly[i] = in.T[i]; cu.neck[i] = in.T[i]; cu.flyv[i] = tv[i] * 0.35f; } cu.flyv[2] += 5000.f;
+                            trick_word = 9; trick_word_at = now; VPIX_Haptic(2, 0.45f, 1.f); play_game_sound(14, 127);
+                            lg("SWORD FATALITY: head off, cart %06X f=%lu (tip %.0f units/s)", c, frame, tspd);
+                        }
+                        if (fast && side >= 0 && !cu.arm[side] && segd(in.T) < 300.f * world_scale) {   /* an arm off */
+                            cu.arm[side] = true; if (!cu.at) cu.at = now; cu.until = now + 6000; for (int i = 0; i < 3; i++) cu.neck[i] = in.T[i];
+                            VPIX_Haptic(1, 0.25f, 1.f); play_game_sound(19, 127);
+                            lg("SWORD arm %s off, cart %06X f=%lu", side ? "left" : "right", c, frame);
+                        }
+                        if ((cu.head && is_head) || (side >= 0 && cu.arm[side])) in.handle = 0;   /* hidden: the cut part */
+                    }
+                    if (cu.head && cu.fly_h) {   /* the flying head: thrown up, falling, spinning */
+                        const float age = (now - cu.at) / 1000.f;
+                        if (age < 3.f) {
+                            VPIX_Instance hd2 = {}; hd2.handle = cu.fly_h; hd2.light_mask = 1;
+                            for (int i = 0; i < 3; i++) { hd2.T[i] = cu.fly[i] + cu.flyv[i] * age + (i == 2 ? -0.5f * 18000.f * age * age : 0.f); hd2.S[i] = 1.f; }
+                            const float a = age * 9.f, ca = cosf(a), sa = sinf(a);
+                            for (int i = 0; i < 3; i++) { hd2.R[0][i] = cu.fR[0][i] * ca + cu.fR[2][i] * sa; hd2.R[1][i] = cu.fR[1][i]; hd2.R[2][i] = cu.fR[2][i] * ca - cu.fR[0][i] * sa; }
+                            for (int i = 0; i < 16; i++) hd2.pal[i] = hd2.palw[i] = 0xFFFFFF;
+                            f.inst.push_back(hd2);
+                        }
+                    }
+                    if (cu.at && now - cu.at < 1500) blood_at.push_back({cu.neck[0], cu.neck[1], cu.neck[2]});   /* the squirt */
+                }
+                std::vector<VPIX_Instance> kept; kept.reserve(f.inst.size());
+                for (const VPIX_Instance &in : f.inst) if (in.handle) kept.push_back(in);
+                f.inst.swap(kept);
+            }
+            /* power-ups (Bobby 10-27: "things you have to jump to get, jump and stretch with the sword, allows you to reach for special
+               power ups ... special sword hit targets, things to slice"): 3 spinning gold stars kept 40-90 m ahead over the track, 3.5 m
+               above the rails - out of reach unless you jump and stretch the sword up. Sliced (the blade within 35 cm) = SUPER SPEED for
+               3 s (the speed clamp 0xC0CCB raised to 26000 and the cart pushed to 24000), a chime, a buzz, +100 score; a new one ahead. */
+            {
+                struct Pow { float along, side; bool live; unsigned long long t; };
+                static Pow pw[3] = {{45000.f, 0.f, true, 0}, {70000.f, -1500.f, true, 0}, {95000.f, 1500.f, true, 0}};
+                static float trav = 0.f, lastp[3] = {0, 0, 0}; static bool hp = false;
+                const float cpos[3] = {rd_f(my_cart + 0x98), rd_f(my_cart + 0x9C), rd_f(my_cart + 0xA0)}, cfw[3] = {rd_f(my_cart + 0x13), rd_f(my_cart + 0x17), 0.f};
+                const float cfl = sqrtf(cfw[0] * cfw[0] + cfw[1] * cfw[1]);
+                if (hp) { float dd = 0; for (int i = 0; i < 2; i++) dd += (cpos[i] - lastp[i]) * (cpos[i] - lastp[i]); if (dd < 4000.f * 4000.f) trav += sqrtf(dd); }
+                memcpy(lastp, cpos, sizeof(lastp)); hp = true;
+                const uint32_t POW = 0x7FFD0008u; static bool pm = false;
+                if (!pm) { pm = true; std::vector<uint32_t> px(64 * 64);
+                    for (int y = 0; y < 64; y++) for (int x = 0; x < 64; x++) { const float dx = x - 31.5f, dy = y - 31.5f, r = sqrtf(dx * dx + dy * dy), a = atan2f(dy, dx);
+                        const float star = 14.f + 12.f * powf(fabsf(cosf(a * 2.5f)), 3.f); const float in = r < star ? 1.f : (std::max)(0.f, 1.f - (r - star) / 6.f);
+                        px[y * 64 + x] = (uint32_t)(in * 255.f) << 24 | (r < star * 0.5f ? 0xB0F8FFu : 0x10C0FFu); }   /* gold, hot centre */
+                    VPIX_Render_AddBitmapRGBA(POW, 64, 64, px.data()); }
+                static unsigned long long boost_until = 0;
+                if (cfl > 1e-3f) for (Pow &p : pw) {
+                    if (p.along - trav < 8000.f && p.live) { p.along = trav + 60000.f + (rand() % 30000); p.side = (float)(rand() % 3000) - 1500.f; }
+                    if (!p.live && now - p.t > 600) { p.live = true; p.along = trav + 60000.f + (rand() % 30000); }
+                    const float ahead = p.along - trav;
+                    float P[3] = {cpos[0] + cfw[0] / cfl * ahead + cfw[1] / cfl * p.side, cpos[1] + cfw[1] / cfl * ahead - cfw[0] / cfl * p.side,
+                                  rd_f(my_cart + 0x6E0) + 3500.f * world_scale};
+                    if (p.live && segd(P) < 350.f * world_scale) {
+                        p.live = false; p.t = now; boost_until = now + 3000;
+                        play_game_sound(4, 127); VPIX_Haptic(2, 0.3f, 1.f);
+                        mem_writed(my_cart + 9, mem_readd(my_cart + 9) + 100);
+                        lg("SWORD power-up: SUPER SPEED f=%lu", frame);
+                    }
+                    if (!p.live && now - p.t > 350) continue;
+                    VPIX_Blit b = {}; b.handle = POW; b.sw = b.sh = 64; b.key = -1; b.world = true;
+                    const float pop = p.live ? 1.f + 0.12f * sinf(now / 150.f) : 1.f + (now - p.t) / 120.f;
+                    b.dw = b.dh = 900.f * pop; b.pivot[0] = b.pivot[1] = b.dw * 0.5f;
+                    for (int i = 0; i < 3; i++) b.pos[i] = P[i];
+                    b.alpha = p.live ? 1.f : (std::max)(0.f, 1.f - (now - p.t) / 350.f); b.prio = 99400;
+                    f.blits.push_back(b);
+                }
+                power_boost_until = boost_until;   /* the jump code's clamp honours it (26000) */
+                if (now < boost_until) { const float sp = 24000.f; uint32_t u; if (rd_f(my_cart + 0x37) < sp) { memcpy(&u, &sp, 4); mem_writed(my_cart + 0x37, u); } }
+            }
+            /* slice anything (Bobby 10-27: "make 'em all sliceable in half or whatever if close, even the bats"): an enemy whose centre the
+               blade passes within its box (+ 20 cm) is killed by the game itself - the next fire call aims the game's shot along the blade
+               with the trigger held (GHOST_Fire, gf_sword), so its own death, explosion and points happen. 0.25 s apart. */
+            {
+                static unsigned long long last_slice = 0;
+                if (now - last_slice > 250) for (uint32_t b = mem_readd(0xD6E40 + data_delta), n = 0; b && n < 200; b = mem_readd(b + 0xEF4), n++) {
+                    const int ty = mem_readb(b + 0xEF3); const uint32_t tb = ty == 0x14 ? 0x3E2 : 0x45;
+                    const float P[3] = {rd_f(b + tb), rd_f(b + tb + 4), rd_f(b + tb + 8)};
+                    if (segd(P) < 600.f * world_scale) {
+                        float dn[3]; for (int i = 0; i < 3; i++) dn[i] = B[i] - A[i]; const float dl = sqrtf(dn[0] * dn[0] + dn[1] * dn[1] + dn[2] * dn[2]); if (dl < 1.f) break;
+                        /* aim the shot at the enemy from the grip (the blade's line through it) */
+                        float to[3], tl = 0; for (int i = 0; i < 3; i++) { to[i] = P[i] - A[i]; tl += to[i] * to[i]; } tl = sqrtf(tl); if (tl < 1.f) break;
+                        for (int i = 0; i < 3; i++) { gf_sword_o[i] = A[i]; gf_sword_d[i] = to[i] / tl; }
+                        gf_sword = true; last_slice = now;
+                        VPIX_Haptic(1, 0.15f, 1.f);
+                        static int nl = 0; if (nl < 40) { nl++; lg("SWORD slice enemy type %d f=%lu", ty, frame); }
+                        break;
+                    }
+                }
+            }
+            /* sparks (Bobby 10-27: "sparks when it touches wheels or track since dragged"): 6 hot specks per contact per frame, flying off
+               and falling (0.25 - 0.5 s), a light buzz on the left hand while it scrapes */
+            struct Spark { float p[3], v[3]; unsigned long long t0; float life; bool blood = false; };
+            static std::vector<Spark> sparks; static unsigned long long last_buzz = 0;
+            const uint32_t SPK = 0x7FFD0005u; static bool sm = false;
+            if (!sm) { sm = true; std::vector<uint32_t> px(16 * 16);
+                for (int y = 0; y < 16; y++) for (int x = 0; x < 16; x++) { const float dx = (x - 7.5f) / 8.f, dy = (y - 7.5f) / 8.f, r = sqrtf(dx * dx + dy * dy);
+                    px[y * 16 + x] = (uint32_t)((std::max)(0.f, 1.f - r) * 255.f) << 24 | 0x60D0FFu; }   /* 0xAABBGGRR: hot yellow-white */
+                VPIX_Render_AddBitmapRGBA(SPK, 16, 16, px.data()); }
+            const uint32_t BLD = 0x7FFD0007u; static bool bm = false;
+            if (!bm) { bm = true; std::vector<uint32_t> px(16 * 16);
+                for (int y = 0; y < 16; y++) for (int x = 0; x < 16; x++) { const float dx = (x - 7.5f) / 8.f, dy = (y - 7.5f) / 8.f, r = sqrtf(dx * dx + dy * dy);
+                    px[y * 16 + x] = (uint32_t)((std::max)(0.f, 1.f - r * r) * 255.f) << 24 | 0x0808C0u; }   /* blood red */
+                VPIX_Render_AddBitmapRGBA(BLD, 16, 16, px.data()); }
+            for (const auto &q : blood_at) for (int n = 0; n < 5 && sparks.size() < 260; n++) {   /* a fountain from the cut */
+                Spark sp; for (int i = 0; i < 3; i++) sp.p[i] = q[i];
+                const float a = (rand() % 628) / 100.f, spd = 800.f + rand() % 1400;
+                sp.v[0] = cosf(a) * spd * 0.4f; sp.v[1] = sinf(a) * spd * 0.4f; sp.v[2] = 3000.f + rand() % 3500; sp.t0 = now; sp.life = 0.5f + (rand() % 40) / 100.f; sp.blood = true; sparks.push_back(sp); }
+            for (const auto &q : spark_at) {
+                for (int n = 0; n < 6 && sparks.size() < 200; n++) { Spark sp; for (int i = 0; i < 3; i++) sp.p[i] = q[i];
+                    const float a = (rand() % 628) / 100.f, up = 0.4f + (rand() % 100) / 100.f, spd = 1500.f + rand() % 2500;
+                    sp.v[0] = cosf(a) * spd; sp.v[1] = sinf(a) * spd; sp.v[2] = up * spd; sp.t0 = now; sp.life = 0.25f + (rand() % 25) / 100.f; sparks.push_back(sp); }
+                if (now - last_buzz > 90) { last_buzz = now; VPIX_Haptic(1, 0.05f, 0.5f); }
+            }
+            static unsigned long long last_ms = now; const float dt = (std::min)(0.05f, (now - last_ms) / 1000.f); last_ms = now;
+            std::vector<Spark> live;
+            for (Spark &sp : sparks) {
+                const float age = (now - sp.t0) / 1000.f; if (age > sp.life) continue;
+                for (int i = 0; i < 3; i++) sp.p[i] += sp.v[i] * dt; sp.v[2] -= 18000.f * dt;
+                VPIX_Blit b = {}; b.handle = sp.blood ? BLD : SPK; b.sw = b.sh = 16; b.key = -1; b.world = true;
+                b.dw = b.dh = sp.blood ? 160.f : 110.f; b.pivot[0] = b.pivot[1] = 55.f; for (int i = 0; i < 3; i++) b.pos[i] = sp.p[i];
+                b.alpha = 1.f - age / sp.life; b.prio = 99500;
+                f.blits.push_back(b); live.push_back(sp);
+            }
+            sparks.swap(live);
+        }
+    }
+    /* VPIX_CAPE=1 (Phantom Freight, dev fabric test, Bobby 10-27: "a cape ... see if you can do wind animation as he goes fast, and
+       drops as he slows down"; "the person in the lead gets the cape"): a cloth cape on the leading rider drawn in the scene (models\rman: TORSO + HEAD, the riders in the other
+       carts). A 7 x 10 grid of points (Verlet), its top row pinned along the shoulders (the torso -> head line, 20 % below the head,
+       across the torso's right axis), held together by distance constraints (6 passes), pulled by gravity and dragged by still air:
+       the shoulders' own speed makes it stream out behind him, plus a flutter that grows with speed; when the cart slows it drops and
+       hangs. Black outside, blood-red lining. Drawn as a MallVR mesh rebuilt each frame in world coordinates. Looks only. */
+    {
+        static const bool cape_on = getenv("VPIX_CAPE") && atoi(getenv("VPIX_CAPE"));
+        if (cape_on) {
+            const int NX = 7, NY = 10;
+            struct Cape { float p[7 * 10][3], q[7 * 10][3]; float sh[3]; bool live; unsigned long seen; float rest_x, rest_y; };
+            static Cape capes[4] = {};
+            static unsigned long long last_ms = 0;
+            const unsigned long long now = hap_ms_now();
+            const float dt = last_ms ? (std::min)(0.05f, (std::max)(0.005f, (now - last_ms) / 1000.f)) : 0.02f; last_ms = now;
+            std::vector<std::pair<const VPIX_Instance *, const VPIX_Instance *>> riders;   /* torso, head */
+            std::vector<const VPIX_Instance *> torsos, heads;
+            for (const VPIX_Instance &in : f.inst) {
+                auto mf = model_files.find(in.handle); if (mf == model_files.end()) continue;
+                std::string lo = mf->second; std::transform(lo.begin(), lo.end(), lo.begin(), ::tolower);
+                if (lo.find("weeman") == std::string::npos) continue;   /* weeman = the cart riders (rman = the rock men: not them, Bobby 10-27) */
+                if (lo.find("pbody.bin") != std::string::npos) torsos.push_back(&in);
+                else if (lo.find("phead.bin") != std::string::npos) heads.push_back(&in);
+            }
+            /* only the rider in the lead wears it (Bobby 10-27: "the person in the lead gets the cape"): of the carts on the track
+               (state 1 / 2), the one ahead of every other along their direction of travel (+0x13) - drawn position +0x98 */
+            float lead[3] = {0, 0, 0}, lead_fw[3] = {0, 1, 0}; bool have_lead = false;
+            {
+                std::vector<uint32_t> cs;
+                for (int g = 0; g < 2; g++) for (int k = 0; k < 2; k++) { const uint32_t c = mem_readd(0xEDB7C + data_delta + g * 8 + k * 4); const int st = c ? mem_readb(0xEDB9C + data_delta + g * 16 + k * 2) : 0;
+                    if (c && (st == 1 || st == 2)) cs.push_back(c); }
+                for (uint32_t a : cs) {
+                    bool ahead = true;
+                    for (uint32_t b2 : cs) { if (b2 == a) continue; float d = 0; for (int c = 0; c < 3; c++) d += (rd_f(a + 0x98 + 4 * c) - rd_f(b2 + 0x98 + 4 * c)) * rd_f(b2 + 0x13 + 4 * c); if (d < 0.f) ahead = false; }
+                    if (ahead && cs.size() > 1) { for (int c = 0; c < 3; c++) { lead[c] = rd_f(a + 0x98 + 4 * c); lead_fw[c] = rd_f(a + 0x13 + 4 * c); } have_lead = true; break; }
+                }
+            }
+            for (const VPIX_Instance *t : torsos) {   /* each torso's nearest head */
+                const VPIX_Instance *bh = NULL; float bd = 1e30f;
+                for (const VPIX_Instance *h : heads) { float d = 0; for (int c = 0; c < 3; c++) d += (h->T[c] - t->T[c]) * (h->T[c] - t->T[c]); if (d < bd) { bd = d; bh = h; } }
+                if (bh && bd < 2500.f * 2500.f && riders.size() < 4) riders.push_back({t, bh});
+            }
+            if (have_lead) {   /* keep the rider sitting in the leading cart (nearest it, within 3 m) */
+                const std::pair<const VPIX_Instance *, const VPIX_Instance *> *best = NULL; float bd = 3000.f * 3000.f;
+                for (const auto &rp : riders) { float d = 0; for (int c = 0; c < 3; c++) d += (rp.first->T[c] - lead[c]) * (rp.first->T[c] - lead[c]); if (d < bd) { bd = d; best = &rp; } }
+                auto keep = best ? *best : std::pair<const VPIX_Instance *, const VPIX_Instance *>(NULL, NULL);
+                riders.clear(); if (keep.first) riders.push_back(keep);
+            } else riders.clear();
+            std::vector<float> v; std::vector<VPIX_MeshPoly> ps;
+            for (const auto &rp : riders) {
+                const VPIX_Instance &t = *rp.first, &h = *rp.second;
+                float up[3], len = 0; for (int c = 0; c < 3; c++) { up[c] = h.T[c] - t.T[c]; len += up[c] * up[c]; }
+                len = sqrtf(len); if (len < 50.f) continue; for (float &u : up) u /= len;
+                float rt[3] = {t.R[0][0], t.R[0][1], t.R[0][2]}; const float rl = sqrtf(rt[0] * rt[0] + rt[1] * rt[1] + rt[2] * rt[2]); if (rl < 1e-3f) continue; for (float &u : rt) u /= rl;
+                float sh[3]; for (int c = 0; c < 3; c++) sh[c] = h.T[c] - up[c] * len * 0.2f;   /* shoulder centre */
+                Cape *cp = NULL; float bd = 1e30f;   /* this rider's cape: the one whose shoulders were nearest last frame */
+                for (Cape &k : capes) if (k.live && frame - k.seen < 30) { float d = 0; for (int c = 0; c < 3; c++) d += (k.sh[c] - sh[c]) * (k.sh[c] - sh[c]); if (d < bd) { bd = d; cp = &k; } }
+                const float width = len * 0.95f, length = len * 1.5f;
+                if (!cp || bd > 3000.f * 3000.f) {   /* a new cape, hanging straight down */
+                    cp = NULL; for (Cape &k : capes) if (!k.live || frame - k.seen >= 30) { cp = &k; break; }
+                    if (!cp) continue;
+                    cp->live = true; cp->rest_x = width / (NX - 1); cp->rest_y = length / (NY - 1);
+                    for (int j = 0; j < NY; j++) for (int i = 0; i < NX; i++) { float *P = cp->p[j * NX + i];
+                        for (int c = 0; c < 3; c++) P[c] = sh[c] + rt[c] * (i - (NX - 1) * 0.5f) * cp->rest_x - (c == 2 ? j * cp->rest_y : 0.f);
+                        memcpy(cp->q[j * NX + i], P, sizeof(float) * 3); }
+                    memcpy(cp->sh, sh, sizeof(sh));
+                }
+                float vel[3]; for (int c = 0; c < 3; c++) vel[c] = (sh[c] - cp->sh[c]) / dt;   /* the rider's speed, units / s */
+                memcpy(cp->sh, sh, sizeof(sh)); cp->seen = frame;
+                const float spd = (std::min)(40000.f, sqrtf(vel[0] * vel[0] + vel[1] * vel[1] + vel[2] * vel[2]));
+                const float g = 18000.f, drag = 3.5f, tt = now / 1000.f;
+                for (int j = 1; j < NY; j++) for (int i = 0; i < NX; i++) {   /* Verlet: gravity + still air (the cloth trails the moving rider) */
+                    float *P = cp->p[j * NX + i], *Q = cp->q[j * NX + i], nv[3];
+                    for (int c = 0; c < 3; c++) {
+                        const float vv = (P[c] - Q[c]) / dt;
+                        float acc = (c == 2 ? -g : 0.f) - drag * vv;
+                        acc += (c == 2 ? 1.f : 0.6f) * 0.08f * spd * sinf(tt * (9.f + 0.0004f * spd) + j * 0.9f + i * 0.5f) * (j / (float)NY);   /* flutter */
+                        nv[c] = P[c] + (P[c] - Q[c]) * 0.985f + acc * dt * dt;
+                    }
+                    memcpy(Q, P, sizeof(nv)); memcpy(P, nv, sizeof(nv));
+                }
+                for (int i = 0; i < NX; i++) for (int c = 0; c < 3; c++) { cp->p[i][c] = sh[c] + rt[c] * (i - (NX - 1) * 0.5f) * cp->rest_x; cp->q[i][c] = cp->p[i][c]; }
+                /* the rider faces the way the cart goes: its back = against the cart's travel (+0x13); the body model's own axes can point
+                   any way (the cape went into his back, Bobby 10-27) */
+                float fw[3] = {lead_fw[0], lead_fw[1], lead_fw[2]}; { const float l = sqrtf(fw[0] * fw[0] + fw[1] * fw[1] + fw[2] * fw[2]); if (l > 1e-3f) for (float &q : fw) q /= l; }
+                for (int it = 0; it < 6; it++) {   /* keep the cloth's size; the top row (pinned) never moves */
+                    auto link = [&](int a, int b, float rest) { float *A = cp->p[a], *Bp = cp->p[b], d[3], l = 0;
+                        for (int c = 0; c < 3; c++) { d[c] = Bp[c] - A[c]; l += d[c] * d[c]; } l = sqrtf(l); if (l < 1e-3f) return;
+                        const float k = (l - rest) / l * 0.5f; const bool pa = a < NX, pb = b < NX;
+                        for (int c = 0; c < 3; c++) { if (!pa) A[c] += d[c] * k * (pb ? 2.f : 1.f); if (!pb) Bp[c] -= d[c] * k * (pa ? 2.f : 1.f); } };
+                    for (int j = 0; j < NY; j++) for (int i = 0; i < NX; i++) {
+                        if (i + 1 < NX) link(j * NX + i, j * NX + i + 1, cp->rest_x);
+                        if (j + 1 < NY) link(j * NX + i, (j + 1) * NX + i, cp->rest_y);
+                    }
+                    const float rad = len * 0.42f;   /* his body: a rounded capsule from the hips (torso origin) up to the shoulders */
+                    for (int j = 1; j < NY; j++) for (int i = 0; i < NX; i++) {   /* the cloth drapes round it, never through */
+                        float *P = cp->p[j * NX + i], ab[3], ap[3], l2 = 0, tt2 = 0;
+                        for (int c = 0; c < 3; c++) { ab[c] = sh[c] - t.T[c]; ap[c] = P[c] - t.T[c]; l2 += ab[c] * ab[c]; tt2 += ab[c] * ap[c]; }
+                        tt2 = l2 > 0 ? (std::max)(0.f, (std::min)(1.f, tt2 / l2)) : 0.f;
+                        float q[3], dq = 0; for (int c = 0; c < 3; c++) { q[c] = P[c] - (t.T[c] + ab[c] * tt2); dq += q[c] * q[c]; } dq = sqrtf(dq);
+                        if (dq < rad) { if (dq < 1e-3f) { for (int c = 0; c < 3; c++) q[c] = -fw[c]; dq = 1.f; } for (int c = 0; c < 3; c++) P[c] += q[c] / dq * (rad - dq); }
+                        float o = 0; for (int c = 0; c < 3; c++) o += (P[c] - sh[c]) * fw[c];   /* and it stays on his back side */
+                        if (o > -rad * 0.6f) for (int c = 0; c < 3; c++) P[c] -= (o + rad * 0.6f) * fw[c];
+                    }
+                }
+                const uint32_t base = (uint32_t)(v.size() / 3);   /* mesh: outside black, lining blood red (opposite windings) */
+                for (int k = 0; k < NX * NY; k++) for (int c = 0; c < 3; c++) v.push_back(cp->p[k][c]);
+                for (int j = 0; j + 1 < NY; j++) for (int i = 0; i + 1 < NX; i++) {
+                    const uint32_t a = base + j * NX + i, b = a + 1, c2 = a + NX + 1, d = a + NX;
+                    float e1[3], e2[3], n[3];
+                    for (int c = 0; c < 3; c++) { e1[c] = v[3 * b + c] - v[3 * a + c]; e2[c] = v[3 * d + c] - v[3 * a + c]; }
+                    n[0] = e1[1] * e2[2] - e1[2] * e2[1]; n[1] = e1[2] * e2[0] - e1[0] * e2[2]; n[2] = e1[0] * e2[1] - e1[1] * e2[0];
+                    const float nl = sqrtf(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]); if (nl < 1e-6f) continue;
+                    for (int side = 0; side < 2; side++) {
+                        VPIX_MeshPoly q; q.n = 4;
+                        if (!side) { q.idx[0] = a; q.idx[1] = b; q.idx[2] = c2; q.idx[3] = d; q.flags = 0x20120C16; q.nx = n[0] / nl; q.ny = n[1] / nl; q.nz = n[2] / nl; }
+                        else { q.idx[0] = a; q.idx[1] = d; q.idx[2] = c2; q.idx[3] = b; q.flags = 0x20140A96; q.nx = -n[0] / nl; q.ny = -n[1] / nl; q.nz = -n[2] / nl; }
+                        ps.push_back(q);
+                    }
+                }
+            }
+            for (Cape &k : capes) if (k.live && frame - k.seen >= 30) k.live = false;
+            const uint32_t HC = 0x7FFF0E40u;   /* not 0x7FFF0E20+: the gallery targets' models */
+            if (!ps.empty() && VPIX_Render_AddMesh(HC, v, ps)) {
+                VPIX_Instance g = {}; g.handle = HC; g.light_mask = 1;
+                for (int c = 0; c < 3; c++) { g.R[c][c] = 1.f; g.S[c] = 1.f; }
+                for (int c = 0; c < 16; c++) g.pal[c] = g.palw[c] = 0xFFFFFF;
+                f.inst.push_back(g);
+                static int nl = 0; if (nl < 8 && frame % 400 == 0) { nl++; lg("CAPE f=%lu %u riders", frame, (unsigned)riders.size()); }
+            }
+        }
+    }
+    /* VPIX_JUMP tricks: turn the rider's own cart model (its 5 parts, models\cart\cart*.bin, the set nearest the camera) round its
+       centre by the trick angle: spin = round the cart's up axis, front flip = round its right axis, barrel roll = round its forward
+       axis. Only the model turns: the game camera, the gun and the hit boxes stay as they are, so the rider's view stays level. */
+    if (jump_trick && jump_trick_a > 0.f) {
+        int base = -1; float bd = 1e30f; std::vector<size_t> bases;
+        for (size_t i = 0; i < f.inst.size(); i++) {
+            auto mf = model_files.find(f.inst[i].handle); if (mf == model_files.end()) continue;
+            std::string lo = mf->second; std::transform(lo.begin(), lo.end(), lo.begin(), ::tolower);
+            if (lo.find("cart\\cartbase") == std::string::npos) continue;
+            bases.push_back(i);
+            float d0 = f.inst[i].T[0] - f.cam_T[0], d1 = f.inst[i].T[1] - f.cam_T[1], d2 = f.inst[i].T[2] - f.cam_T[2], d = d0 * d0 + d1 * d1 + d2 * d2;
+            if (d < bd) { bd = d; base = (int)i; }
+        }
+        if (base >= 0) {
+            const VPIX_Instance cb = f.inst[base];
+            const int ax = jump_trick <= 2 ? 2 : jump_trick == 3 ? 0 : 1;   /* row of the cart's matrix = the axis */
+            float A[3]; float al = 0; for (int c = 0; c < 3; c++) { A[c] = cb.R[ax][c]; al += A[c] * A[c]; }
+            al = sqrtf(al); if (al > 1e-6f) for (float &v : A) v /= al;
+            const float ang = jump_trick == 1 ? jump_trick_a : -jump_trick_a, ca = cosf(ang), sa = sinf(ang);
+            auto rot = [&](const float v[3], float o[3]) {   /* Rodrigues: v about A by ang */
+                const float d = A[0] * v[0] + A[1] * v[1] + A[2] * v[2];
+                const float cx[3] = {A[1] * v[2] - A[2] * v[1], A[2] * v[0] - A[0] * v[2], A[0] * v[1] - A[1] * v[0]};
+                for (int c = 0; c < 3; c++) o[c] = v[c] * ca + cx[c] * sa + A[c] * d * (1 - ca);
+            };
+            float C[3]; for (int c = 0; c < 3; c++) C[c] = cb.T[c] + cb.R[2][c] / (al > 1e-6f && ax == 2 ? 1.f : 1.f) * 0.f;
+            { float up = 0; for (int c = 0; c < 3; c++) up += cb.R[2][c] * cb.R[2][c]; up = up > 1e-6f ? 450.f / sqrtf(up) : 0.f;
+              for (int c = 0; c < 3; c++) C[c] = cb.T[c] + cb.R[2][c] * up; }   /* turn about a point a little above the base */
+            for (VPIX_Instance &in : f.inst) {
+                float d0 = in.T[0] - cb.T[0], d1 = in.T[1] - cb.T[1], d2 = in.T[2] - cb.T[2];
+                if (d0 * d0 + d1 * d1 + d2 * d2 > 2500.f * 2500.f) continue;
+                auto mf = model_files.find(in.handle); if (mf == model_files.end()) continue;
+                std::string lo = mf->second; std::transform(lo.begin(), lo.end(), lo.begin(), ::tolower);
+                if (lo.find("cart\\cart") == std::string::npos) continue;
+                /* only parts of OUR cart: the ones whose nearest cart base is ours (the other rider's cart, running beside within
+                   2.5 m, turned with our tricks, Bobby 10-29) */
+                { const float mine = d0 * d0 + d1 * d1 + d2 * d2; bool other = false;
+                  for (size_t bi : bases) { if ((int)bi == base) continue; const VPIX_Instance &ob = f.inst[bi];
+                      const float e0 = in.T[0] - ob.T[0], e1 = in.T[1] - ob.T[1], e2 = in.T[2] - ob.T[2]; if (e0 * e0 + e1 * e1 + e2 * e2 < mine) { other = true; break; } }
+                  if (other) continue; }
+                float v[3] = {in.T[0] - C[0], in.T[1] - C[1], in.T[2] - C[2]}, o[3];
+                rot(v, o); for (int c = 0; c < 3; c++) in.T[c] = C[c] + o[c];
+                for (int r = 0; r < 3; r++) { float rr[3] = {in.R[r][0], in.R[r][1], in.R[r][2]}; rot(rr, o); for (int c = 0; c < 3; c++) in.R[r][c] = o[c]; }
+            }
+        }
+    }
+    /* VPIX_GHOST_TRAIN=<n> (Phantom Freight, dev, Bobby 10-27: "more players ghost train cars behind them"): each cart pulls n ghost
+       cars. MallVR keeps where the cart's 5 parts (models\cart\cart*.bin) were drawn, and draws copies of them where the cart was
+       0.45 s, 0.9 s ... ago: they follow the same track like a train, pale and see-through-looking (washed-out palette). A copy is skipped
+       while it would sit on top of a cart (stopped / slow). Nothing in the game knows about them (no hits, no collisions). */
+    static const int gt = getenv("VPIX_GHOST_TRAIN") ? atoi(getenv("VPIX_GHOST_TRAIN")) : 0;
+    if (gt > 0) {
+        struct Snap { unsigned long long ms; std::vector<VPIX_Instance> parts; };
+        static std::deque<Snap> hist;
+        Snap now{hap_ms_now(), {}};
+        for (const VPIX_Instance &in : f.inst) {
+            auto mf = model_files.find(in.handle);
+            if (mf == model_files.end()) continue;
+            std::string lo = mf->second; std::transform(lo.begin(), lo.end(), lo.begin(), ::tolower);
+            if (lo.find("cart\\cart") != std::string::npos) now.parts.push_back(in);
+        }
+        if (!now.parts.empty()) {
+            hist.push_back(now);
+            while (!hist.empty() && now.ms - hist.front().ms > (unsigned long long)(450 * gt + 500)) hist.pop_front();
+            for (int k = 1; k <= gt; k++) {
+                const unsigned long long want = now.ms - 450ull * k;
+                const Snap *best = nullptr;
+                for (const Snap &h : hist) if (h.ms <= want) best = &h;
+                if (!best) break;
+                for (const VPIX_Instance &p : best->parts) {
+                    bool on_cart = false;
+                    for (const VPIX_Instance &c : now.parts) {
+                        float d0 = p.T[0] - c.T[0], d1 = p.T[1] - c.T[1], d2 = p.T[2] - c.T[2];
+                        if (d0 * d0 + d1 * d1 + d2 * d2 < 1200.f * 1200.f) { on_cart = true; break; }
+                    }
+                    if (on_cart) continue;
+                    VPIX_Instance g = p;
+                    for (int c = 0; c < 16; c++) {   /* ghostly: halfway to pale green-white, dimmer the further back */
+                        uint32_t v = g.pal[c]; if ((v >> 24) != 0) continue;   /* entries that carry texture numbers stay */
+                        const float t = 0.55f, dim = 1.f - 0.12f * k;
+                        int r = (int)(((v >> 16 & 255) * (1 - t) + 170 * t) * dim), gg = (int)(((v >> 8 & 255) * (1 - t) + 230 * t) * dim), b = (int)(((v & 255) * (1 - t) + 200 * t) * dim);
+                        g.pal[c] = g.palw[c] = (uint32_t)(r << 16 | gg << 8 | b);
+                    }
+                    f.inst.push_back(g);
+                }
+            }
+        }
+    }
+    if (end_scrub.on) {   /* VPIX_ENDING: what was added after the mall code goes again (the ending's own pieces stay) */
+        end_scrub.on = false;
+        f.inst.erase(std::remove_if(f.inst.begin(), f.inst.end(), [](const VPIX_Instance &g) {
+            return !g.own_hand && !(g.handle >= 0x7FFF1500u && g.handle < 0x7FFF1600u) && !(g.handle >= 0x7FFF1760u && g.handle < 0x7FFF1780u); }), f.inst.end());
+        const bool w = end_scrub.world;
+        f.blits.erase(std::remove_if(f.blits.begin(), f.blits.end(), [w](const VPIX_Blit &b) {
+            if (b.world && b.handle >= 0x7FFD00E0u && b.handle < 0x7FFD00F0u) return false;   /* the ending's own */
+            return w || (b.world && b.handle >= 0x7FFD0000u && b.handle < 0x7FFE0000u); }), f.blits.end());
+        for (int c = 0; c < 3; c++) { f.clear[c] = end_scrub.clear[c]; f.fog_col[c] = end_scrub.clear[c]; }
+        f.fog_start = end_scrub.fog_start; f.fog_end = end_scrub.fog_end;
+    }
     frame_deliver(f);
 }
 
@@ -2529,6 +7306,9 @@ static void write_snapshot() {
 /* ---- the replaced functions ------------------------------------------------ */
 static uint32_t hle_replace(VHook &h) {
     const std::string &n = h.name;
+    /* PIX 1.34 (Pac-Man VR prototype) waits for a queued texture upload in PIX_GetChannelStatus, which is stubbed: run the queue here,
+       as the newer libraries' PIX_GetModuleStatus status read does (vpix.cpp) */
+    if (n == "PIX_GetChannelStatus") VPIX_Pix3K_Service();
     if (n == "PIX_LoadModel" || n == "PIX_LoadTexture" || n == "PIX_LoadBitmap") {
         uint32_t hd = forced_handle ? forced_handle : next_handle++;
         std::string fn = rd_str(reg_eax);
@@ -2553,11 +7333,42 @@ static uint32_t hle_replace(VHook &h) {
         } else {
             std::vector<uint8_t> data;
             ok = read_dos_file(fn, data) && VPIX_Render_AddBitmap(hd, data.data(), data.size());
+            bitmap_files[hd] = fn;
+            if (const char *gs = getenv("VPIX_GHOST_SETS")) {   /* VPIX_GHOST_SETS: a ghost frame -> load that frame of every set too */
+                std::string lo = fn; std::transform(lo.begin(), lo.end(), lo.begin(), ::tolower);
+                size_t g = lo.rfind("ghost");
+                if (ok && g != std::string::npos && g + 10 == lo.size() && lo.compare(g + 6, 4, ".vst") == 0 && lo[g + 5] >= '1' && lo[g + 5] <= '8') {
+                    const int fr = lo[g + 5] - '0'; ghost_frame[hd] = fr;
+                    std::vector<std::string> dirs; std::string all = gs; size_t p0 = 0;
+                    while (p0 <= all.size()) { size_t q = all.find(';', p0); if (q == std::string::npos) q = all.size(); if (q > p0) dirs.push_back(all.substr(p0, q - p0)); p0 = q + 1; }
+                    if (ghost_sets.size() < dirs.size()) ghost_sets.resize(dirs.size(), std::array<uint32_t, 9>{});
+                    for (size_t d = 0; d < dirs.size(); d++) {
+                        std::string path = dirs[d] + "\\GHOST" + std::to_string(fr) + ".VST";
+                        std::vector<uint8_t> gd; FILE *fp = fopen(path.c_str(), "rb");
+                        if (fp) { uint8_t buf[65536]; size_t nr; while ((nr = fread(buf, 1, sizeof(buf), fp)) > 0) gd.insert(gd.end(), buf, buf + nr); fclose(fp); }
+                        const uint32_t xh = 0x7FFE0000u + (uint32_t)d * 16 + fr;
+                        bool gok = !gd.empty() && VPIX_Render_AddBitmap(xh, gd.data(), gd.size());
+                        ghost_sets[d][fr] = gok ? xh : 0;
+                        if (fr == 1) lg("HLE: VPIX_GHOST_SETS set %u %s: %s", (unsigned)d, dirs[d].c_str(), gok ? "loaded" : "** NOT FOUND");
+                    }
+                }
+            }
             {   /* VPIX_BLIT_UNDER="name,name" (games.ps1 BlitUnder, Pac-Man: bells): those bitmaps go under the other 2D */
                 const char *bu = getenv("VPIX_BLIT_UNDER");
                 if (bu && *bu && ok) { std::string lo = fn, l2 = bu; std::transform(lo.begin(), lo.end(), lo.begin(), ::tolower); std::transform(l2.begin(), l2.end(), l2.begin(), ::tolower);
                     size_t p = 0; while (p <= l2.size()) { size_t q = l2.find(',', p); if (q == std::string::npos) q = l2.size(); std::string t = l2.substr(p, q - p);
                         if (!t.empty() && lo.find(t) != std::string::npos) blit_under.insert(hd); p = q + 1; } }
+            }
+            if (const char *ss = ok ? getenv("VPIX_SKY_SPRITE") : NULL) {   /* VPIX_SKY_SPRITE="name,name" (games.ps1 SkySprite, Missile Command) */
+                std::string lo = fn; for (char &c : lo) c = (char)tolower((unsigned char)c);
+                for (const char *p = ss; ; ) { const char *q = strchr(p, ','); std::string t = q ? std::string(p, q - p) : std::string(p);
+                    if (!t.empty() && lo.find(t) != std::string::npos) sky_sprite.insert(hd);
+                    if (!q) break; p = q + 1; } }
+            {   /* VPIX_SPRITE_TOP="name,name" (games.ps1 SpriteTop, Olin Shotgun: quala = QUALIFIED): those world sprites draw last, over everything */
+                const char *st = getenv("VPIX_SPRITE_TOP");
+                if (st && *st && ok) { std::string lo = fn, l2 = st; std::transform(lo.begin(), lo.end(), lo.begin(), ::tolower); std::transform(l2.begin(), l2.end(), l2.begin(), ::tolower);
+                    size_t p = 0; while (p <= l2.size()) { size_t q = l2.find(',', p); if (q == std::string::npos) q = l2.size(); std::string t = l2.substr(p, q - p);
+                        if (!t.empty() && lo.find(t) != std::string::npos) sprite_top.insert(hd); p = q + 1; } }
             }
             static const char *bb = getenv("VPIX_BLACK_BACKDROP");
             if (bb && *bb && ok) { std::string lo = fn; std::transform(lo.begin(), lo.end(), lo.begin(), ::tolower); if (lo.find(bb) != std::string::npos) black_backdrop_handle = hd; }
@@ -2645,6 +7456,7 @@ static uint32_t hle_replace(VHook &h) {
         return reg_edx == 2 ? (reg_eax & 3) : 0;    /* 0x80/0x40/0x20 is clear; a real idle card reads 0xCF */
     if (n.compare(0, 4, "SND_") == 0) return hle_sound(n, h);
     if (n.compare(0, 4, "AWE_") == 0) return hle_awe(n, h);
+    if ((n.compare(0, 5, "AWE32") == 0 || n == "aweinit" || n == "aweclose") && global_rt("awe_samples")) return hle_awe32(n);   /* Pac-Man VR only (ZENECA has these names too) */
     if (getenv("VPIX_CD_DIR") && n.compare(0, 3, "CD_") == 0) return hle_cd(n);
     if (n == "PIX_InitFLIC" || n == "PIX_ReadNextFLICFrame" || n == "PIX_CloseFLIC") return hle_flic(n);
     if (n == "TRK_Open") { lg("TRK_Open \"%s\" -> 0 (HLE tracker)", rd_str(reg_eax).c_str()); return track_on ? 0 : (uint32_t)-2000; }
@@ -2691,6 +7503,10 @@ static uint32_t hle_replace(VHook &h) {
             static const bool seat2_mirror = getenv("VPIX_SEAT2_MIRROR") && atoi(getenv("VPIX_SEAT2_MIRROR"));
             const bool own = s == 0 || (seat2_mirror && s == 1);
             uint32_t btn = own ? cur_in.buttons | (two_hand_trigger ? VPIX_BTN_TRIGGER : 0) : 0;
+            if (s == 0 && dual_on()) btn = (btn & ~(uint32_t)VPIX_BTN_TRIGGER) | (dual_trig ? VPIX_BTN_TRIGGER : 0);
+            /* the museum drives the cart itself (Bobby 10-29: "the cart would stall and move fowerd super slow by pressing move button ...
+               take full control"): the move button held for the rider; the ride's own speed (crawl, creep, stop) is written each frame */
+            if (s == 0 && mall_now) btn |= VPIX_BTN_WALK;
             if (s == 1 && seat2_live()) btn = seat2_in.buttons | (seat2_two_hand_trigger ? VPIX_BTN_TRIGGER : 0);   /* remote seat 2 */
             if (seat_client_on()) btn = 0;   /* remote seat PC: its own game stays in attract (we draw the host's seat 2) */
             mem_writeb(a, (uint8_t)(int8_t)jx); mem_writeb(a + 1, (uint8_t)(int8_t)jy); mem_writed(a + 2, btn);
@@ -2721,6 +7537,14 @@ static uint32_t hle_replace(VHook &h) {
            link path when it is possible and fall back to single play */
         uint32_t press = start_bits ? start_bits : VPIX_NET_Enabled() ? 3 : 1;   /* SU3000 Zero Hour: PROCESS_buttons starts player 1 on bit 4 (8 = the other start) */
         bool start = cur_in.start;
+        /* VPIX_COIN_STARTS=1 (run_su3k.sh pacman: the prototype has no credits): a coin (5 / VR coin) is also a start press, held 0.5 s
+           (Bobby 11-01: "i had to hit 555 multiple times", the window's start key is 1) */
+        { static const bool coin_starts = getenv("VPIX_COIN_STARTS") && atoi(getenv("VPIX_COIN_STARTS"));
+          static int lastc = 0; static double until = 0;
+          if (coin_starts) { if (cur_in.coins != lastc) until = hap_ms_now() + 500; if (hap_ms_now() < until) start = true; }
+          lastc = cur_in.coins; }
+        { static const bool auto_start = getenv("VPIX_AUTOSTART") && atoi(getenv("VPIX_AUTOSTART"));   /* dev (screenshot runs): start held 0.5 s every 8 s */
+          if (auto_start && fmod(hap_ms_now(), 8000.0) < 500.0) start = true; }
         /* DAC linked pods: the asking pod waits 10 s for the other pod's players to press LINK UP too;
            only when both pods have nextMode 4/4 does the 4-player game start. Pressing on both pods at
            once races (each sees the other already playing and starts a local game), so slave pods
@@ -2783,12 +7607,24 @@ static uint32_t hle_replace(VHook &h) {
     }
     if (n == "PIX_RenderSwap" || n == "PIX_Render") {
         /* the real cards took ~1/30-1/60 s per frame; without a limit the game runs ~2000 fps */
-        static auto last = std::chrono::steady_clock::now();
         if (fps_limit > 0) {
-        auto due = last + std::chrono::microseconds(1000000 / fps_limit);
+        /* Windows sleeps in 15.6 ms ticks unless asked: a 20 ms (50 fps) frame woke at 16 or 31 ms, so game frames came
+           unevenly and the whole game stuttered in the headset (Bobby 11-01). 1 ms timer. */
+#ifdef _WIN32
+        static bool hires = false;
+        if (!hires) { hires = true; timeBeginPeriod(1); }
+#endif
+        /* the wait itself is in vpix_hle_cb_in: the call is held in the game until cap_due. Here: the next frame's due time */
         auto now = std::chrono::steady_clock::now();
-        if (now < due) std::this_thread::sleep_until(due);
-        last = (std::max)(due, now - std::chrono::milliseconds(100));
+        if (cap_due.time_since_epoch().count() == 0) cap_due = now;
+        cap_due = (std::max)(cap_due + std::chrono::microseconds(1000000 / fps_limit), now - std::chrono::milliseconds(100));
+        {   /* frame pacing: worst interval and frames late by over 5 ms, every 10 s */
+            static auto prev = now, t0 = now; static double worst = 0, hk_worst = 0, hk_sum = 0; static unsigned nf = 0, late = 0;
+            hk_worst = (std::max)(hk_worst, hook_ms); hk_sum += hook_ms; hook_ms = 0;
+            double ms = std::chrono::duration<double, std::milli>(now - prev).count(); prev = now;
+            if (ms > worst) worst = ms; if (ms > 1000.0 / fps_limit + 5) late++; nf++;
+            if (now - t0 >= std::chrono::seconds(10)) { lg("pace: %u frames in 10 s, worst %.1f ms, %u late; hooks %.1f ms a frame, worst %.1f", nf, worst, late, nf ? hk_sum / nf : 0.0, hk_worst); t0 = now; worst = hk_worst = hk_sum = 0; nf = late = 0; }
+        }
         }
         if (frame % snap_every == 0) write_snapshot();
         {   /* VPIX_PPCDUMP=<frame> (dev, SU3000): PowerPC 0's database memory (model objects) -> <log>.ppc0 */
@@ -2854,8 +7690,8 @@ static uint32_t hle_replace(VHook &h) {
         seat_tick();                                     /* remote seat (vpix_seat.h): seat 2's input in, its frame out */
         voice_tick();                                    /* voice chat (vpix_voice.h) */
         {   /* VPIX_TEXTDUMP: log the operator screen (DOS text page at 0xB8000) when it changes */
-            static const bool td = getenv("VPIX_TEXTDUMP") != NULL; static std::string last; static unsigned long nt = 0;
-            if (td && nt++ % 2000 == 0) {
+            static const bool td = getenv("VPIX_TEXTDUMP") != NULL; static const unsigned long tdn = td && atoi(getenv("VPIX_TEXTDUMP")) > 1 ? (unsigned long)atoi(getenv("VPIX_TEXTDUMP")) : 2000; static std::string last; static unsigned long nt = 0;   /* VPIX_TEXTDUMP=<n>: every n frames (default 2000) */
+            if (td && nt++ % tdn == 0) {
                 std::string t;
                 for (int r = 0; r < 50; r++) { std::string row; for (int c = 0; c < 80; c++) { uint8_t ch = mem_readb(0xB8000 + (r * 80 + c) * 2); row += (ch >= 32 && ch < 127) ? (char)ch : ' '; }
                     while (!row.empty() && row.back() == ' ') row.pop_back(); if (!row.empty()) t += "  |" + row + "\n"; }
@@ -2866,6 +7702,167 @@ static uint32_t hle_replace(VHook &h) {
         {   /* VPIX_HAPTIC gun rules: when the trigger last went down / whether it is held (auto-fire) */
             static bool trig_was = false; bool t = (cur_in.buttons & VPIX_BTN_TRIGGER) != 0;
             if (t && !trig_was) trigger_down_ms = hap_ms_now(); trig_was = t; trigger_held = t;
+        }
+        {   /* VPIX_SEATED */
+            static int mode = -2; static float fixed = 0;
+            if (mode == -2) { const char *e = getenv("VPIX_SEATED"); mode = !e || !*e || !strcmp(e, "0") ? 0 : !strcmp(e, "auto") ? 1 : 2; if (mode == 2) fixed = (float)atof(e);
+                if (mode) lg("HLE: VPIX_SEATED %s", mode == 1 ? "auto" : e); }
+            if (mode == 2) seat_lift = fixed;
+            else if (mode == 1 && cur_in.head.valid) {
+                static bool was = false; static int n = 0; static float sum = 0; static unsigned long long off_since = 0;
+                const bool riding = ghost_ride_ms && hap_ms_now() - ghost_ride_ms < 1000;
+                if (!riding && was) off_since = hap_ms_now();
+                /* measured once per game: a pause between stages (the drop into hell, the station) re-measured mid-ride and the view
+                   (and the gun's aim with it) jumped up or down (Bobby 10-28) - only a new game (15 s+ off the ride) measures again */
+                if (riding && !was && (!off_since || hap_ms_now() - off_since > 15000)) { n = 0; sum = 0; }
+                if (riding && n >= 0 && n < 60) { sum += cur_in.head.p[2]; if (++n == 60) { const float hz = sum / 60.f;
+                    seat_lift = hz < 1350.f ? (std::min)(700.f, 1650.f - hz) : 0.f; n = -1;
+                    lg("SEATED head %.0f mm -> lift %.0f mm (%s)", hz, seat_lift, seat_lift > 0 ? "sitting" : "standing"); } }
+                was = riding;
+            }
+        }
+        if (dual_on()) {   /* VPIX_DUAL_GUN: which hand fires this shot, and the pulsed trigger */
+            static const bool lt_moves = getenv("VPIX_LTRIG_MOVE") && atoi(getenv("VPIX_LTRIG_MOVE"));   /* the left trigger moves the cart (render), never fires */
+            const bool rt = (cur_in.buttons & VPIX_BTN_TRIGGER) != 0, lt = cur_in.fire2 && cur_in.hand2.valid && !lt_moves;
+            const unsigned long long now = hap_ms_now(), period = (unsigned long long)(1000.f / dual_rate);
+            /* off the ride (attract, menus, the high-score initials after game over) it's one plain trigger: the pulsed one entered a
+               letter 10 times a second (Bobby 10-27: "the initials after game over its not selecting right") */
+            const bool riding = ghost_ride_ms && now - ghost_ride_ms < 1000;
+            if (!riding) { dual_trig = rt || lt; dual_hand = 0; gf_right = false; dual_next_ms = 0; }
+            else if (mall_now && mall_in_room) { dual_trig = false; dual_next_ms = 0; gf_right = cur_in.vr && cur_in.hand.valid; }   /* in a museum room: the BANG! flag instead (between rooms the guns fire) */
+            else if (!rt && !lt) { dual_trig = false; dual_next_ms = 0; gf_right = cur_in.vr && cur_in.hand.valid; }   /* VR: the aim (sight, 3D crosshair) follows the right hand */
+            else if (now >= dual_next_ms) {
+                dual_hand = (rt && lt) ? dual_hand ^ 1 : lt ? 1 : 0;
+                /* right = the controller's aim (GHOST_Fire), left = where you look; with VPIX_SWORD the left hand holds the sword, so its
+                   trigger's shot goes along the right gun too (Bobby 10-28: the head-aimed "laser eyes" came out of the stomach) */
+                static const bool sword_left = getenv("VPIX_SWORD") && atof(getenv("VPIX_SWORD")) > 0;
+                gf_right = dual_hand == 0 || (sword_left && cur_in.vr && cur_in.hand.valid);
+                dual_trig = true; dual_shot_ms = now; dual_next_ms = now + period;
+                trigger_down_ms = now; trigger_held = true;   /* muzzle flash + haptics follow every shot */
+                static int nl = 0; if (nl < 60) { lg("DUALGUN f=%lu %s shot", frame, dual_hand ? "LEFT" : "right"); nl++; }
+            } else if (now - dual_shot_ms >= period / 2) dual_trig = false;
+        }
+        {   /* VPIX_JUMP=<hop height> (Ghost Train "Hunted", dev, 10-27; re/GHOST_HUNTED_RE.md goal 1): each local cart routine places the
+               cart model at its path point + up axis * its own copy of the double 200.0: mover 0x25400 (0xC0CE3), stage start 0x20AD0
+               (0xC0B73), 0x21BF0 (0xC0BD1), placement 0x231F0 (0xC0C57), state-2 mover 0x292A0 (0xC0E83). Writing 200 + h(t) into them hops
+               the cart, the rider's eye and the rival's hit box along the cart's up axis; the path itself is untouched, so it lands back on
+               the rails. The follower cart 0x3D950 (0xC27C8) is left alone: a linked rival may ride on it. Button: input.jump (left trigger,
+               B with dual guns, E in the window). VPIX_JUMP_AUTO=<s> (dev test): hop by itself every s seconds. VPIX_JUMP_TIME=<s> hop
+               length (0.8). Ghost Train v01.00.09 only (the constants must hold 200.0). Not synced to a linked pod yet. */
+            static const uint32_t jcs[5] = {0xC0CE3, 0xC0B73, 0xC0BD1, 0xC0C57, 0xC0E83};
+            static bool jok[5] = {false, false, false, false, false};
+            static int jstate = -1; static float jh = 900.f, jt = 0.8f, jauto = 0.f;
+            static unsigned long long j0 = 0, jlast = 0; static bool jwas = false;
+            if (jstate < 0 && frame % 50 == 0) {   /* re-checked until frame 3000: the data object may be fixed up after arming */
+                const char *e = getenv("VPIX_JUMP");
+                int nok = 0;
+                for (int k = 0; k < 5; k++) { jok[k] = mem_readd(jcs[k] + data_delta) == 0 && mem_readd(jcs[k] + data_delta + 4) == 0x40690000u; nok += jok[k]; }
+                if (!e || atof(e) <= 0) jstate = 0;
+                else if (jok[0] && mem_readb(0x25AAA + code_delta) == 0xDC && mem_readb(0x25AAB + code_delta) == 0x0D && mem_readb(0x25AAC + code_delta) == 0xE3) {
+                    jstate = 1; jh = atof(e) > 1 ? (float)atof(e) : 900.f;
+                    if ((e = getenv("VPIX_JUMP_TIME")) && atof(e) > 0.1) jt = (float)atof(e);
+                    if ((e = getenv("VPIX_JUMP_AUTO"))) jauto = (float)atof(e);
+                    lg("HLE: VPIX_JUMP on: %.0f units, %.2f s%s, %d of 5 cart constants", jh, jt, jauto > 0 ? " (auto)" : "", nok);
+                } else if (frame >= 3000) { jstate = 0; lg("HLE: VPIX_JUMP: not Ghost Train v01.00.09 (cart mover / constant not found), off"); }
+            }
+            if (jstate == 1) {
+                /* a jump = one or two arcs. Press = hop (height jh, jt s). Press again in the air = SUPER JUMP (Bobby 10-27): a second,
+                   bigger arc from where the cart is (1.8x higher, 1.4x longer), once per jump, boom rumble. A stick direction while in
+                   the air = a TRICK on that arc (Bobby 10-27 "a joystick direction makes him do a trick or spin around"): left / right
+                   spin round, forward front flip, back barrel roll; MallVR turns the cart model, the rider's view stays level.
+                   Landing: speed boost (Hunted speed rule): hop +10%, a trick +40% for the top speed, 3 s cooldown. */
+                const unsigned long long now = hap_ms_now();
+                bool press = cur_in.jump && !jwas; jwas = cur_in.jump;
+                if (jauto > 0 && now - jlast > (unsigned long long)(jauto * 1000)) press = true;
+                static double a_h0 = 0, a_H = 0, a_dur = 1; static bool super_used = false; static int tricks_done = 0; static int last_trick = 0, trick_pts = 0;
+                static unsigned long long trick_t0 = 0, boost_until = 0, boost_cool = 0; static bool trick_set = false;
+                double h = 0;
+                if (j0) {
+                    double t = (now - j0) / 1000.0 / a_dur;
+                    if (t >= 1) {   /* landed */
+                        j0 = 0; VPIX_Haptic(2, 0.12f, 1.f);
+                        if (now >= boost_cool) {   /* speed boost on the riding cart (state 1) */
+                            const float mult = tricks_done ? 1.4f : 1.1f;
+                            for (int g = 0; g < 2; g++) for (int k = 0; k < 2; k++) {
+                                const uint32_t c = mem_readd(0xEDB7C + data_delta + g * 8 + k * 4);
+                                if (c && mem_readb(0xEDB9C + data_delta + g * 16 + k * 2) == 1) {
+                                    float sp = rd_f(c + 0x37) * mult; if (sp > 18700.f) sp = 18700.f;
+                                    uint32_t u; memcpy(&u, &sp, 4); mem_writed(c + 0x37, u);
+                                }
+                            }
+                            boost_until = now + (tricks_done ? 1500 : 1000); boost_cool = now + 3000;
+                            lg("JUMP landed f=%lu: %d trick(s), speed x%.1f", frame, tricks_done, mult);
+                        }
+                        {   /* named tricks: points on the score (cart+9), a word pops up (VPIX_TITLE3D), the game's point ding */
+                            int pts = 0, word = -1;
+                            if (tricks_done) { word = last_trick <= 2 ? 0 : last_trick == 3 ? 1 : 2; pts = trick_pts; }
+                            else if (super_used) { word = 3; pts = 100; }
+                            if (tricks_done >= 2) { word = 4; pts = trick_pts * 2; }   /* DOUBLE HAUNT: both tricks, doubled */
+                            if (pts) {
+                                for (int g = 0; g < 2; g++) for (int k = 0; k < 2; k++) {
+                                    const uint32_t c = mem_readd(0xEDB7C + data_delta + g * 8 + k * 4);
+                                    if (c && mem_readb(0xEDB9C + data_delta + g * 16 + k * 2) == 1) mem_writed(c + 9, mem_readd(c + 9) + (uint32_t)pts);
+                                }
+                                trick_word = word; trick_word_at = now;
+                                play_game_sound(4, 120);                 /* SND_CART_POINT (point03.wav) */
+                                lg("JUMP trick word %d +%d", word, pts);
+                            }
+                        }
+                        jump_trick = 0; jump_trick_a = 0.f;
+                    } else h = a_h0 * (1 - t) + 4.0 * a_H * t * (1 - t);
+                }
+                if (press) {
+                    if (!j0) { j0 = now; jlast = now; a_h0 = 0; a_H = jh; a_dur = jt; super_used = false; tricks_done = 0; last_trick = 0; trick_pts = 0; trick_set = false;
+                               static int nl = 0; if (nl++ < 40) lg("JUMP f=%lu hop", frame); }
+                    else if (!super_used) {   /* SUPER JUMP from the current height */
+                        double t = (now - j0) / 1000.0 / a_dur, hn = a_h0 * (1 - t) + 4.0 * a_H * t * (1 - t);
+                        j0 = now; a_h0 = hn; a_H = jh * 1.8; a_dur = jt * 1.4; super_used = true; trick_set = false;
+                        VPIX_Haptic(2, 0.25f, 1.f); play_game_sound(1, 110); lg("JUMP f=%lu SUPER", frame);   /* SND_VR_SPIN whoosh */
+                    }
+                }
+                if (j0 && !trick_set) {   /* pick a trick from the stick (the pod joystick axes the thumbsticks feed) */
+                    const float jx = cur_in.joy[0], jy = cur_in.joy[1];
+                    int tr = 0;
+                    if (fabsf(jx) > 0.6f && fabsf(jx) >= fabsf(jy)) tr = jx < 0 ? 1 : 2;
+                    else if (fabsf(jy) > 0.6f) tr = jy > 0 ? 3 : 4;
+                    if (!tr && jauto > 0 && now - j0 > 120) tr = 1 + rand() % 4;   /* VPIX_JUMP_AUTO (dev test): a random trick */
+                    if (tr) { trick_set = true; jump_trick = tr; trick_t0 = now; lg("JUMP f=%lu trick %d", frame, tr); }
+                }
+                if (j0 && jump_trick) {   /* the trick finishes before the cart lands (by 85% of what's left of the arc) */
+                    const double left = a_dur * 1000.0 - (double)(trick_t0 - j0);
+                    double u = (now - trick_t0) / ((left > 200 ? left : 200) * 0.85);
+                    if (u >= 1) { u = 1; if (jump_trick_a < 6.28f) { tricks_done++; last_trick = jump_trick; trick_pts += jump_trick <= 2 ? 200 : 300; } }
+                    const double e = u * u * (3 - 2 * u);
+                    jump_trick_a = (float)(6.2831853 * e);
+                    if (u >= 1) { jump_trick = 0; jump_trick_a = 0.f; }
+                }
+                {   /* top-speed clamp (float 0xC0CCB, 15000): raised while boosted, else the mover snaps a boosted cart back */
+                    static int clamp_ok = -1;
+                    if (clamp_ok < 0) clamp_ok = mem_readd(0xC0CCB + data_delta) == 0x466A6000u;
+                    if (clamp_ok) { float cl = now < power_boost_until ? 26000.f : now < boost_until ? 18750.f : 15000.f; uint32_t u; memcpy(&u, &cl, 4); mem_writed(0xC0CCB + data_delta, u); }
+                }
+                {   /* dev log: each riding cart's drawn height over its path point (+0xA0 - +0x6E0): 200 on the rails, 200 + h in a hop.
+                       Carts: [0xEDB7C + game*8 + cart*4], state byte [0xEDB9C + game*16 + cart*2] */
+                    static int nz = 0;
+                    if (j0 && frame % 10 == 0 && nz < 150) {
+                        std::string w; char b[64];
+                        for (int g = 0; g < 2; g++) for (int k = 0; k < 2; k++) {
+                            const uint32_t c = mem_readd(0xEDB7C + data_delta + g * 8 + k * 4);
+                            const int st = mem_readb(0xEDB9C + data_delta + g * 16 + k * 2);
+                            if (c && st) { snprintf(b, sizeof(b), " g%dc%d st%d dz=%.0f y=%.0f", g, k, st, rd_f(c + 0xA0) - rd_f(c + 0x6E0), rd_f(c + 0x6DC)); w += b; }
+                        }
+                        static float lasty = 0; const uint32_t c0 = mem_readd(0xEDB7C + data_delta); const float y0 = c0 ? rd_f(c0 + 0x6DC) : 0;
+                        if (!w.empty() && y0 != lasty) { nz++; lg("JUMPZ f=%lu h=%.0f%s", frame, h, w.c_str()); }   /* only while the cart moves */
+                        lasty = y0;
+                    }
+                }
+                /* only the riding cart's own mover constant (Bobby 10-27: "jump made the other guy jump with me"): 0xC0E83 is the
+                   other cart's mover, and the placement 0x231F0 (0xC0C57) is shared by both movers, so the GHOST_Place hook sets that
+                   one per call; the stage-start constants stay 200 */
+                jump_h_now = h + snatch_h;
+                double v = 200.0 + h + snatch_h; uint64_t u; memcpy(&u, &v, 8);
+                if (jok[0]) { mem_writed(jcs[0] + data_delta, (uint32_t)u); mem_writed(jcs[0] + data_delta + 4, (uint32_t)(u >> 32)); }
+            }
         }
         net_bots();
         if (frame % 100 == 0 && trk_calls) {
@@ -2985,6 +7982,7 @@ static std::string net_state() {
 }
 
 static void hle_log(VHook &h) {
+    if (h.name == "GHOST_Fire" || h.name == "GHOST_Place") return;   /* every frame: handled in vpix_hle_cb */
     if (h.name == "PIX_SetVideoCapture") {           /* (input, video texture descriptor): where the MPEG picture goes */
         uint32_t d = reg_edx & 0xFFFFFF;
         if (d >= 0x100000 && d < 0x2000000 && d != video_target) { video_target = d; lg("PIX_SetVideoCapture -> texture %06X", d); }
@@ -3004,6 +8002,44 @@ static void hle_log(VHook &h) {
         }
     }
     if (h.name == "HI_process") { hi_frame = frame; return; }   /* Zero Hour high-score entry: draw our aim beam (submit_frame_su3k) */
+    if (h.name == "GDOORS_small") {                 /* Zero Hour garage doors (hooks ZERO3K.game): put the small door back in the big one */
+        /* BAD_process (type 0xD) runs ANIM_animate, which places part 1 (GSMDOOR, 'FROM 0' in GDOORS.DBS) from part 0's UNTURNED axes,
+           then turns each part's axes in place by its own swing angle (part +9: row0' = c*row0 + s*row1, row1' = -s*row0 + c*row1).
+           Part 0 (GLDOOR) swings open but the small door stays hanging in the doorway (Bobby: 'the smaller door is getting left
+           behind'). Here, just before part 1's OBJ_update: D = part 0's swing in world space, applied to part 1's axes and to its
+           offset from part 0. Part = 0x196 bytes from obj+0xA: +0x32 axes (3 rows of 4 floats, world = sum x_k * row_k), +0x62 pos */
+        const uint32_t ob = reg_eax, p0 = ob + 0xA, p1 = ob + 0xA + 0x196;
+        const float a = rd_f(p0 + 9);
+        auto wr_f = [](uint32_t ad, float v) { uint32_t u; memcpy(&u, &v, 4); mem_writed(ad, u); };
+        static std::map<uint32_t, float> done;            /* part 1's x as we left it: ANIM_animate skipped -> don't turn twice */
+        auto it = done.find(ob);
+        if (a == 0.f || !std::isfinite(a) || (it != done.end() && it->second == rd_f(p1 + 0x62))) return;
+        float A[3][3], U[3][3];                          /* part 0's rows now (turned) and before the swing */
+        for (int r = 0; r < 3; r++) for (int c = 0; c < 3; c++) A[r][c] = rd_f(p0 + 0x32 + 0x10 * r + 4 * c);
+        const float c = cosf(a), s = sinf(a);
+        for (int k = 0; k < 3; k++) { U[0][k] = c * A[0][k] - s * A[1][k]; U[1][k] = s * A[0][k] + c * A[1][k]; U[2][k] = A[2][k]; }
+        /* D = A^T (U^T)^-1: a world vector w = U^T x (unturned) -> A^T x (turned) */
+        float M[3][3], I[3][3];                          /* M = U^T; I = M^-1 */
+        for (int r = 0; r < 3; r++) for (int k = 0; k < 3; k++) M[r][k] = U[k][r];
+        const float det = M[0][0] * (M[1][1] * M[2][2] - M[1][2] * M[2][1]) - M[0][1] * (M[1][0] * M[2][2] - M[1][2] * M[2][0]) + M[0][2] * (M[1][0] * M[2][1] - M[1][1] * M[2][0]);
+        if (fabsf(det) < 1e-9f) return;
+        for (int r = 0; r < 3; r++) for (int k = 0; k < 3; k++) {
+            const int r1 = (k + 1) % 3, r2 = (k + 2) % 3, c1 = (r + 1) % 3, c2 = (r + 2) % 3;
+            I[r][k] = (M[r1][c1] * M[r2][c2] - M[r1][c2] * M[r2][c1]) / det;
+        }
+        float D[3][3];
+        for (int r = 0; r < 3; r++) for (int k = 0; k < 3; k++) { D[r][k] = 0.f; for (int j = 0; j < 3; j++) D[r][k] += A[j][r] * I[j][k]; }
+        auto turn = [&](const float v[3], float o[3]) { for (int r = 0; r < 3; r++) o[r] = D[r][0] * v[0] + D[r][1] * v[1] + D[r][2] * v[2]; };
+        for (int r = 0; r < 3; r++) {                    /* the small door's own axes (already turned by its own angle) */
+            float v[3] = {rd_f(p1 + 0x32 + 0x10 * r), rd_f(p1 + 0x36 + 0x10 * r), rd_f(p1 + 0x3A + 0x10 * r)}, o[3]; turn(v, o);
+            for (int k = 0; k < 3; k++) wr_f(p1 + 0x32 + 0x10 * r + 4 * k, o[k]);
+        }
+        float d[3] = {rd_f(p1 + 0x62) - rd_f(p0 + 0x62), rd_f(p1 + 0x66) - rd_f(p0 + 0x66), rd_f(p1 + 0x6A) - rd_f(p0 + 0x6A)}, o[3]; turn(d, o);
+        for (int k = 0; k < 3; k++) wr_f(p1 + 0x62 + 4 * k, rd_f(p0 + 0x62 + 4 * k) + o[k]);
+        done[ob] = rd_f(p1 + 0x62);
+        if (h.calls < 20) lg("GDOORS_small f=%lu obj %06X big door %.2f rad -> small door moved by (%.0f %.0f %.0f)", frame, ob, a, o[0] - d[0], o[1] - d[1], o[2] - d[2]);
+        return;
+    }
     if (h.name == "PLAYER_do_blood") {              /* Zero Hour: the player took a hit (edx = hits, 0 = none) -> both hands (Bobby 10-18: no rumble on hits) */
         if (reg_edx) { VPIX_Haptic(2, 0.25f, 1.f); if (h.calls < 50) lg("player hit f=%lu (edx %u) -> rumble", frame, reg_edx); }
         return;
@@ -3020,6 +8056,9 @@ static void hle_log(VHook &h) {
         return;
     }
     if (h.name == "PIX_DrawBitmap") {               /* ZENECA (cdecl): (window mask, PIXBITMAP *) from BITMAP_update every frame */
+        if (getenv("VPIX_BMPLOG")) { static std::set<uint32_t> seen; if (seen.insert(reg_edx).second && seen.size() < 40)   /* dev: PIX 1.34 (Pac-Man VR) passes it in edx */
+            lg("PIX_DrawBitmap reg eax %X edx %06X: %s", reg_eax, reg_edx, rd_hex(reg_edx, 0x60).c_str()); }
+        if (ppcdev_off == 0x1D6) { if (reg_edx > 0x1000 && reg_edx < 0x4000000) blit134(drawbmp3k, reg_edx); return; }   /* PIX 1.34: register args, packed record */
         uint32_t bmp = mem_readd(SegPhys(ss) + reg_esp + 8);
         if (bmp > 0x1000 && bmp < 0x4000000) blit3k(drawbmp3k, bmp - 0x1A0, 0xFFFF, true);
         if (h.calls < 10) lg("PIX_DrawBitmap f=%lu bmp %06X [%s] -> %u blits", frame, bmp, rd_hex(bmp, 0x31).c_str(), (unsigned)drawbmp3k.blits.size());
@@ -3062,7 +8101,13 @@ static void hle_log(VHook &h) {
     else lg("%s eax=%X edx=%X ebx=%X ecx=%X", n.c_str(), reg_eax, reg_edx, reg_ebx, reg_ecx);
 }
 
+
+static Bitu vpix_hle_cb_in(void);
 static Bitu vpix_hle_cb(void) {
+    auto t0 = std::chrono::steady_clock::now(); Bitu r = vpix_hle_cb_in();
+    hook_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() - cap_ms; cap_ms = 0; return r;
+}
+static Bitu vpix_hle_cb_in(void) {
     uint32_t at = (uint32_t)(SegPhys(cs) + reg_eip - 4);
     /* VPIX_ARM_POLL can arm before DOS/4GW has applied the fixups: the data reference then still holds the object-relative
        offset. Re-read it on calls until the game's first frame (the relocated value is final by then). */
@@ -3075,6 +8120,49 @@ static Bitu vpix_hle_cb(void) {
     auto it = hook_at.find(at);
     if (it == hook_at.end()) { lg("HLE: stray callback at %08X", at); return CBRET_NONE; }
     VHook &h = hooks[it->second];
+    /* VPIX_FPS: the frame call waits INSIDE the game, not by sleeping the emulator: the call re-runs and gives up the rest of the CPU
+       slice until due, so DOSBox's timers and sound mixer keep running. A host sleep here (10 ms a frame) stalled them: cycles=max sank
+       (choppy, Bobby 11-01) and with fixed cycles the sound dropped every 2-4 s */
+    if (fps_limit > 0 && (h.name == "PIX_RenderSwap" || h.name == "PIX_Render") && std::chrono::steady_clock::now() < cap_due) {
+        reg_eip = at - SegPhys(cs); CPU_Cycles = 0; return CBRET_NONE;
+    }
+    if (h.name == "GHOST_Fire") {   /* VPIX_DUAL_GUN, Ghost Train: the right gun shoots along the right controller (ghost_fire_enter) */
+        if (gf_ret) {               /* the fire call returned here: put the rider's camera back, go back to its caller */
+            for (int i = 0; i < 0x3C; i++) mem_writeb(gf_gb + 4 + i, gf_save[i]);
+            {   /* its hit result (the ray test's: [0xD95B8 + game*2] type 1 = enemy id [0xD95C0 + game*4] centre +0x45, 3 = rival cart
+                   +0x98): the point on the ray at the target, for the VR 3D crosshair (Bobby 10-27: "like Zone Hunter has") */
+                const int ty = (int16_t)mem_readw(0xD95B8 + data_delta + gf_game * 2); const uint32_t id = mem_readd(0xD95C0 + data_delta + gf_game * 4);
+                float P[3]; bool got = false;
+                if (ty == 1) for (uint32_t b = mem_readd(0xD6E40 + data_delta + gf_game * 4), n = 0; b && n < 200; b = mem_readd(b + 0xEF4), n++)
+                    if (mem_readd(b) == id) { for (int i = 0; i < 3; i++) P[i] = rd_f(b + 0x45 + 4 * i); got = true; break; }
+                if (ty == 3) { const uint32_t rc = mem_readd(0xEDB7C + data_delta + gf_game * 8 + (id & 1) * 4); if (rc) { for (int i = 0; i < 3; i++) P[i] = rd_f(rc + 0x98 + 4 * i); got = true; } }
+                if (got) { float t = 0; for (int i = 0; i < 3; i++) t += (P[i] - gf_o[i]) * gf_d[i];
+                    if (t > 0.f) { for (int i = 0; i < 3; i++) gf_aim_pt[i] = gf_o[i] + gf_d[i] * t; gf_aim_ms = hap_ms_now(); } }
+                /* a hit on an enemy (the ghosts take a few shots): a light high "tink" each hit (Bobby 10-28: "bitmap targets should make
+                   a slight tinging noise when hit since they take a few shots") = the point ding, quiet, an octave up; at most 8 a second */
+                static unsigned long long tink_ms = 0;
+                if (ty == 1 && hap_ms_now() - tink_ms > 120) { tink_ms = hap_ms_now(); play_game_sound(4, 55, 12); }
+            }
+            reg_eip = gf_ret; gf_ret = 0;
+            return CBRET_NONE;
+        }
+        ghost_fire_enter(at);       /* then the prologue replays below (L hook) */
+    }
+    if (h.name == "GHOST_Place") {  /* VPIX_JUMP: the shared cart placement 0x231F0 (eax = cart) lifts only the rider's own cart */
+        bool mine = false;
+        for (int g = 0; g < 2; g++) for (int k = 0; k < 2; k++)
+            if (mem_readd(0xEDB7C + data_delta + g * 8 + k * 4) == reg_eax && mem_readb(0xEDB9C + data_delta + g * 16 + k * 2) == 1) mine = true;
+        double v = 200.0 + (mine ? jump_h_now : 0.0), cur; uint64_t u = (uint64_t)mem_readd(0xC0C57 + data_delta) | (uint64_t)mem_readd(0xC0C57 + data_delta + 4) << 32;
+        memcpy(&cur, &u, 8);
+        if (cur >= 199.0 && cur <= 20000.0) {   /* still the 200.0 (+ a hop) it should be: v01.00.09 data */
+            memcpy(&u, &v, 8);
+            mem_writed(0xC0C57 + data_delta, (uint32_t)u); mem_writed(0xC0C57 + data_delta + 4, (uint32_t)(u >> 32));
+        }
+    }
+    if (!h.name.compare(0, 4, "pac_") && pac_hook(h.name)) {   /* Pac-Man VR levels: the hook does the function's work */
+        h.calls++; const uint32_t ra = mem_readd(SegPhys(ss) + reg_esp); reg_esp += 4; reg_eip = ra - SegPhys(cs);
+        return CBRET_NONE;
+    }
     if (ref_mode && at == ref_trap && !ref_loads.empty()) {
         /* a native PIX_Load* returned here: load the same file for our renderer under the card's handle, then go back to the caller */
         RefLoad rl = ref_loads.back(); ref_loads.pop_back();
@@ -3224,6 +8312,17 @@ static void eip_sample(Bitu) {
         if (v >= 0x10000 && v < 0x100000) { snprintf(b, sizeof(b), " %06X", v); st += b; }
     }
     lg("EIP %08X static %08X frame %lu cs %04X:%08X pm %d v86 %d ss:esp %04X:%08X stack%s", at, at - (uint32_t)code_delta, frame, SegValue(cs), (unsigned)reg_eip, (int)cpu.pmode, (int)((reg_flags & FLAG_VM) != 0), SegValue(ss), (unsigned)reg_esp, st.c_str());
+    /* VPIX_EIP_MS=n + VPIX_EIP_FROM=<frame> (dev): from that frame on, sample every n ms with the registers, each line flushed, so the
+       last lines before a DOSBox 'No byte handler' crash box show where the game was (Olin Shotgun's attract crash, 10-27) */
+    static const double fast_ms = getenv("VPIX_EIP_MS") ? atof(getenv("VPIX_EIP_MS")) : 0.0;
+    static const unsigned long fast_from = getenv("VPIX_EIP_FROM") ? strtoul(getenv("VPIX_EIP_FROM"), NULL, 10) : 0;
+    const bool fast = fast_ms > 0.0 && frame >= fast_from;
+    if (fast) {
+        lg("EIPREG eax=%08X ebx=%08X ecx=%08X edx=%08X esi=%08X edi=%08X ebp=%08X", reg_eax, reg_ebx, reg_ecx, reg_edx, reg_esi, reg_edi, reg_ebp);
+        if (flog) fflush(flog);
+        PIC_AddEvent(eip_sample, fast_ms);
+        return;
+    }
     static int n = 0;
     if (++n % 5 == 0) {                                  /* every 5 s: the 80x25 text screen */
         for (int y = 0; y < 25; y++) {
@@ -3296,6 +8395,22 @@ void VPIX_HLE_Arm(void) {
     {   /* hooks/<GAME>.game: hand-written hooks on the game's own code (regen_hooks.sh never touches it) */
         std::string gp(hp); size_t dot = gp.rfind(".hooks");
         if (dot != std::string::npos) { gp = gp.substr(0, dot) + ".game"; FILE *t = fopen(gp.c_str(), "r"); if (t) { fclose(t); load_hooks(gp.c_str()); } }
+    }
+    {   /* Phantom Freight (dev): Ghost Train v01.00.09 code hooks, only when their feature is on (the prologue check skips other builds).
+           GHOST_Fire 0x29AD0 = the fire routine (VPIX_DUAL_GUN: the right gun aims with the controller), GHOST_Place 0x231F0 = the cart
+           placement both movers share (VPIX_JUMP: only the rider's own cart hops) */
+        std::string hn(hp); std::transform(hn.begin(), hn.end(), hn.begin(), ::toupper);
+        const bool ghost = hn.size() >= 11 && hn.compare(hn.size() - 11, 11, "GHOST.HOOKS") == 0;
+        const char *je = getenv("VPIX_JUMP");
+        const struct { const char *name; uint32_t st; const char *pro; bool on; } gh[2] = {
+            {"GHOST_Fire", 0x29AD0, "535156575589e581ec3c0000008945f8", dual_on()},
+            {"GHOST_Place", 0x231F0, "535156575589e581ec4c0000008945f8", je && atof(je) > 0}};
+        for (const auto &x : gh) {
+            if (!ghost || !x.on) continue;
+            VHook h; h.name = x.name; h.mode = 'L'; h.st = x.st; parse_hex(x.pro, h.pro, 16);
+            h.retpop = 0; h.calls = 0; h.retval = 0; h.imm = 0;
+            hooks.push_back(h); lg("HLE: %s hook added (%06X)", x.name, x.st);
+        }
     }
     lg("HLE: arming. paging=%d cr0=%08X cs.base=%08X", paging.enabled ? 1 : 0, (unsigned)cpu.cr0, (unsigned)SegPhys(cs));
 

@@ -8,7 +8,9 @@
    at VPIX_VOICE_GAIN (default 1.0).
    Per-friend volume (Button Masher Menu > VOICE CHAT, Bobby 10-26: "so people can turn their friends down if too loud or up if not
    loud enough"): VPIX_VOICE_VOL_FILE = a small text file the launcher rewrites when a volume changes, lines "<pod> <percent>" and
-   "all <percent>" (0-200; a missing line = 100). Read again once a second. Only changes what this player hears. */
+   "all <percent>" (0-200; a missing line = 100). Read again once a second. Only changes what this player hears.
+   "ptt 1" in the same file = push to talk (hold the mic button to talk), "ptt 0" = mic live, the button mutes (the menu's PUSH TO
+   TALK line). Mute itself is shared with the in-game menu (VPIX_Voice_Muted: MIC LIVE / MUTED on the VOICE CHAT page). */
 
 #include <deque>
 static MixerChannel *voice_chan = NULL;
@@ -18,6 +20,7 @@ static std::map<int, bool> voice_playing;
 static unsigned long voice_tx = 0, voice_rx_n = 0;
 static std::map<int, float> voice_vol;                   /* talker -> volume (1 = 100%) */
 static float voice_vol_all = 1.f;
+static int voice_ptt_file = -1;                          /* -1 = the file says nothing: VPIX_VOICE_MODE decides */
 
 static void voice_vol_poll() {
     static const char *path = getenv("VPIX_VOICE_VOL_FILE");
@@ -28,14 +31,16 @@ static void voice_vol_poll() {
     char txt[512]; size_t n = fread(txt, 1, sizeof(txt) - 1, f); fclose(f); txt[n] = 0;
     if (was == txt) return;
     was = txt;
-    std::map<int, float> m; float all = 1.f;
+    std::map<int, float> m; float all = 1.f; int ptt = -1;
     for (char *l = strtok(txt, "\r\n"); l; l = strtok(NULL, "\r\n")) {
         char k[16]; int pct;
         if (sscanf(l, "%15s %d", k, &pct) != 2) continue;
         float v = (float)(std::max)(0, (std::min)(200, pct)) / 100.f;
-        if (!strcmp(k, "all")) all = v; else if (atoi(k) > 0) m[atoi(k)] = v;
+        if (!strcmp(k, "ptt")) ptt = pct ? 1 : 0;
+        else if (!strcmp(k, "all")) all = v; else if (atoi(k) > 0) m[atoi(k)] = v;
     }
     {   std::lock_guard<std::mutex> lk(voice_mtx); voice_vol.swap(m); voice_vol_all = all; }
+    voice_ptt_file = ptt;
     lg("VOICE volume: all %d%%, %u talker(s) set", (int)(all * 100.f + 0.5f), (unsigned)voice_vol.size());
 }
 
@@ -91,10 +96,14 @@ static void voice_tick() {
     voice_vol_poll();
     /* mute: Index left stick click / window M, every game; short buzz = muted, long buzz = live again */
     /* VPIX_VOICE_MODE (launcher VOICE setting): open = mic always live, the button toggles mute; ptt = push to talk, hold the button */
-    static const bool ptt = getenv("VPIX_VOICE_MODE") && !strcmp(getenv("VPIX_VOICE_MODE"), "ptt");
-    static bool muted = false, was = false;
-    if (ptt) muted = !cur_in.voice_mute;
-    else if (cur_in.voice_mute && !was) { muted = !muted; VPIX_Haptic(1, muted ? 0.05f : 0.3f, 1.f); lg("VOICE %s", muted ? "MUTED" : "live"); }
+    static const bool ptt_env = getenv("VPIX_VOICE_MODE") && !strcmp(getenv("VPIX_VOICE_MODE"), "ptt");
+    const bool ptt = voice_ptt_file >= 0 ? voice_ptt_file == 1 : ptt_env;
+    static bool was = false, was_ptt = false;
+    if (was_ptt && !ptt) VPIX_Voice_SetMuted(0);             /* push to talk switched off: the mic is live again */
+    was_ptt = ptt;
+    if (ptt) VPIX_Voice_SetMuted(!cur_in.voice_mute);
+    else if (cur_in.voice_mute && !was) { VPIX_Voice_SetMuted(!VPIX_Voice_Muted()); VPIX_Haptic(1, VPIX_Voice_Muted() ? 0.05f : 0.3f, 1.f); lg("VOICE %s", VPIX_Voice_Muted() ? "MUTED" : "live"); }
+    const bool muted = VPIX_Voice_Muted() != 0;
     if (ptt && cur_in.voice_mute && !was) VPIX_Haptic(1, 0.03f, 0.6f);   /* a tick when you start talking */
     was = cur_in.voice_mute;
     uint8_t u[320];

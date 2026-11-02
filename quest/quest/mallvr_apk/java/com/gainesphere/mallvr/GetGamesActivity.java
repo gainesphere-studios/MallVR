@@ -16,6 +16,7 @@ public class GetGamesActivity extends Activity {
 
     @Override protected void onCreate(Bundle b) {
         super.onCreate(b);
+        if (MallVR.store(this)) { finish(); return; }     // never in the store build
         LinearLayout root = LauncherActivity.col(this); root.setBackgroundColor(LauncherActivity.BG); root.setPadding(dp(24), dp(16), dp(24), dp(16));
         TextView t = LauncherActivity.text(this, "GET GAMES", 28, LauncherActivity.GOLD); t.setTypeface(Typeface.DEFAULT_BOLD); root.addView(t);
         root.addView(LauncherActivity.text(this, "MallVR ships no game files. These are the community's archive.org copies (the same ones the PC download page "

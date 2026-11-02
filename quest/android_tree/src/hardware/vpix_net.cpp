@@ -578,6 +578,10 @@ static void mic_loop() {
 }
 #endif
 
+static std::atomic<int> mic_muted(0);
+void VPIX_Voice_SetMuted(int m) { mic_muted = m ? 1 : 0; }
+int VPIX_Voice_Muted(void) { return mic_muted; }
+
 void VPIX_Voice_Start(void) {
     static bool started = false;
     if (started) return; started = true;

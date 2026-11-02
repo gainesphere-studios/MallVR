@@ -1,20 +1,36 @@
 #!/bin/bash
 # MallVR for Meta Quest: the release APK (launcher + engine), its GPL source zip and the install guide.
-#   bash quest/build_mallvr_apk.sh [--engine]     --engine: sync + ndk-build libmain.so first (= build_mallvr_android.sh)
-# Out: H:\Android\release\<ver>\  MallVR-Quest-<ver>.apk, MallVR-Quest-<ver>-source.zip, QUEST_INSTALL.txt
+#   bash quest/build_mallvr_apk.sh [--engine] [--store]     --engine: sync + ndk-build libmain.so first (= build_mallvr_android.sh)
+# Two builds from one source:
+#   sideload (default)  MallVR-Quest-<ver>.apk        GET GAMES (archive.org) on. Signed with H:\Android\keys\debug.keystore, the
+#                       0.1/0.2 sideload key, so it installs over them.
+#   --store             MallVR-Quest-<ver>-store.apk  Meta Horizon Store channels: no GET GAMES (players bring their own files;
+#                       10-28 decision, a store/paid app must not fetch the games). Signed with H:\Android\keys\mallvr_release.keystore
+#                       (+ .pass) = THE store key for every later store update (backup: Projects/Virtuality VR/Android Keys Backup
+#                       QuestMallVR/keys/, git-ignored). The two keys differ, so a player switching between them uninstalls once.
+# Out: H:\Android\release\<ver>\  the APK, MallVR-Quest-<ver>-source.zip, QUEST_INSTALL.txt
 # Work dir H:\Android\build\mallvr_apk (no apostrophe for the tools). Same no-Gradle steps as build_dosbox.sh: javac + d8 + aapt +
-# zipalign + apksigner. Signed with H:\Android\keys\debug.keystore = THE MallVR Quest key: keep it (backed up), or players have to
-# uninstall before an update installs.
+# zipalign + apksigner.
 set -e
-VER=0.2; CODE=2; VNAME=$VER-quest   # 0.2 = online + crossplay with PC (10-26)
+VER=0.4.0; CODE=7; VNAME=$VER-quest   # 0.2 = online + crossplay with PC (10-26); 0.3 = Meta Alpha (release key, targetSdk 34); 0.3.1 = store build without GET GAMES; 0.3.2 = VR-failed message (old headset OS) + engine from current master; 0.3.3 = the Cyberspace Hall launcher + menu music
+STORE=false; SUF=""
+for a in "$@"; do case "$a" in --store) STORE=true; SUF=-store;; --engine) ;; *) echo "unknown option $a"; exit 1;; esac; done
 A=/h/Android; Q="$(cd "$(dirname "$0")" && pwd)"; P="$(dirname "$Q")"
 LIBS=$A/build/mallvr/q/mallvr_android/libs/arm64-v8a
 out=$A/build/mallvr_apk; rel=$A/release/$VER; M=$A/dl/maven
 CC=$M/commons-compress-1.25.0.jar; XZ=$M/xz-1.9.jar
 export JAVA_HOME='H:\Android\jdk17'; J=$A/jdk17/bin; BT=$A/sdk/build-tools/34.0.0; JAR='H:\Android\sdk\platforms\android-32\android.jar'
+[ -f $A/sdk/platforms/android-34/android.jar ] && JAR='H:\Android\sdk\platforms\android-34\android.jar'   # targetSdk 34 either way
+if [ $STORE = true ]; then
+    [ -f $A/keys/mallvr_release.keystore ] && [ -f $A/keys/mallvr_release.pass ] || { echo "no release key in $A/keys (restore it from the backup folder)"; exit 1; }
+    SIGN=(--ks 'H:\Android\keys\mallvr_release.keystore' --ks-key-alias mallvr --ks-pass file:H:/Android/keys/mallvr_release.pass)
+else
+    [ -f $A/keys/debug.keystore ] || { echo "no $A/keys/debug.keystore (restore it from the backup folder)"; exit 1; }
+    SIGN=(--ks 'H:\Android\keys\debug.keystore' --ks-pass pass:android)
+fi
 w() { cygpath -w "$1"; }
 
-[ "$1" = "--engine" ] && bash "$Q/build_mallvr_android.sh"
+case " $* " in *" --engine "*) bash "$Q/build_mallvr_android.sh";; esac
 [ -f $LIBS/libmain.so ] || { echo "no libmain.so: run with --engine"; exit 1; }
 if grep -qaE "VPIX_TESTPOSE|VPIX_TESTAIM" $LIBS/libmain.so; then echo "libmain.so contains the test player: never ship it"; exit 1; fi
 for f in "$CC" "$XZ"; do [ -f "$f" ] || { echo "missing $f (Maven Central, see QUEST_HANDOFF.md)"; exit 1; }; done
@@ -35,11 +51,26 @@ cp $A/src/gl4es/LICENSE "$L/gl4es_MIT.txt"
 cp $A/openxr_loader/META-INF/LICENSE "$L/OpenXR_loader_Apache-2.0.txt"
 (cd "$out" && "$J/jar.exe" xf "$(w "$CC")" META-INF/LICENSE.txt META-INF/NOTICE.txt && cat META-INF/NOTICE.txt META-INF/LICENSE.txt > "$L/Apache_Commons_Compress_Apache-2.0.txt" && rm -rf META-INF)
 cp "$Q/mallvr_apk/licenses/"*.txt "$L/"
+# the Cyberspace Hall (HallData.java): package/engine/hall's exhibit text, news, mark, pillbug and pod turnarounds; the menu songs
+# (hall/music/*.wav, ~108 MB) as mono OGG (~20 MB), converted once into $A/build/hall_music and again only when a WAV changes
+HD="$P/package/engine/hall"; HM=$A/build/hall_music; mkdir -p "$out/assets/hall/music" "$HM"
+cp "$HD/hall_info.txt" "$HD/news.txt" "$HD/logo.png" "$HD/pillbug.png" "$HD"/pod_*.jpg "$out/assets/hall/"
+mkdir -p "$out/assets/hall/voice"; cp "$HD"/voice/*.ogg "$out/assets/hall/voice/"     # the computer voice (quest/tools/make_hall_voice.py; not _candidates)
+for f in "$HD"/music/*.wav; do
+    o="$HM/$(basename "$f" .wav).ogg"
+    [ -f "$o" ] && [ "$o" -nt "$f" ] || /c/ffmpeg/bin/ffmpeg -v error -y -i "$(w "$f")" -ac 1 -c:a libvorbis -q:a 3 "$(w "$o")"
+    cp "$o" "$out/assets/hall/music/"
+done
 
-mkdir -p "$out/javasrc"; cp "$Q"/mallvr_apk/java/com/gainesphere/mallvr/*.java "$out/javasrc/"    # (javac args: no apostrophe paths)
+mkdir -p "$out/javasrc" "$out/sdlsrc"; cp "$Q"/mallvr_apk/java/com/gainesphere/mallvr/*.java "$out/javasrc/"    # (javac args: no apostrophe paths)
+# SDL2's Java, with one fix for targetSdk 34: Android 14 throws on registerReceiver() for a non-system action (SDL's USB permission
+# reply) unless it says RECEIVER_EXPORTED (= 2) or NOT_EXPORTED
+cp $A/src/SDL2/android-project/app/src/main/java/org/libsdl/app/*.java "$out/sdlsrc/"
+sed -i 's|^\(\s*\)mContext.registerReceiver(mUsbBroadcast, filter);|\1if (android.os.Build.VERSION.SDK_INT >= 33) mContext.registerReceiver(mUsbBroadcast, filter, 2); else mContext.registerReceiver(mUsbBroadcast, filter);|' "$out/sdlsrc/HIDDeviceManager.java"
+grep -q "registerReceiver(mUsbBroadcast, filter, 2)" "$out/sdlsrc/HIDDeviceManager.java" || { echo "SDL USB receiver patch didn't apply"; exit 1; }
 # --- Java: SDL2's activity + ours, Commons Compress + XZ (to unpack the archive.org .7z / .zip files) -> classes.dex
 "$J/javac.exe" -nowarn -encoding UTF-8 -source 8 -target 8 -Xlint:-options -cp "$JAR;$(w "$CC");$(w "$XZ")" -d "$(w "$out/classes")" \
-    $(cygpath -w $A/src/SDL2/android-project/app/src/main/java/org/libsdl/app/*.java) $(cygpath -w "$out"/javasrc/*.java) 2>&1 | grep -v "^Note:" || true
+    $(cygpath -w "$out"/sdlsrc/*.java) $(cygpath -w "$out"/javasrc/*.java) 2>&1 | grep -v "^Note:" || true
 (cd "$out" && "$J/jar.exe" cfM ours.jar -C classes .)
 mkdir -p "$out/libjars"
 for j in "$CC" "$XZ"; do      # without META-INF (module-info.class of the multi-release jars upsets d8)
@@ -51,15 +82,15 @@ done
 [ -f "$out/dex/classes.dex" ] || { echo "d8 made no classes.dex"; exit 1; }
 
 # --- APK
-sed "s/@VERSION@/$VNAME/; s/@CODE@/$CODE/" "$Q/mallvr_apk/AndroidManifest.xml" > "$out/AndroidManifest.xml"
+sed "s/@VERSION@/$VNAME/; s/@CODE@/$CODE/; s/@STORE@/$STORE/" "$Q/mallvr_apk/AndroidManifest.xml" > "$out/AndroidManifest.xml"
 cp -r "$Q/mallvr_apk/res" "$out/res"
 cd "$out"
 "$BT/aapt.exe" package -f -M AndroidManifest.xml -S res -A assets -I "$JAR" -F unsigned.apk
 cp dex/classes*.dex apk/; cp $LIBS/libmain.so $LIBS/libSDL2.so $LIBS/libopenxr_loader.so $LIBS/libc++_shared.so apk/lib/arm64-v8a/
 (cd apk && "$BT/aapt.exe" add ../unsigned.apk classes*.dex lib/arm64-v8a/*.so >/dev/null)
 "$BT/zipalign.exe" -p -f 4 unsigned.apk aligned.apk
-cmd //c "H:\\Android\\sdk\\build-tools\\34.0.0\\apksigner.bat" sign --v2-signing-enabled true --v3-signing-enabled true --v4-signing-enabled false --ks 'H:\Android\keys\debug.keystore' --ks-pass pass:android --out "$(w "$rel/MallVR-Quest-$VER.apk")" aligned.apk
-cmd //c "H:\\Android\\sdk\\build-tools\\34.0.0\\apksigner.bat" verify --verbose "$(w "$rel/MallVR-Quest-$VER.apk")" | head -6
+cmd //c "H:\\Android\\sdk\\build-tools\\34.0.0\\apksigner.bat" sign --v1-signing-enabled true --v2-signing-enabled true --v3-signing-enabled true --v4-signing-enabled false "${SIGN[@]}" --out "$(w "$rel/MallVR-Quest-$VER$SUF.apk")" aligned.apk
+cmd //c "H:\\Android\\sdk\\build-tools\\34.0.0\\apksigner.bat" verify --verbose --min-sdk-version 24 "$(w "$rel/MallVR-Quest-$VER$SUF.apk")" | head -4
 
 # --- GPL source zip: our files as built (the Android tree's patched copies too) + the stock versions to put them on
 S="$out/src/MallVR-Quest-$VER-source"; T=$A/src/mallvr-dbx
@@ -102,7 +133,9 @@ Stock parts (download these versions)
   gl4es        commit 2037865590d410bcd7b8d1f22b841472ed6d39ac (github.com/ptitSeb/gl4es)
   OpenXR loader  Khronos 1.1.65 for Android (Maven org.khronos.openxr:openxr_loader_for_android:1.1.65)
   Apache Commons Compress 1.25.0, XZ for Java 1.9 (Maven Central)
-  Android NDK r29, SDK platform 32, build-tools 34.0.0, JDK 17
+  Android NDK r29, SDK platform 32 or 34 (targetSdk 34), build-tools 34.0.0, JDK 17
+  SDL2's HIDDeviceManager.java gets one line changed for Android 14 (registerReceiver with RECEIVER_EXPORTED): see the sed in
+  quest/build_mallvr_apk.sh. Releases are signed with our own key (not in this zip).
 
 Build (Windows + Git Bash, no Gradle; paths in the scripts point at H:\Android)
   bash quest/sync_android_tree.sh        stock DOSBox-X + dosbox_src -> the Android tree

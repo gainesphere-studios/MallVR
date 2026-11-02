@@ -1,0 +1,4 @@
+# Shoot For Loot byte patches (static addresses in SFL.EXE).
+# Character select picks by gun azimuth MINUS head azimuth (0x4E67C..0x4E682, clamped +-45 deg, 22.5 deg per character). In a headset the
+# head follows the aim, so the difference stays near 0 and red Eddy was always picked (Bobby). Gun azimuth alone: fsub [eax+0x692A2] -> nops.
+poke 0004E682 d8a0a2920600 909090909090

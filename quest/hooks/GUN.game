@@ -1,0 +1,7 @@
+# Hand-written hooks for Olin Shotgun (static GUN.EXE addresses). regen_hooks.sh never touches this file.
+# Olin Shotgun crash fix (10-27): SET_delete (game over -> attract) deletes the level's models / textures / bitmaps. The native PIX
+# library looks each handle up in its own handleTable (handle x 12), which our HLE loads never fill -> it wrote through empty entries
+# ('No byte handler for write to fffffffb' at the trp1.flc attract movie). Our side keeps its handles: just answer 0 (ok).
+hook PIX_DeleteModel R 00058C20 535152565789c28d04850000000029d0 0 0
+hook PIX_DeleteTexture R 0005F3F0 535289c28d04850000000029d08d1c85 0 0
+hook PIX_DeleteBitmap R 0005B550 535289c28d04850000000029d08d1c85 0 0

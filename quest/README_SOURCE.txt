@@ -1,7 +1,7 @@
-MallVR for Meta Quest 0.2 - complete source (GNU GPL v2 or later, like DOSBox-X)
+MallVR for Meta Quest 0.4.0 - complete source (GNU GPL v2 or later, like DOSBox-X)
 =================================================================================
 MallVR is a modified DOSBox-X that plays the 1990s Virtuality SU2000 / SU3000 arcade VR games. This zip is the source of
-MallVR-Quest-0.2.apk: everything we wrote or changed, the build scripts, and the exact versions of the stock parts.
+MallVR-Quest-0.4.0.apk: everything we wrote or changed, the build scripts, and the exact versions of the stock parts.
 
 What's here
   dosbox_src/      MallVR's DOSBox-X additions (vpix*.cpp/.h = the Virtuality hardware: PIX graphics card HLE, VR renderer,
@@ -22,7 +22,9 @@ Stock parts (download these versions)
   gl4es        commit 2037865590d410bcd7b8d1f22b841472ed6d39ac (github.com/ptitSeb/gl4es)
   OpenXR loader  Khronos 1.1.65 for Android (Maven org.khronos.openxr:openxr_loader_for_android:1.1.65)
   Apache Commons Compress 1.25.0, XZ for Java 1.9 (Maven Central)
-  Android NDK r29, SDK platform 32, build-tools 34.0.0, JDK 17
+  Android NDK r29, SDK platform 32 or 34 (targetSdk 34), build-tools 34.0.0, JDK 17
+  SDL2's HIDDeviceManager.java gets one line changed for Android 14 (registerReceiver with RECEIVER_EXPORTED): see the sed in
+  quest/build_mallvr_apk.sh. Releases are signed with our own key (not in this zip).
 
 Build (Windows + Git Bash, no Gradle; paths in the scripts point at H:\Android)
   bash quest/sync_android_tree.sh        stock DOSBox-X + dosbox_src -> the Android tree

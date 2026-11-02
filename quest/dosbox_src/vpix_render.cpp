@@ -25,13 +25,18 @@
 
 #include "vpix_render.h"
 #include "vpix_splash.h"
+#include "vpix_net.h"       /* VPIX_Voice_Muted / SetMuted: the in-game menu's MIC line (vpix_menu.h) */
 
 #ifdef _WIN32
 #include <windows.h>
 #include <GL/gl.h>
 #include "openvr.h"
 #pragma comment(lib, "opengl32.lib")
+#ifdef _WIN64
 #pragma comment(lib, "H:/Games/Virtuality/_work/openvr/lib/win64/openvr_api.lib")
+#else   // 32-bit build for 32-bit Windows (build.ps1 -Win32; DevilMaster 10-22: Win10 32-bit PC)
+#pragma comment(lib, "H:/Games/Virtuality/_work/openvr/lib/win32/openvr_api.lib")
+#endif
 #endif
 
 #include <stdio.h>
@@ -41,6 +46,7 @@
 #include <string.h>
 #include <math.h>
 #include <mutex>
+#include <functional>
 #include <thread>
 #include <atomic>
 #include <map>
@@ -65,7 +71,7 @@ struct Poly {
     uint32_t tex;            /* SU3000: texture handle (textures map) drawn with uv[] instead of the SU2000 texture slots; 0 = none */
     float uv[16][2];
 };
-struct Mesh { std::vector<float> v; std::vector<Poly> p; int layers = 2;
+struct Mesh { std::vector<float> v; std::vector<Poly> p; int layers = 2; bool hires = false; bool stars = false; unsigned dl = 0;   /* hires: VPIX_Render_AddMeshHires, drawn from a GL list */
                std::vector<uint32_t> oct[8]; float bmin[3] = {0, 0, 0}, bmax[3] = {0, 0, 0}; };   /* + model-space bounds */   /* type 0x1000x: each octant's presorted list (indices into p, the card's painting order) */
 
 /* Per-game decal settings (games.ps1 DecalStack / DecalGap / DecalBias; defaults = the old behaviour):
@@ -246,6 +252,13 @@ static Mesh *parse_bin(const uint8_t *d, size_t len) {
         if (type == 0x2000D) { if (!m) return NULL; }
         else {
         uint32_t bt = type & 0xFFFF;                     /* 9 and 8: 5-word sub-header, 6 and 7: 4 words (no bbox); */
+        if (type == 0xA) {                               /* points, no polygons (MISS models\space\starf.bin, 2000 stars): the loader refused it, so no stars */
+            uint32_t ov = bsz >= 4 ? be32(blob) : 0, nv = ov >= 4 && ov <= bsz ? be32(blob + ov - 4) : 0;
+            if (!nv || ov + 12ull * nv > bsz) return NULL;
+            m = new Mesh(); m->stars = true;
+            for (uint32_t i = 0; i < nv * 3; i++) m->v.push_back(bef(blob + ov + 4 * i));
+            return m;
+        }
         if (bt < 6 || bt > 9) continue;                  /* we only use the first three offsets either way           */
         /* type 0x1000x: 8 sub-models, one per view octant, each holding only the polygons that face
            that way (the card's back-face removal), each with its own vertex list. We draw with the
@@ -360,6 +373,8 @@ static Tex *parse_tex(const uint8_t *d, size_t len) {
     if (len < 48 || memcmp(d, "TEX 01", 6) != 0) return NULL;   /* 0101 (BOX) and 0103 share the layout */
     uint32_t a = be32(d + 24), b = be32(d + 28);
     int w = a < 16 ? 1 << a : (int)a, h = b < 16 ? 1 << b : (int)b;
+    /* PEARL JAPAN PILLAR.TEX and FLOOR.TEX: 64 x 64 16-bit texels under a 32 x 32 header. Read as 32-bit they came out magenta (the only two files with this size) */
+    if (a < 16 && b < 16 && len - 48 == (size_t)w * h * 8) { w *= 2; h *= 2; }
     if (w <= 0 || h <= 0 || w > 1024 || h > 1024) return NULL;
     size_t n = (size_t)w * h, avail = len - 48;
     Tex *t = new Tex(); t->w = w; t->h = h; t->rgba.resize(n);
@@ -441,6 +456,26 @@ static unsigned bitmap_gl(Tex *t, int key) {
         uint32_t v = t->raw[i], bl = (v >> 8) & 15, g = (v >> 4) & 15, r = v & 15;
         px[i] = ((int)v == key || (t->clear0 && v == 0) ? 0u : 0xFF000000u) | (bl * 17u << 16) | (g * 17u << 8) | (r * 17u);
     }
+    /* VPIX_KEY_FRINGE=n (Olin Shotgun): texels next to a keyed one whose colour is within n steps (4-bit) of the key in every channel are
+       keyed too. Olin's stopwatch art is antialiased against its blue key: the near-blue edge texels drew a blue ring round the clock
+       (Bobby 10-27 'blue around clock') */
+    static const int fringe = getenv("VPIX_KEY_FRINGE") ? atoi(getenv("VPIX_KEY_FRINGE")) : 0;
+    if (fringe > 0 && key >= 0 && !t->raw.empty()) {
+        const int kb = (key >> 8) & 15, kg = (key >> 4) & 15, kr = key & 15;
+        std::vector<uint32_t> o = px;
+        for (int y = 0; y < t->h; y++) for (int x = 0; x < t->w; x++) {
+            size_t i = (size_t)y * t->w + x; if (!(px[i] >> 24)) continue;
+            uint32_t v = t->raw[i]; int b = (v >> 8) & 15, g = (v >> 4) & 15, r = v & 15;
+            if (abs(b - kb) > fringe || abs(g - kg) > fringe || abs(r - kr) > fringe) continue;
+            bool edge = false;
+            for (int dy = -1; dy <= 1 && !edge; dy++) for (int dx = -1; dx <= 1 && !edge; dx++) {
+                int xx = x + dx, yy = y + dy;
+                if (xx >= 0 && yy >= 0 && xx < t->w && yy < t->h && !(px[(size_t)yy * t->w + xx] >> 24)) edge = true;
+            }
+            if (edge) o[i] &= 0x00FFFFFFu;
+        }
+        px.swap(o);
+    }
     /* VPIX_BLIT_UPSCALE=n (games.ps1 BlitUpscale, 2-6): the screen bitmaps (FOCUS VISETTE picture, HUD text) are native
        352x288 art shown across the whole view; xBRZ (DOSBox-X's own pixel-art scaler, src/libs/xBRZ) scales them n times
        with smooth edges, keyed pixels as alpha, then drawn with linear filtering (Bobby 10-17 'can the text be sharper') */
@@ -464,6 +499,16 @@ static unsigned bitmap_gl(Tex *t, int key) {
 }
 
 std::mutex mtx;
+/* the game thread's model / texture / material changes wait here and the render thread applies them as it picks up a frame: under mtx
+   they waited out a whole eye draw each, and in the headset (two eyes + the top view) the game's frames came late in bursts
+   (Pac-Man VR's stargate swirl rebuilds its mesh ~12 times a second; Bobby 11-01 "still choppy") */
+static std::mutex rq_mtx; static std::vector<std::function<void()>> rq;
+static void rq_push(std::function<void()> f) { std::lock_guard<std::mutex> lk(rq_mtx); rq.push_back(std::move(f)); }
+static void rq_apply() {
+    std::vector<std::function<void()>> q; { std::lock_guard<std::mutex> lk(rq_mtx); q.swap(rq); }
+    if (q.empty()) return;
+    std::lock_guard<std::mutex> lk(mtx); for (auto &f : q) f();
+}
 std::map<uint32_t, std::shared_ptr<Mesh>> meshes;
 std::map<uint32_t, std::shared_ptr<Tex>> bitmaps;
 float screen_w = 352.f, screen_h = 288.f;          /* PIX 2D screen space */
@@ -482,7 +527,13 @@ static int mattex[32] = {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
 static float matalpha[32] = {1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1};
 /* PEARL: material colours for type 0x28 polygons (VPIX_Render_SetMaterialColour; mat28 on once any is set) */
 static uint32_t matcol[32]; static bool mat28 = false;
-VPIX_Frame pending; bool have_pending = false;
+/* VPIX_SNOW (games.ps1 Snow, the Dactyls; Bobby 11-01 "portal mirrors ... the tv snow effect"): PIX_DrawStatic names a texture (elect.tex, 128 x 128) and the card
+   keeps it full of moving noise, so what wears that texture shows TV snow: the portal surfaces, through their material. Reference mode, DAC 1.04: solid point-sampled texels of
+   16 greys, new every frame. The full-screen load picture (draw_static) keeps the file's own pixels. Other materials: unchanged. */
+static uint32_t snow_handle = 0;
+/* the frame hand-off has its own lock: under mtx (held by the draw thread for a whole frame) the game waited out every draw, so its
+   speed was the renderer's (Pac-Man VR steps per frame: 55 fps in a window, 260 on the cheap top view, other again in the headset) */
+VPIX_Frame pending; bool have_pending = false; std::mutex pend_mtx;
 std::atomic<bool> running(false);
 std::thread th;
 int win_w = 960, win_h = 720;
@@ -496,7 +547,132 @@ static void rl(const char *fmt, ...) {
     va_list ap; va_start(ap, fmt); vfprintf(rlog, fmt, ap); va_end(ap);
     fputc('\n', rlog); fflush(rlog);
 }
+/* VPIX_BAKE=<folder> (dev, Bobby 10-27: the shooting gallery's ducks, cans, bottles, rabbits, balloons and targets as floating
+   targets in Phantom Freight): the first time a model whose file matches VPIX_BAKE_NAMES (default "\tin\": Olin Shotgun's
+   MODELS\TINCAN\OBJECTS\TIN) is drawn, its polygons are written to <folder>\<NAME>.poly with the colour each one shows: the
+   texture texel at the polygon's centre through the game's texture projection (masked texels = see-through: dropped), palette
+   and flat colours as drawn. events\phantom_freight\gallery_bake.py turns them into flat-colour models (with a Halloween recolour).
+   Text lines: "P r g b nx ny nz  x y z  x y z ..." in model space. */
+static std::map<uint32_t, std::string> bake_names;   /* model handle -> file (VPIX_Render_ModelName) */
+/* the colour a bake polygon shows (RGB); false = a see-through texel (dropped) */
+static const bool snow_on = getenv("VPIX_SNOW") && atoi(getenv("VPIX_SNOW"));
+static Tex snow_tex;
+static bool snow_slot(int tn) { return snow_on && snow_handle && tn >= 0 && tn < 0x400 && texslot[tn].set && texslot[tn].handle == snow_handle; }
+static void snow_update(const VPIX_Frame &f) {   /* once per game frame, before the eyes draw */
+    static unsigned long last = ~0ul;
+    if (!snow_on) return;
+    if (f.static_tex) snow_handle = f.static_tex;
+    if (f.frame == last || !snow_handle) return;
+    last = f.frame;
+    if (!snow_tex.gl) {
+        snow_tex.w = snow_tex.h = 128; snow_tex.rgba.resize(128 * 128);
+        GLuint id; glGenTextures(1, &id); glBindTexture(GL_TEXTURE_2D, id);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 128, 128, 0, GL_RGBA, GL_UNSIGNED_BYTE, snow_tex.rgba.data());
+        snow_tex.gl = id;
+    }
+    for (auto &c : snow_tex.rgba) { const uint32_t g = (rand() & 15) * 17; c = 0xFF000000u | g << 16 | g << 8 | g; }
+    snow_tex.dirty = true;
+}
 
+static bool bake_rgb(const VPIX_Instance &inst, const Mesh &m, const Poly &p, uint32_t &rgb) {
+    {
+        const uint32_t top = p.flags >> 24; rgb = 0xB4B4B4;   /* RGB */
+        float c[3] = {0, 0, 0};
+        for (int k = 0; k < p.n; k++) for (int i = 0; i < 3; i++) c[i] += m.v[3 * p.idx[k] + i] / p.n;
+        if (top >= 0x60) {
+            uint32_t tn = top == 0x78 ? inst.palw[p.flags & 15] & 0x3FF : p.flags & 0x3FF;
+            if (top == 0x68 && mattex[p.flags & 31] >= 0) tn = (uint32_t)mattex[p.flags & 31];
+            const TexSlot *ts = texslot[tn].set ? &texslot[tn] : NULL; Tex *tx = NULL;
+            if (ts) { auto ti = textures.find(ts->handle); if (ti != textures.end()) tx = ti->second.get(); }
+            if (tx && tx->w > 0 && tx->h > 0 && !tx->rgba.empty()) {
+                int ua = 0, va = 2; if (ts->flags & 0x20000) { ua = 0; va = 1; } else if (ts->flags & 0x80000) { ua = 1; va = 2; }
+                const float u = (c[ua] - ts->o[ua]) * ts->su, v = (c[va] - ts->o[va]) * ts->sv;   /* texels */
+                int x = (int)floorf(u) % tx->w, y = (int)floorf(v) % tx->h; if (x < 0) x += tx->w; if (y < 0) y += tx->h;
+                const uint32_t t = tx->rgba[(size_t)y * tx->w + x];
+                const uint32_t cmp = tx->b16 ? 0xF0F0F0u : 0xFFFFFFu;
+                if ((ts->flags & 0x100000) && (t & cmp) == (ts->mask & 0xFFFFFF & cmp)) return false;   /* see-through texel */
+                if (tx->cut && !(t >> 24)) return false;
+                rgb = (t & 0xFF) << 16 | (t & 0xFF00) | ((t >> 16) & 0xFF);
+            } else rgb = 0xB08C5A;
+        } else if (top == 0x28 || top == 0x38 || top == 0x30) rgb = inst.pal[p.flags & 15] & 0xFFFFFF;
+        else if (top == 0x40 || top == 0x48) {
+            unsigned r = 0, g = 0, b = 0;
+            for (int k = 0; k < p.n; k++) { uint32_t vc = p.vcol[k]; uint32_t q = (vc >> 24 & 0x08) ? inst.pal[vc & 15] : (((vc & 0xFF) << 16) | (vc & 0xFF00) | ((vc >> 16) & 0xFF));
+                r += q >> 16 & 255; g += q >> 8 & 255; b += q & 255; }
+            rgb = (r / p.n) << 16 | (g / p.n) << 8 | (b / p.n);
+        } else { const uint32_t q = p.flags & 0xFFFFFF; rgb = ((q & 0xFF) << 16) | (q & 0xFF00) | ((q >> 16) & 0xFF); }
+    }
+    return true;
+}
+
+static void bake_model(const VPIX_Instance &inst, const Mesh &m) {
+    static const char *dir = getenv("VPIX_BAKE");
+    if (!dir || !*dir) return;
+    static std::set<uint32_t> done;
+    if (done.count(inst.handle)) return;
+    auto nm = bake_names.find(inst.handle); if (nm == bake_names.end()) return;
+    std::string lo = nm->second; std::transform(lo.begin(), lo.end(), lo.begin(), ::tolower);
+    static const char *want = getenv("VPIX_BAKE_NAMES");
+    std::string w = want && *want ? want : "\\tin\\"; std::transform(w.begin(), w.end(), w.begin(), ::tolower);
+    if (lo.find(w) == std::string::npos) return;
+    done.insert(inst.handle);
+    std::string base = nm->second.substr(nm->second.find_last_of("\\/") + 1); size_t dot = base.rfind('.'); if (dot != std::string::npos) base = base.substr(0, dot);
+    FILE *fo = fopen((std::string(dir) + "\\" + base + ".poly").c_str(), "w");
+    if (!fo) return;
+    int kept = 0, dropped = 0;
+    for (const Poly &p : m.p) {
+        if (p.n < 3 || p.tex) continue;
+        uint32_t rgb; if (!bake_rgb(inst, m, p, rgb)) { dropped++; continue; }
+        fprintf(fo, "P %u %u %u %.4f %.4f %.4f", rgb >> 16 & 255, rgb >> 8 & 255, rgb & 255, p.nx, p.ny, p.nz);
+        for (int k = 0; k < p.n; k++) fprintf(fo, "  %.2f %.2f %.2f", m.v[3 * p.idx[k]], m.v[3 * p.idx[k] + 1], m.v[3 * p.idx[k] + 2]);
+        fprintf(fo, "\n"); kept++;
+    }
+    fclose(fo);
+    rl("bake %s: %d polygons, %d see-through dropped", base.c_str(), kept, dropped);
+}
+/* VPIX_BAKE_POSE=<seconds> (dev, with VPIX_BAKE + VPIX_BAKE_NAMES; Bobby 10-30: "get the characters in there from the other games"):
+   the boxers, Zone Hunter's aliens, the SFL pilots are many parts each, placed by the game every frame. Every <seconds> all the
+   matching models of that frame are written posed, in world space, to <folder>\POSE_<n>.poly: an "I <handle> x y z <file>" line per
+   part, then its polygons ("P r g b nx ny nz  x y z ..."). events\phantom_freight\pose_bake.py picks one whole figure out of a pose
+   and makes the museum guest BIN. VPIX_BAKE_BURST=<n> (Bobby 10-30: "you can animate them"): each pose is a burst of n frames at
+   15 a second instead (POSE_<burst>_<frame>.poly), the figure's own moves from its game, looped in the museum. */
+static void bake_pose(const VPIX_Frame &f) {
+    static const char *dir = getenv("VPIX_BAKE"), *ev = getenv("VPIX_BAKE_POSE");
+    if (!dir || !*dir || !ev || atof(ev) <= 0) return;
+    static double last = -1e9, last_cap = -1e9; static int n = 0, k = 0;
+    static const int burst = getenv("VPIX_BAKE_BURST") ? (std::max)(1, atoi(getenv("VPIX_BAKE_BURST"))) : 1;
+    const double now = (double)GetTickCount64() / 1000.0;
+    if (k > 0 ? now - last_cap < 1.0 / 15.0 : now - last < atof(ev)) return;
+    static const char *want = getenv("VPIX_BAKE_NAMES");
+    std::string w = want && *want ? want : "\\tin\\"; std::transform(w.begin(), w.end(), w.begin(), ::tolower);
+    std::vector<size_t> hit;
+    for (size_t i = 0; i < f.inst.size(); i++) { auto nm = bake_names.find(f.inst[i].handle); if (nm == bake_names.end() || !meshes.count(f.inst[i].handle)) continue;
+        std::string lo = nm->second; std::transform(lo.begin(), lo.end(), lo.begin(), ::tolower); if (lo.find(w) != std::string::npos) hit.push_back(i); }
+    if (hit.size() < 3) { if (k > 0) { k = 0; n++; last = now; } return; }   /* a figure is several parts (lost mid-burst: that burst ends) */
+    char fn[64];
+    if (burst > 1) { snprintf(fn, sizeof(fn), "\\POSE_%03d_%02d.poly", n, k); last_cap = now; if (++k >= burst) { k = 0; n++; last = now; } }
+    else { snprintf(fn, sizeof(fn), "\\POSE_%03d.poly", n++); last = now; }
+    FILE *fo = fopen((std::string(dir) + fn).c_str(), "w"); if (!fo) return;
+    int kept = 0;
+    for (size_t i : hit) {
+        const VPIX_Instance &in = f.inst[i]; const Mesh &m = *meshes[in.handle];
+        fprintf(fo, "I %u %.2f %.2f %.2f %s\n", in.handle, in.T[0], in.T[1], in.T[2], bake_names[in.handle].c_str());
+        for (const Poly &p : m.p) {
+            if (p.n < 3 || p.tex) continue;
+            uint32_t rgb; if (!bake_rgb(in, m, p, rgb)) continue;
+            float nw[3]; for (int c = 0; c < 3; c++) nw[c] = in.R[0][c] * p.nx + in.R[1][c] * p.ny + in.R[2][c] * p.nz;   /* world = R^T (S v) + T */
+            fprintf(fo, "P %u %u %u %.4f %.4f %.4f", rgb >> 16 & 255, rgb >> 8 & 255, rgb & 255, nw[0], nw[1], nw[2]);
+            for (int k = 0; k < p.n; k++) { const float *v = &m.v[3 * p.idx[k]];
+                float o[3]; for (int c = 0; c < 3; c++) o[c] = in.R[0][c] * in.S[0] * v[0] + in.R[1][c] * in.S[1] * v[1] + in.R[2][c] * in.S[2] * v[2] + in.T[c];
+                fprintf(fo, "  %.2f %.2f %.2f", o[0], o[1], o[2]); }
+            fprintf(fo, "\n"); kept++;
+        }
+    }
+    fclose(fo);
+    rl("bake pose %s: %u parts, %d polygons", fn + 1, (unsigned)hit.size(), kept);
+}
 static void mat_mul3(const float a[3][3], const float b[3][3], float o[3][3]) {
     for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++) o[i][j] = a[i][0] * b[0][j] + a[i][1] * b[1][j] + a[i][2] * b[2][j];
 }
@@ -515,6 +691,13 @@ static float yaw_of(const float fw[3]) { return atan2f(-fw[0], fw[1]); }
 static void eye_camera(const VPIX_Frame &f, const VPIX_Pose &eye, const VPIX_Pose &head_now, float R[3][3], float T[3]) {
     memcpy(R, f.cam_R, sizeof(f.cam_R)); memcpy(T, f.cam_T, sizeof(f.cam_T));
     if (!eye.valid) return;
+    if (f.lock_view && head_now.valid) {   /* VPIX_ATTRACT_LOCK (Bobby 10-27: "no head tracking till the game starts"): the game camera as it is
+                                              (the HLE fed it a fixed head), each eye at its offset from the head along the camera's axes */
+        float d[3]; for (int i = 0; i < 3; i++) d[i] = eye.p[i] - head_now.p[i];
+        for (int j = 0; j < 3; j++) { const float c = d[0] * head_now.R[j][0] + d[1] * head_now.R[j][1] + d[2] * head_now.R[j][2];
+            for (int i = 0; i < 3; i++) T[i] += world_scale * c * f.cam_R[j][i]; }
+        eye_follows = true; return;
+    }
     /* VPIX_FULLPIC_LOCK (games.ps1 FullPicLock, Zone): a picture filling the whole screen (Zone's FOCUS VISETTE screen, 351 x 247)
        is shown straight in front, no free look (Bobby 10-24). Strip pictures (the intro's 351 x 135) keep free look. */
     static const bool fullpic_lock = getenv("VPIX_FULLPIC_LOCK") && atoi(getenv("VPIX_FULLPIC_LOCK"));
@@ -616,6 +799,12 @@ static void eye_camera(const VPIX_Frame &f, const VPIX_Pose &eye, const VPIX_Pos
         float ref_h = f.player_height > 500 ? f.player_height : auto_ref;
         /* not with VPIX_FOLLOW_PITCH: Missile Command's eye sits at the game camera (as in free look before); the first-frame
            height reference put Bobby under the gun barrel (10-17: 'we are still too low and under the gun barrel view') */
+        /* VPIX_EYE_NO_REF (run_game.sh: ghost): the game camera already sits at the fed head's height (Ghost Train has no
+           player_height either, so the reference was the first head height seen: seated at boot, ~1.1 m), and this added the
+           fed-minus-reference again on frames where the camera's tilt matched the head, but not on hills and drops where it
+           didn't: the view jumped ~0.5 m between "sitting" and "standing" (Bobby 10-28, rides 2 + 3) */
+        static const bool no_ref = getenv("VPIX_EYE_NO_REF") && atoi(getenv("VPIX_EYE_NO_REF"));
+        if (no_ref) ref_h = 0;
         if (ref_h > 500 && hf.p[2] > ref_h - 200 && follow_po == 0) d[2] = ez - ref_h;
         if (follow_po != 0) {
             static unsigned long nz = 0;
@@ -723,6 +912,38 @@ static bool zf_rev = false;                /* VPIX_ZFIGHT probe (dev): models + 
    the 2D layer is drawn fixed to the game camera, not to the eye - the attract high-score table's 3D faces stayed put while its
    2D scores moved with the head (Bobby 10-24). Picture screens too, unless their models are locked to the view (PictureLock 1). */
 static bool panel_world_on = false; static float panel_mv[16];
+/* VPIX_HUD_STEREO=<metres> (Bobby 10-27: "all text should be stereoscopic where it can be"): the 2D layer (tutorial text, score,
+   counter, menus) was drawn at the same place in front of each eye = no depth (it sits at infinity). In the headset it is now drawn
+   at that distance in front of the head, shifted for each eye by the eye's offset from the head centre: both eyes see it at a
+   real depth. 0 / unset = the old flat layer. */
+static float hud_off[3] = {0, 0, 0};       /* this eye's offset to the head centre, eye GL coords (set per eye) */
+static float hud_m_live = -1.f;            /* VPIX_SBS: F12 steps it */
+static float hud_stereo_m() { if (hud_m_live < 0.f) hud_m_live = getenv("VPIX_HUD_STEREO") ? (float)atof(getenv("VPIX_HUD_STEREO")) : 0.f; return hud_m_live; }
+/* VPIX_SBS=full|half (launcher MODE: 3D SBS / 3D HALF-SBS; DevilMaster 10-27, a head-mounted display fed a 1920 x 1080 side-by-side
+   picture): window only, no SteamVR. The left eye fills the left half, the right eye the right half, each at the game's own 4:3:
+   'full' = letterboxed in its 960 x 1080 half (960 x 720); 'half' = squeezed to half width (720 x 1080), for displays that stretch
+   each half back out to 1440 x 1080. Eyes VPIX_SBS_IPD mm apart (default 64). VPIX_SBS_MONITOR=N: borderless on the Nth display
+   (the log lists them), else on the main display. The window takes that display's size (1920 x 1080 on DevilMaster's HMD).
+   Keys in the SBS window (Bobby 10-27: 'give him all the options one would need'), saved in the settings file (sbs_*):
+   F1 readout on/off, F2/F3 eye distance, F4/F5 picture size, F6/F7 pictures closer/apart (lens centres), F8/F9 pictures down/up,
+   F10 swap eyes, F11 SBS <-> HALF-SBS, F12 2D text depth, Page Down next display, Page Up render detail (slow PCs), Home reset.
+   Start values: VPIX_SBS_IPD / _ZOOM / _SEP / _VY / _SWAP / _DETAIL; saved values win over them. */
+struct SbsAdj { float ipd = 64.f, zoom = 1.f, sep = 0.f, vy = 0.f, detail = 1.f; bool swap = false; };
+static SbsAdj sbs_env_adj() {
+    SbsAdj a; const char *e;
+    if ((e = getenv("VPIX_SBS_IPD")) && *e) a.ipd = (float)atof(e);
+    if ((e = getenv("VPIX_SBS_ZOOM")) && *e) a.zoom = (float)atof(e);
+    if ((e = getenv("VPIX_SBS_SEP")) && *e) a.sep = (float)atof(e);
+    if ((e = getenv("VPIX_SBS_VY")) && *e) a.vy = (float)atof(e);
+    if ((e = getenv("VPIX_SBS_DETAIL")) && *e) a.detail = (float)atof(e);
+    if ((e = getenv("VPIX_SBS_SWAP")) && *e) a.swap = atoi(e) != 0;
+    return a;
+}
+static int sbs_mode() {
+    static const int m = [] { const char *e = getenv("VPIX_SBS"); if (!e || !*e) return 0;
+                              if (!_stricmp(e, "half") || !strcmp(e, "2")) return 2; return (!_stricmp(e, "full") || !strcmp(e, "1")) ? 1 : 0; }();
+    return m;
+}
 static void panel_world_set(const VPIX_Frame &f, const float camR[3][3]) {
     static const bool on = getenv("VPIX_PANEL_WORLD") && atoi(getenv("VPIX_PANEL_WORLD"));
     panel_world_on = false;
@@ -737,13 +958,14 @@ static void panel_world_set(const VPIX_Frame &f, const float camR[3][3]) {
     panel_world_on = true;
 }
 static void draw_scene(const VPIX_Frame &f, const float proj[16], const float camR[3][3], const float camT[3], int vw, int vh) {
+    snow_update(f);
     glViewport(0, 0, vw, vh);
     panel_world_set(f, camR);
     {   /* VPIX_FULLPIC_LOCK: a full-screen picture is 351 x 247 on the 352 x 248 screen - a pixel of the game's blue showed along the
            bottom and right (Bobby 10-24): clear black on those screens */
         static const bool fpl = getenv("VPIX_FULLPIC_LOCK") && atoi(getenv("VPIX_FULLPIC_LOCK"));
         bool full = false; if (fpl) for (const VPIX_Blit &b : f.blits) if (b.backdrop && b.dh >= 0.85f * screen_h) { full = true; break; }
-        if (full) glClearColor(0, 0, 0, 1); else glClearColor(f.clear[0] / 255.f, f.clear[1] / 255.f, f.clear[2] / 255.f, 1);
+        if (full) glClearColor(0, 0, 0, 1); else glClearColor(f.clear[0] / 255.f, f.clear[1] / 255.f, f.clear[2] / 255.f, f.clear0 ? 0.f : 1.f);
     }
     glClearDepth(rev_z ? 0.0 : 1.0);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
@@ -818,7 +1040,7 @@ static void draw_scene(const VPIX_Frame &f, const float proj[16], const float ca
     /* VPIX_ON_TOP models (games.ps1 OnTop, Missile Command skip.bin): drawn after everything else with the depth test off. The card
        had no depth buffer and painted the 'skip intro' sign over the gun housing round the eye (guns1.bin, 58 units away); with a
        depth test the barrels hid it whenever you looked at it (Bobby 10-17). */
-    bool any_top = false; for (const auto &in : f.inst) if (in.on_top) { any_top = true; break; }
+    bool any_top = false, own_top = false; for (const auto &in : f.inst) if (in.on_top) { any_top = true; if (in.on_top == 2) own_top = true; }
     GLint depth_fn = GL_LEQUAL; if (any_top) glGetIntegerv(GL_DEPTH_FUNC, &depth_fn);
     /* VPIX_CARD_ORDER (games.ps1 CardOrder): paint like the PIX card, which had no depth buffer. Rule read off LeonG-ZA's card
        emulation (reference mode trace, Zone 10-25): models in ascending slot priority (+0x54), equal priorities far to near (the
@@ -851,16 +1073,22 @@ static void draw_scene(const VPIX_Frame &f, const float proj[16], const float ca
             rl("CARDORDER%s", sq.c_str());
         }
     }
+    bake_pose(f);                                         /* VPIX_BAKE_POSE (dev): every few seconds, the matching figure as posed */
     for (int pass = 0; pass < (any_trans && !card_order ? 2 : 1); pass++)      /* pass 1: translucent material polygons, blended, no depth write */
     for (size_t jj = 0; jj < f.inst.size() * (any_top ? 2 : 1); jj++) {
         const size_t ii = jj % f.inst.size(); const bool top_pass = jj >= f.inst.size();
-        if (any_top && ii == 0) glDepthFunc(top_pass ? GL_ALWAYS : depth_fn);
+        /* the on-top pass: kept to the nearest sliver of the depth range with the normal test, so on-top models (the guns, the sword,
+           the arms) are in front of everything yet still hide their own back faces (GL_ALWAYS drew a gun's far side over its near
+           side); the game's own on-top models (Missile Command's skip sign) keep GL_ALWAYS */
+        if (any_top && ii == 0) { glDepthFunc(top_pass && !own_top ? GL_ALWAYS : depth_fn);
+            if (top_pass && own_top) glDepthRange(rev_z ? 0.998 : 0.0, rev_z ? 1.0 : 0.002); else glDepthRange(0.0, 1.0); }
         const auto &inst = f.inst[card_order ? card_seq[ii] : zf_rev && !prio_layers ? f.inst.size() - 1 - ii : ii];
         if ((inst.on_top != 0) != top_pass) continue;
         if (split && (inst.prio > split_prio) != (phase == 1)) continue;
         auto it = meshes.find(inst.handle);
         if (it == meshes.end()) continue;
         const Mesh &m = *it->second;
+        bake_model(inst, m);                              /* VPIX_BAKE (dev): write this model's coloured polygons once */
         glDepthMask(inst.backdrop ? GL_FALSE : GL_TRUE);
         if (prio_layers) { if (!first_inst && inst.prio != last_prio) glClear(GL_DEPTH_BUFFER_BIT); first_inst = false; last_prio = inst.prio; }
         float RmT[3][3]; mat_tr3(inst.R, RmT);
@@ -878,6 +1106,91 @@ static void draw_scene(const VPIX_Frame &f, const float proj[16], const float ca
                        A[0][2] * inst.S[2], A[1][2] * inst.S[2], A[2][2] * inst.S[2], 0,
                        b[0], b[1], b[2], 1};
         glLoadMatrixf(M);
+        /* stars (type 0xA model): one point each, depth-tested, unlit. PIX_SetTwinkleFrame is only ever called at load, so the twinkle runs on the frame count */
+        if (m.stars) {
+            if (pass != 0) continue;
+            { static bool told = false; if (!told) { told = true; rl("stars drawn: h=%u %u points at (%.0f %.0f %.0f) f=%lu", inst.handle, (unsigned)(m.v.size() / 3), inst.T[0], inst.T[1], inst.T[2], f.frame); } }
+            glPushAttrib(GL_ENABLE_BIT | GL_POINT_BIT | GL_CURRENT_BIT);
+            glDisable(GL_TEXTURE_2D); glDisable(GL_FOG); glDisable(GL_LIGHTING); glDisable(GL_BLEND); glDisable(GL_CULL_FACE);
+            glPointSize(2.f);
+            glBegin(GL_POINTS);
+            for (size_t i = 0, n = m.v.size() / 3; i < n; i++) {
+                const uint32_t h = ((uint32_t)i * 2654435761u) ^ ((uint32_t)((f.frame + i * 13) / 12) * 40503u);
+                const float g = 0.55f + 0.45f * (float)((h >> 11) & 255) / 255.f;
+                glColor3f(g, g, g); glVertex3fv(&m.v[3 * i]);
+            }
+            glEnd();
+            glPopAttrib();
+            continue;
+        }
+        /* HIRES meshes (Phantom Freight museum, Bobby 10-28: "find a way to inject our hi res models ... mix our high res models with
+           these low poly games"): 20-50k textured triangles. The path below hand-feeds every polygon every frame (CPU light, one
+           glBegin each), fine for the card's few hundred, far too slow for these. Here the mesh is put in a GL display list once
+           (smooth vertex normals, uv), then drawn with this same model matrix + one texture: depth-tested with the game's world
+           and fogged like it, lit by GL with the fixed eye-space light (inst.lum = brightness: the museum's spotlight). */
+        if (m.hires) {
+            if (pass != 0) continue;
+            Mesh &mm = const_cast<Mesh &>(m);
+            Tex *tx = NULL; { auto ti = textures.find(m.p[0].tex); if (ti != textures.end()) tx = ti->second.get(); }
+            if (tx && !tx->gl) { GLuint id; glGenTextures(1, &id); glBindTexture(GL_TEXTURE_2D, id);
+                /* mipmaps built here level by level (2x2 averages; this GL is 1.1, GL_GENERATE_MIPMAP left the texture incomplete =
+                   black): without them a 2048 texture seen from metres away shimmered into specks ("a few floating dots", 10-29) */
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, 0x812F /* GL_CLAMP_TO_EDGE */); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, 0x812F);
+                std::vector<uint32_t> lv(tx->rgba); int lw = tx->w, lh = tx->h, level = 0;
+                for (;;) {
+                    glTexImage2D(GL_TEXTURE_2D, level, GL_RGBA, lw, lh, 0, GL_RGBA, GL_UNSIGNED_BYTE, lv.data());
+                    if (lw == 1 && lh == 1) break;
+                    const int nw = (std::max)(1, lw / 2), nh = (std::max)(1, lh / 2); std::vector<uint32_t> nx((size_t)nw * nh);
+                    for (int y = 0; y < nh; y++) for (int x = 0; x < nw; x++) { uint32_t sum[4] = {0, 0, 0, 0};
+                        for (int dy = 0; dy < 2; dy++) for (int dx = 0; dx < 2; dx++) { const uint32_t c = lv[(size_t)(std::min)(lh - 1, 2 * y + dy) * lw + (std::min)(lw - 1, 2 * x + dx)];
+                            for (int k = 0; k < 4; k++) sum[k] += c >> (8 * k) & 255; }
+                        nx[(size_t)y * nw + x] = (sum[0] / 4) | (sum[1] / 4) << 8 | (sum[2] / 4) << 16 | (sum[3] / 4) << 24; }
+                    lv.swap(nx); lw = nw; lh = nh; level++;
+                }
+                tx->gl = id;
+                const GLenum ge = glGetError(); rl("hires texture %08X %dx%d -> GL %u%s", m.p[0].tex, tx->w, tx->h, id, ge ? " ** GL error" : ""); }
+            if (!mm.dl) {
+                std::vector<float> vn(m.v.size(), 0.f);
+                for (const Poly &p : m.p) for (int k = 0; k < p.n; k++) { vn[3 * p.idx[k]] += p.nx; vn[3 * p.idx[k] + 1] += p.ny; vn[3 * p.idx[k] + 2] += p.nz; }
+                for (size_t i = 0; i + 2 < vn.size(); i += 3) { const float l = sqrtf(vn[i] * vn[i] + vn[i + 1] * vn[i + 1] + vn[i + 2] * vn[i + 2]); if (l > 1e-6f) { vn[i] /= l; vn[i + 1] /= l; vn[i + 2] /= l; } }
+                mm.dl = glGenLists(1); glNewList(mm.dl, GL_COMPILE); glBegin(GL_TRIANGLES);
+                for (const Poly &p : m.p) for (int k = 1; k + 1 < p.n; k++) { const int cs[3] = {0, k, k + 1};
+                    for (int c : cs) { const uint32_t q = p.idx[c]; glNormal3fv(&vn[3 * q]);
+                        if (p.tex) glTexCoord2f(p.uv[c][0], p.uv[c][1]);
+                        else glColor3ub((GLubyte)(p.vcol[c] >> 16), (GLubyte)(p.vcol[c] >> 8), (GLubyte)p.vcol[c]);   /* vertex colours 0xRRGGBB */
+                        glVertex3fv(&m.v[3 * q]); } }
+                glEnd(); glEndList();
+                rl("hires mesh %08X: %u polygons in a GL list", inst.handle, (unsigned)m.p.size());
+            }
+            const float lum = inst.bright ? 1.f : inst.lum;
+            const float Lp[4] = {L[0], L[1], L[2], 0.f}, amb[4] = {0.42f * lum, 0.42f * lum, 0.42f * lum, 1.f}, dif[4] = {0.68f * lum, 0.68f * lum, 0.68f * lum, 1.f};
+            glPushMatrix(); glLoadIdentity(); glLightfv(GL_LIGHT0, GL_POSITION, Lp); glPopMatrix();
+            glLightfv(GL_LIGHT0, GL_AMBIENT, amb); glLightfv(GL_LIGHT0, GL_DIFFUSE, dif);
+            const float g0[4] = {0, 0, 0, 1}; glLightModelfv(GL_LIGHT_MODEL_AMBIENT, g0); glLightModeli(GL_LIGHT_MODEL_TWO_SIDE, GL_TRUE);
+            glEnable(GL_LIGHTING); glEnable(GL_LIGHT0); glEnable(GL_NORMALIZE); glEnable(GL_COLOR_MATERIAL); glColorMaterial(GL_FRONT_AND_BACK, GL_AMBIENT_AND_DIFFUSE);
+            glColor4f(1, 1, 1, 1);
+            if (!m.p[0].tex) tx = NULL;   /* vertex-coloured: the list carries the colours */
+            /* statue (the ending's Lawn People, 10-29): no texture, one bold colour as the material; colour tracking off so a
+               vertex-coloured list's own glColor calls don't paint over it */
+            if (inst.statue) { tx = NULL; glDisable(GL_COLOR_MATERIAL);
+                const float sc[4] = {(inst.statue >> 16 & 255) / 255.f, (inst.statue >> 8 & 255) / 255.f, (inst.statue & 255) / 255.f, 1.f};
+                glMaterialfv(GL_FRONT_AND_BACK, GL_AMBIENT_AND_DIFFUSE, sc); }
+            if (tx) { glEnable(GL_TEXTURE_2D); glBindTexture(GL_TEXTURE_2D, tx->gl); glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE); }
+            /* gloss (Bobby 10-29 "add gloss in game": the TRELLIS pods looked flat next to the glossy plastic in the photos): a white
+               specular highlight added AFTER the texture (separate specular colour, GL 1.2's light-model switch, values written out as
+               the build has 1.1 headers), so dark navy plastic gets a bright sheen instead of being washed grey */
+            const bool shiny = inst.gloss > 0.f;
+            if (shiny) { const float sp[4] = {inst.gloss * lum, inst.gloss * lum, inst.gloss * lum, 1.f}, ms[4] = {1, 1, 1, 1};
+                glLightfv(GL_LIGHT0, GL_SPECULAR, sp); glMaterialfv(GL_FRONT_AND_BACK, GL_SPECULAR, ms); glMaterialf(GL_FRONT_AND_BACK, GL_SHININESS, 48.f);
+                glLightModeli(0x81F8 /* GL_LIGHT_MODEL_COLOR_CONTROL */, 0x81FA /* GL_SEPARATE_SPECULAR_COLOR */);
+                glLightModeli(GL_LIGHT_MODEL_LOCAL_VIEWER, GL_TRUE); }
+            glCallList(mm.dl);
+            if (shiny) { const float z4[4] = {0, 0, 0, 1}; glLightfv(GL_LIGHT0, GL_SPECULAR, z4); glMaterialfv(GL_FRONT_AND_BACK, GL_SPECULAR, z4);
+                glLightModeli(0x81F8, 0x81F9 /* GL_SINGLE_COLOR */); glLightModeli(GL_LIGHT_MODEL_LOCAL_VIEWER, GL_FALSE); }
+            glDisable(GL_TEXTURE_2D); glDisable(GL_LIGHTING); glDisable(GL_LIGHT0); glDisable(GL_NORMALIZE); glDisable(GL_COLOR_MATERIAL);
+            continue;
+        }
         const std::vector<uint32_t> *olist = NULL;      /* VPIX_CARD_ORDER: the octant list for this view */
         if (card_order) {
             /* the card picks the list by VIEW DIRECTION: the camera's forward axis in model space, negative x -> 1, y -> 2, z -> 4
@@ -917,6 +1230,8 @@ static void draw_scene(const VPIX_Frame &f, const float proj[16], const float ca
                 if (!card_order && p.layer != layer) continue;
                 if (inst.poly_select && p.sel && !(p.sel & inst.select)) continue;   /* VPIX_POLY_SELECT models: only the polygons the instance picks */
                 bool trans = ((p.flags >> 24) == 0x68 || (mat28 && (p.flags >> 24) == 0x28)) && matalpha[p.flags & 31] < 1.f;
+                const bool snow_poly = (p.flags >> 24) == 0x68 && snow_slot(mattex[p.flags & 31]);
+                if (snow_poly) trans = false;   /* the game's random opacity on this material: the card's snow is solid */
                 if (!card_order && trans != (pass == 1)) continue;
                 float ex = A[0][0] * p.nx + A[0][1] * p.ny + A[0][2] * p.nz;
                 float ey = A[1][0] * p.nx + A[1][1] * p.ny + A[1][2] * p.nz;
@@ -935,7 +1250,7 @@ static void draw_scene(const VPIX_Frame &f, const float proj[16], const float ca
                     }
                 }
                 float lam;
-                if (inst.headlock == 1 || p.tex) lam = 1.f;   /* sell messages: full colour */
+                if (inst.headlock == 1 || p.tex || inst.bright) lam = 1.f;   /* sell messages: full colour; lit from within */
                 else if (game_light && (p.flags >> 24) == 0x22) lam = 1.f;   /* type 0x22 = unlit on the card (Zone sight, building windows) */
                 else if (game_light && tex_unlit && (p.flags >> 24) >= 0x60) lam = 1.f;   /* textured: texel colour as-is (VPIX_TEX_UNLIT, Missile Command's golden ground) */
                 else if (game_light) {
@@ -982,18 +1297,31 @@ static void draw_scene(const VPIX_Frame &f, const float proj[16], const float ca
                     /* 0x78 = palette-textured: the low bits pick a model palette entry holding the texture
                        number, so one model can wear each instance's own face (Boxing) */
                     uint32_t tn = top == 0x78 ? inst.palw[p.flags & 15] & 0x3FF : p.flags & 0x3FF;
-                    if (top == 0x68 && mattex[p.flags & 31] >= 0) tn = (uint32_t)mattex[p.flags & 31];
+                    if (top == 0x68 && mattex[p.flags & 31] >= 0 && (!snow_on || snow_poly)) tn = (uint32_t)mattex[p.flags & 31];
                     if (inst.scared && top == 0x60) { if (tn == 0xB || tn == 0xC) tn = 0xD; else if (tn == 0xE) tn = 0xF; }   /* Pac-Man scared eyes / mouth */
                     if (texslot[tn].set) {
                         ts = &texslot[tn];
                         auto ti = textures.find(ts->handle);
                         if (ti != textures.end()) tx = ti->second.get();
+                        if (snow_poly) tx = &snow_tex;
                     }
                 }
                 if (mat28 && top == 0x28) rgb = matcol[p.flags & 31];       /* PEARL: material colour (RGB like the palette) */
-                else if (top == 0x28 || top == 0x38 || top == 0x30) rgb = inst.pal[p.flags & 15];
+                else if (top == 0x28 || top == 0x38 || top == 0x30) {
+                    rgb = inst.pal[p.flags & 15];
+                    static const bool pal6 = getenv("VPIX_PAL6") && atoi(getenv("VPIX_PAL6"));   /* Olin's shelf rails 0F0500 = brown (see the Gouraud case) */
+                    if (pal6 && rgb && !(rgb & 0xC0C0C0)) rgb = (rgb << 2) | ((rgb >> 4) & 0x030303);
+                }
                 else if (top >= 0x60) rgb = tx ? 0xFFFFFF : 0xB08C5A;     /* untextured fallback */
                 else rgb = p.flags & 0xFFFFFF;
+                if (inst.grime) {   /* VPIX_GRIME (Phantom Freight, Bobby 10-27: "dirty up the track wood and rail textures"): each polygon of the
+                                       track a little darker or lighter (fixed per polygon) and pulled toward dirty brown; textures darkened too */
+                    const uint32_t hh = (uint32_t)(((uintptr_t)&p) >> 3) * 2654435761u;
+                    const float dk = 0.55f + 0.45f * ((hh >> 8) & 255) / 255.f;
+                    lam *= dk;
+                    if (!tx) { const float mix = 0.30f; int r = (int)((rgb >> 16 & 255) * (1 - mix) + 95 * mix), g = (int)((rgb >> 8 & 255) * (1 - mix) + 70 * mix), bb = (int)((rgb & 255) * (1 - mix) + 45 * mix);
+                               rgb = (uint32_t)(r << 16 | g << 8 | bb); }
+                }
                 if (tx) {
                     if (!tx->gl) {
                         GLuint id; glGenTextures(1, &id); glBindTexture(GL_TEXTURE_2D, id);
@@ -1028,7 +1356,15 @@ static void draw_scene(const VPIX_Frame &f, const float proj[16], const float ca
                     bool palc = top == 0x28 || top == 0x38 || top == 0x30;
                     /* Gouraud vertex words 0x20BBGGRR = colour; 0x18 (palette bit 0x08) = model palette
                        index in the low bits (Boxing's gloves take each boxer's colour) */
-                    if ((top == 0x40 || top == 0x48) && (c >> 24 & 0x08)) { c = inst.pal[c & 15]; palc = true; }
+                    if ((top == 0x40 || top == 0x48) && (c >> 24 & 0x08)) {
+                        c = inst.pal[c & 15]; palc = true;
+                        /* VPIX_PAL6 (Olin Shotgun): palette colours that fit in 6 bits are VGA-style 0..63. The big-top tent (BIGTOP1, Gouraud
+                           corners 0x18000000-3) is set to 2D2D2D / 2D0000 fading to 020202 / 020000: read as 8 bits the tent and shelves
+                           went near black and the targets' black boards vanished into it; x4 = the bright red + white stripes of the
+                           1990s footage (quickshot_isdn) and Bobby's early MallVR captures */
+                        static const bool pal6 = getenv("VPIX_PAL6") && atoi(getenv("VPIX_PAL6"));
+                        if (pal6 && c && !(c & 0xC0C0C0)) c = (c << 2) | ((c >> 4) & 0x030303);
+                    }
                     if (!palc) c = ((c & 0xFF) << 16) | (c & 0xFF00) | ((c >> 16) & 0xFF);
                     if (inside) c = 0xB4B4B4;                /* kickW suit grey, unlit-looking */
                     float lv = lam;
@@ -1063,7 +1399,7 @@ static void draw_scene(const VPIX_Frame &f, const float proj[16], const float ca
         }
     }
     glDepthMask(GL_TRUE);
-    if (any_top) glDepthFunc(depth_fn);                         /* VPIX_ON_TOP pass done */
+    if (any_top) { glDepthFunc(depth_fn); glDepthRange(0.0, 1.0); }   /* VPIX_ON_TOP pass done */
     }   /* phase */
     if (f.aim_beam) {                                           /* see-through red aim beam, 30 m, world space */
         float t[3] = {-camT[0], -camT[1], -camT[2]}, b[3];
@@ -1118,15 +1454,19 @@ static void draw_static(const VPIX_Frame &f, const float proj[16]) {
 
 /* The 2D layer, drawn in eye space as a panel filling the game's original field of view
    (the Visette overlaid it on the 3D image). proj = this eye's projection. */
+static GLuint draw_rtt(const VPIX_Frame &f, int w, int h);
 static void draw_blits(const VPIX_Frame &f, const float proj[16], bool backdrop, bool mid) {
     glDisable(GL_FOG);
     if (f.blits.empty()) return;
+    GLuint rtt_tex = 0;   /* VPIX_RTT3K: the view drawn into its picture first (once per frame), then pasted like the game's bitmaps */
+    for (const VPIX_Blit &b : f.blits) if (b.handle == VPIX_RTT_HANDLE && b.backdrop == backdrop && b.mid == mid) { rtt_tex = draw_rtt(f, b.sw, b.sh); break; }
     glMatrixMode(GL_PROJECTION); glLoadMatrixf(proj);
     glMatrixMode(GL_MODELVIEW); if (panel_world_on) glLoadMatrixf(panel_mv); else glLoadIdentity();   /* VPIX_PANEL_WORLD */
     glDisable(GL_DEPTH_TEST);
+    if (hud_stereo_m() > 0.f) glTranslatef(hud_off[0], hud_off[1], hud_off[2]);   /* VPIX_HUD_STEREO: from the head, not the eye */
     glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     glEnable(GL_TEXTURE_2D); glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
-    const float z = -1000.f;                       /* beyond the near plane (20) */
+    const float z = hud_stereo_m() > 0.f ? -hud_stereo_m() * 1000.f * world_scale : -1000.f;   /* beyond the near plane (20); VPIX_HUD_STEREO: the layer's distance */
     float tx_ = -z * tanf(f.fov_deg * 3.14159265f / 360.f), ty_ = tx_ / screen_aspect;   /* PAL pixels aren't square: shown 4:3 */
     /* VPIX_HUD_SCALE=<0..1> (games.ps1 HudScale, Pac-Man, VR only): the panel spans the game's whole field of view, which puts the
        HUD out at the headset's lens edges ('the HUD isn't scaled right ... kind of off-screen', bug list 10-24): shrink it toward
@@ -1141,10 +1481,18 @@ static void draw_blits(const VPIX_Frame &f, const float proj[16], bool backdrop,
     glTranslatef(nud[0] / screen_w * 2 * tx_, -nud[1] / screen_h * 2 * ty_, 0);
     for (const VPIX_Blit &b : f.blits) {
         if (b.world || b.backdrop != backdrop || b.mid != mid) continue;   /* VPIX_BLIT_PRIORITY: backdrops go under the 3D scene; mid: between models (draw_scene) */
+        static Tex rtt_t;   /* stands in for the picture: its size = the pasted rectangle, the whole texture */
+        Tex *t;
+        if (b.handle == VPIX_RTT_HANDLE) {
+            if (!rtt_tex) continue;
+            rtt_t.w = b.sx + b.sw; rtt_t.h = b.sy + b.sh; t = &rtt_t;
+            glBindTexture(GL_TEXTURE_2D, rtt_tex);
+        } else {
         auto it = bitmaps.find(b.handle);
         if (it == bitmaps.end()) continue;
-        Tex *t = it->second.get();
+        t = it->second.get();
         glBindTexture(GL_TEXTURE_2D, bitmap_gl(t, b.key));
+        }
         if (t->clear0 && b.pal0[0] >= 0.f && !b.glyph) glColor4f(b.pal0[0], b.pal0[1], b.pal0[2], b.alpha);   /* 4-shade bitmap: slot colour 0 */
         else if (t->mono || t->raw.empty() || b.glyph) glColor4f(b.tint[0], b.tint[1], b.tint[2], b.alpha); else glColor4f(1, 1, 1, b.alpha);   /* raw empty = SU3000 RGBA bitmap (tint +1DC) */
         /* screen y runs top-down; source rect is measured from the bitmap's top row; texture row 0 = bottom */
@@ -1321,7 +1669,10 @@ static void draw_sprites(const VPIX_Frame &f, const float camR[3][3], const floa
     /* which: 0 = all (with mid bitmaps: only those above the split), 1 = only those at or below the split */
     int32_t sp; const bool split = mid_split(f, sp);
     if (which == 1 && !split) return;
-    auto pick = [&](const VPIX_Blit &b) { return b.world && (!split || ((b.prio <= sp) == (which == 1))); };
+    const GLboolean fog_on0 = glIsEnabled(GL_FOG);   /* b.nofog sprites switch it off for themselves */
+    if (which == 2) glDepthFunc(GL_ALWAYS);   /* top sprites: over everything, the 2D layer included */
+    if (which == 2) { bool anyt = false; for (const VPIX_Blit &b : f.blits) anyt |= b.world && b.top; if (!anyt) return; }
+    auto pick = [&](const VPIX_Blit &b) { return b.world && (which == 2 ? b.top : !b.top && (!split || ((b.prio <= sp) == (which == 1)))); };
     bool any = false;
     for (const VPIX_Blit &b : f.blits) any |= pick(b);
     if (!any) return;
@@ -1335,7 +1686,10 @@ static void draw_sprites(const VPIX_Frame &f, const float camR[3][3], const floa
            over the 3D, no depth test (Bobby 10-25: score behind the white cards) */
         static const bool card_order = getenv("VPIX_CARD_ORDER") && atoi(getenv("VPIX_CARD_ORDER"));
         static const bool card_depth = getenv("VPIX_CARD_DEPTH") && atoi(getenv("VPIX_CARD_DEPTH"));
-        if (card_order && !card_depth) glDepthFunc(GL_ALWAYS);
+        /* VPIX_SPRITE_CARD (Olin Shotgun): only this sprite part of the card rules, in the normal build (Bobby 10-27: score digits behind
+           their cards, the stopwatch shows no countdown number - both world sprites a few units BEHIND the sprite they belong on) */
+        static const bool sprite_card = getenv("VPIX_SPRITE_CARD") && atoi(getenv("VPIX_SPRITE_CARD"));
+        if ((card_order || sprite_card) && !card_depth) glDepthFunc(GL_ALWAYS);
     }
     for (const VPIX_Blit &b : f.blits) {
         if (!pick(b)) continue;
@@ -1350,13 +1704,20 @@ static void draw_sprites(const VPIX_Frame &f, const float camR[3][3], const floa
         /* glyphs test depth against the 3D but don't write it: the card drew a pair by priority (letter 350 over shadow 349).
            Olin Shotgun's blue bottle numbers sit 10-30 units BEHIND their black shadow, so the shadow's depth hid them
            (Bobby: numbers missing). Shadows come first in the list (GlyphColour partition), the letter paints over. */
-        glDepthMask(b.glyph ? GL_FALSE : GL_TRUE);
+        /* MallVR's own soft effects (handles 0x7FFD0000-0x7FFD00FF: smoke, glows, beams, sparks, sky flyers) never write depth: their faint
+           edges hid the monster targets behind them in a wavy pattern (Bobby 10-27) */
+        glDepthMask((b.glyph || (b.handle >= 0x7FFD0000u && b.handle < 0x7FFD0100u)) ? GL_FALSE : GL_TRUE);
+        if (b.nofog) glDisable(GL_FOG); else if (fog_on0) glEnable(GL_FOG);
         float d[3] = {b.pos[0] - camT[0], b.pos[1] - camT[1], b.pos[2] - camT[2]}, e[3];
         for (int i = 0; i < 3; i++) e[i] = CRv[i][0] * d[0] + CRv[i][1] * d[1] + CRv[i][2] * d[2];   /* eye space */
         /* the pivot is measured from the bitmap's top-left, y DOWN (screen style): Shoot For Loot's 'shoot me' robot (SH00-19, 2298 x 3000,
            pivot 1149, 3000 = bottom centre) stands on its spot. Measured up, it hung 3000 units under the floor (Bobby 10-17: invisible,
            the gun still locked on). Every other game's sprites pivot at the centre, unchanged. */
-        float x0 = e[0] - b.pivot[0], x1 = x0 + b.dw, y1 = e[1] + b.pivot[1], y0 = y1 - b.dh;
+        float ss = 1.f;
+        if (b.screen_size) { float Pm[16]; glGetFloatv(GL_PROJECTION_MATRIX, Pm); ss = 2.f * fabsf(e[2]) / (Pm[0] * 352.f); }
+        /* Missile Command's moons (mid world sprites, painted after the sky, no depth): brought near inside the far plane, same size on screen */
+        if (b.mid) { glDisable(GL_DEPTH_TEST); if (e[2] < -1000.f) { ss = -1000.f / e[2]; for (int i = 0; i < 3; i++) e[i] *= ss; } }
+        float x0 = e[0] - ss * b.pivot[0], x1 = x0 + ss * b.dw, y1 = e[1] + ss * b.pivot[1], y0 = y1 - ss * b.dh;
         float u0 = (float)b.sx / t->w, u1 = (float)(b.sx + b.sw) / t->w;
         float v1 = 1.f - (float)b.sy / t->h, v0 = 1.f - (float)(b.sy + b.sh) / t->h;
         glBegin(GL_QUADS);
@@ -1396,12 +1757,12 @@ LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l) {
     return DefWindowProc(h, m, w, l);
 }
 
-static void save_bmp(const char *path) {
-    int w = win_w & ~3, h = win_h;
+static void save_bmp(const char *path, int fw = 0, int fh = 0) {   /* fw > 0: the bound framebuffer object (a VR eye) */
+    int w = (fw > 0 ? fw : win_w) & ~3, h = fh > 0 ? fh : win_h;
     if (w <= 0 || h <= 0) return;
     std::vector<uint8_t> px((size_t)w * h * 3);
     glPixelStorei(GL_PACK_ALIGNMENT, 1);
-    glReadBuffer(GL_BACK);
+    glReadBuffer(fw > 0 ? 0x8CE0 /* GL_COLOR_ATTACHMENT0 */ : GL_BACK);
     glReadPixels(0, 0, w, h, GL_BGR_EXT, GL_UNSIGNED_BYTE, px.data());
     FILE *f = fopen(path, "wb"); if (!f) return;
     uint32_t sz = 54 + (uint32_t)px.size();
@@ -1494,6 +1855,70 @@ static void free_fb(EyeFB &e) {
     if (e.tex) glDeleteTextures(1, &e.tex);
     e = EyeFB();
 }
+/* VPIX_RTT3K: the game's render-to-picture view (Pac-Man VR's alarm clock, view 5), 4x the picture's size, once per frame: its screen
+   bitmaps (the red face) into picture A, its 3D models (the CLKMSK pie slices, material "K BLUE") into picture B, then A is kept only
+   where B drew: elsewhere the picture is see-through and the clock body's white dial shows, so only the red sweep is left (the masks
+   drawn as they are were Bobby's grey screen / "blue needle", 11-01). draw_blits calls it with mtx held, in the middle of
+   another pass: that pass's framebuffer, viewport and 2D panel placement are put back */
+static GLuint draw_rtt(const VPIX_Frame &f, int w, int h) {
+    static EyeFB fa, fbm; static int fw = 0, fh = 0; static unsigned long done = ~0ul; static bool bad = false;
+    if (!f.rtt || w <= 0 || h <= 0 || bad || !load_fbo()) return 0;
+    const int W = 4 * w, H = 4 * h;
+    if (fw != W || fh != H) {
+        free_fb(fa); free_fb(fbm); fw = W; fh = H;
+        if (!make_eye_fb(fa, W, H) || !make_eye_fb(fbm, W, H)) { free_fb(fa); free_fb(fbm); bad = true; rl("render-to-picture FBO failed"); return 0; }
+    }
+    if (done == f.frame) return fa.tex;
+    done = f.frame;
+    GLint prev = 0, vp[4]; glGetIntegerv(0x8CA6 /* GL_FRAMEBUFFER_BINDING */, &prev); glGetIntegerv(GL_VIEWPORT, vp);
+    const bool pw_on = panel_world_on; float pw_mv[16]; memcpy(pw_mv, panel_mv, sizeof(pw_mv));
+    /* B: the masks, on see-through */
+    VPIX_Frame a; a.frame = f.frame; a.fov_deg = f.fov_deg; a.clear0 = true;
+    memcpy(a.cam_R, f.rtt_R, sizeof(a.cam_R)); memcpy(a.cam_T, f.rtt_T, sizeof(a.cam_T));
+    a.n_lights = f.n_lights; for (int i = 0; i < 4; i++) a.lights[i] = f.lights[i];
+    a.inst = f.rtt_inst;
+    float R[3][3], T[3], P[16]; VPIX_Pose none;
+    eye_camera(a, none, none, R, T);
+    frustum(a.fov_deg, (float)w / h, P);
+    glBindFramebuffer_(GL_FRAMEBUFFER, fbm.fbo);
+    draw_scene(a, P, R, T, W, H);
+    if (const char *dp = getenv("VPIX_RTTDUMP")) {   /* dev: the mask picture's alpha (white = drawn), a few times */
+        static int nd = 0; if (nd < 6 && f.frame % 200 == 0) { std::vector<uint8_t> px((size_t)W * H * 4), g((size_t)W * H * 3);
+            glReadPixels(0, 0, W, H, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+            for (size_t i = 0; i < (size_t)W * H; i++) { g[3 * i] = px[4 * i + 3]; g[3 * i + 1] = px[4 * i + 1]; g[3 * i + 2] = px[4 * i + 2]; }
+            char fn[600]; snprintf(fn, sizeof(fn), "%s_%d_f%lu_n%u.ppm", dp, nd++, f.frame, (unsigned)f.rtt_inst.size()); write_ppm(fn, g.data(), W, H); } }
+    /* A: the face bitmaps, in the picture's own pixels (y down) */
+    glBindFramebuffer_(GL_FRAMEBUFFER, fa.fbo); glViewport(0, 0, W, H);
+    glClearColor(0, 0, 0, 0); glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    glMatrixMode(GL_PROJECTION); glLoadIdentity(); glOrtho(0, w, h, 0, -1, 1);
+    glMatrixMode(GL_MODELVIEW); glLoadIdentity();
+    glDisable(GL_DEPTH_TEST); glDisable(GL_LIGHTING); glDisable(GL_FOG); glDisable(GL_CULL_FACE); glDisable(GL_ALPHA_TEST);
+    glEnable(GL_TEXTURE_2D); glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
+    glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA); glColor4f(1, 1, 1, 1);
+    for (const VPIX_Blit &b : f.rtt_blits) {
+        auto it = bitmaps.find(b.handle); if (it == bitmaps.end()) continue;
+        Tex *t = it->second.get(); if (t->w <= 0 || t->h <= 0) continue;
+        glBindTexture(GL_TEXTURE_2D, bitmap_gl(t, b.key >= 0 ? b.key : 0));   /* black = see-through: the game pastes the picture with colour key 0 */
+        float u0 = (float)b.sx / t->w, u1 = (float)(b.sx + b.sw) / t->w, v1 = 1.f - (float)b.sy / t->h, v0 = 1.f - (float)(b.sy + b.sh) / t->h;
+        float x0 = (float)b.x, y0 = (float)b.y, x1 = x0 + b.dw, y1 = y0 + b.dh;
+        glBegin(GL_QUADS);
+        glTexCoord2f(u0, v1); glVertex2f(x0, y0); glTexCoord2f(u1, v1); glVertex2f(x1, y0);
+        glTexCoord2f(u1, v0); glVertex2f(x1, y1); glTexCoord2f(u0, v0); glVertex2f(x0, y1);
+        glEnd();
+    }
+    /* keep A only where B drew: A *= B.alpha (colour and alpha). The masks grow with time, and the clock starts all white and uncovers
+       its red (the timer art AL0000-0010, Bobby 11-01 "should be all white from the start"; cut the other way it started all red) */
+    glLoadIdentity(); glMatrixMode(GL_PROJECTION); glLoadIdentity();
+    glBindTexture(GL_TEXTURE_2D, fbm.tex); glBlendFunc(GL_ZERO, GL_SRC_ALPHA);
+    glBegin(GL_QUADS);
+    glTexCoord2f(0, 0); glVertex2f(-1, -1); glTexCoord2f(1, 0); glVertex2f(1, -1);
+    glTexCoord2f(1, 1); glVertex2f(1, 1); glTexCoord2f(0, 1); glVertex2f(-1, 1);
+    glEnd();
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glBindFramebuffer_(GL_FRAMEBUFFER, (GLuint)prev); glViewport(vp[0], vp[1], vp[2], vp[3]);
+    panel_world_on = pw_on; memcpy(panel_mv, pw_mv, sizeof(pw_mv));
+    return fa.tex;
+}
 /* VPIX_DEPTH_FIX setup (needs the FBO entry points: every 3D pass then renders into a float-depth FBO) */
 static void depth_setup() {
     if (!depth_fix()) return;
@@ -1512,6 +1937,8 @@ static float loco[2] = {0, 0};         /* right-stick back/strafe movement, mm (
 static float walk_yaw = 0;             /* VPIX_WALK_TURN: head turn fed to the game while back/strafe is held */
 static float stick_back = 0, stick_side = 0;
 static bool vr_voice_mute = false;           /* Index left stick click this frame (voice chat mute) */
+static std::atomic<bool> bot_shot_now(false);   /* test player: screenshot now (VPIX_BOTCTL) */
+static float test_hand_az = 0;   /* test player: hand azimuth on top of the aim, radians (VPIX_TESTHANDAZ) */
 static float test_hand[3] = {0, 0, 0};       /* test player: extra hand offset, mm (desktop) */
 /* VPIX_LEAN=<mm> (games.ps1 Lean, Boxing): the game moves you by how far your head leans off centre
    ("lean or move forwards or backwards in the CS unit ... lean to the sides" - its help text), so the
@@ -1718,6 +2145,146 @@ static VPIX_Pose pose_pitched(const VPIX_Pose &h, float deg) {
     for (int i = 0; i < 3; i++) { g.R[1][i] = h.R[1][i] * c + h.R[2][i] * sn; g.R[2][i] = h.R[2][i] * c - h.R[1][i] * sn; }
     return g;
 }
+/* VPIX_DUAL_GUN_MODEL=<.BIN file> (Phantom Freight, Bobby 10-26: "double machine guns from Zone Hunter"): a gun drawn on EACH
+   controller. Ghost Train has no hand gun of its own (its shots are laser.bin), so the model comes from disk: Zone Hunter's
+   kickW\gun.bin when the player has Zone (its 36 select-bit-1 polygons past the barrel = the muzzle flash), else Ghost's unused
+   cart\gun.bin. The firing hand's flash shows for 60 ms per shot (frame.dual_flash, from the HLE's VPIX_DUAL_GUN). The left gun is
+   the right one mirrored. Pose = the controller relative to the head, put on the head's camera like the eyes (glued to the hand).
+   Tuning: VPIX_DUAL_GUN_POSE="pitch_deg,scale,x,y,z" (pitch about the controller's right axis, model scale, grip offset mm); the
+   player's aim trim (touchpad up / down, gun_pitch_GHOST) tilts both guns on top (Bobby 10-27: "the gun angle needs adjusting"). */
+static const VPIX_Frame &dual_guns_apply(const VPIX_Frame &f, const VPIX_Pose &head_now, const VPIX_Pose &rh, const VPIX_Pose &lh, float trim) {
+    static const char *mp = getenv("VPIX_DUAL_GUN_MODEL");
+    if (!mp || !*mp || !head_now.valid || !f.in_head || f.lock_view) return f;   /* not in the locked attract (it floated in the picture, Bobby 10-27) */
+    const uint32_t H = 0x7FFF0D01u;
+    static int state = 0;                                                  /* 0 = not loaded yet, 1 = ready, -1 = failed */
+    if (state == 0) {
+        state = -1;
+        if (FILE *fp = fopen(mp, "rb")) {
+            std::vector<uint8_t> d; uint8_t buf[65536]; size_t n;
+            while ((n = fread(buf, 1, sizeof(buf), fp)) > 0) d.insert(d.end(), buf, buf + n);
+            fclose(fp);
+            if (VPIX_Render_AddModel(H, d.data(), d.size())) state = 1;
+        }
+        rl("dual gun model %s: %s", mp, state == 1 ? "loaded" : "** FAILED");
+    }
+    if (state != 1) return f;
+    static float pitch = 0, sc = 0.35f, off[3] = {0, 0, -20}; static bool rd = false;
+    if (!rd) { rd = true; if (const char *e = getenv("VPIX_DUAL_GUN_POSE")) sscanf(e, "%f,%f,%f,%f,%f", &pitch, &sc, &off[0], &off[1], &off[2]);
+        rl("dual guns: pitch %.0f deg, scale %.2f, grip offset (%.0f %.0f %.0f) mm", pitch, sc, off[0], off[1], off[2]); }
+    float HR[3][3], HT[3];
+    eye_camera(f, head_now, head_now, HR, HT);
+    /* tracker vector -> world: its components along the head's axes, put on the head camera's axes */
+    auto tw = [&](const float v[3], float o[3]) {
+        for (int i = 0; i < 3; i++) o[i] = 0;
+        for (int k = 0; k < 3; k++) { float c = v[0] * head_now.R[k][0] + v[1] * head_now.R[k][1] + v[2] * head_now.R[k][2];
+            for (int i = 0; i < 3; i++) o[i] += c * HR[k][i]; }
+    };
+    static VPIX_Frame v;
+    v = f;
+    const VPIX_Pose *hands[2] = {&rh, &lh};
+    for (int i = 0; i < 2; i++) {
+        const VPIX_Pose &h = *hands[i];
+        if (!h.valid) continue;
+        VPIX_Pose hp = pose_pitched(h, pitch + trim);   /* + the aim trim: the HLE's right-gun shot leaves along this barrel */
+        VPIX_Instance g = {};
+        g.handle = H;
+        float grip[3], d[3], w[3];
+        for (int k = 0; k < 3; k++) grip[k] = h.p[k] + (i ? -off[0] : off[0]) * h.R[0][k] + off[1] * h.R[1][k] + off[2] * h.R[2][k];
+        for (int k = 0; k < 3; k++) d[k] = grip[k] - head_now.p[k];
+        tw(d, w);
+        for (int k = 0; k < 3; k++) g.T[k] = HT[k] + world_scale * w[k];
+        for (int r = 0; r < 3; r++) tw(hp.R[r], g.R[r]);
+        g.S[0] = i ? -sc : sc; g.S[1] = sc; g.S[2] = sc;                    /* left = mirrored */
+        for (int c = 0; c < 16; c++) { uint32_t gr = 0x40 + 0x0C * c; if (gr > 0xF0) gr = 0xF0; g.pal[c] = gr << 16 | gr << 8 | gr; g.palw[c] = g.pal[c]; }
+        g.prio = 300; g.light_mask = 1;
+        g.poly_select = 1; g.select = f.dual_flash == i ? 1 : 0;
+        g.on_top = 2;   /* the guns, sword and arms are drawn over the world: they never clip into the cart, track or props (Bobby 10-29) */
+        v.inst.push_back(g);
+        /* VPIX_SWORD=<blade mm> (Phantom Freight, Bobby 10-27: "one gun ... your right hand and a sword like the skeletons have for your
+           left hand", long enough to reach the other cart across the track): the left hand holds a sword instead (steel blade, gold
+           cross-guard, brown hilt, MallVR mesh); the HLE tests the blade against the other carts (hits, jams, sparks) */
+        static const float sword_mm = getenv("VPIX_SWORD") ? (float)atof(getenv("VPIX_SWORD")) : 0.f;
+        if (i == 1 && sword_mm > 0.f) {
+            v.inst.pop_back();
+            const uint32_t HS = 0x7FFF0D03u; static bool made = false;
+            if (!made) {
+                made = true; std::vector<float> sv; std::vector<VPIX_MeshPoly> sp;
+                auto box = [&](float x0, float x1, float y0, float y1, float z0, float z1, uint32_t col) {
+                    const uint32_t b0 = (uint32_t)(sv.size() / 3);
+                    const float c8[8][3] = {{x0, y0, z0}, {x1, y0, z0}, {x1, y1, z0}, {x0, y1, z0}, {x0, y0, z1}, {x1, y0, z1}, {x1, y1, z1}, {x0, y1, z1}};
+                    for (auto &q : c8) { sv.push_back(q[0]); sv.push_back(q[1]); sv.push_back(q[2]); }
+                    const int f6[6][4] = {{0, 1, 5, 4}, {1, 2, 6, 5}, {2, 3, 7, 6}, {3, 0, 4, 7}, {4, 5, 6, 7}, {3, 2, 1, 0}};
+                    const float nn[6][3] = {{0, -1, 0}, {1, 0, 0}, {0, 1, 0}, {-1, 0, 0}, {0, 0, 1}, {0, 0, -1}};
+                    for (int fi = 0; fi < 6; fi++) { VPIX_MeshPoly q; q.n = 4; for (int k = 0; k < 4; k++) q.idx[k] = b0 + (uint32_t)f6[fi][k];
+                        q.flags = 0x20000000 | col; q.nx = nn[fi][0]; q.ny = nn[fi][1]; q.nz = nn[fi][2]; sp.push_back(q); }
+                };
+                box(-22, 22, -170, 0, -22, 22, 0x183048);                 /* hilt (0xBBGGRR flat colours) */
+                box(-130, 130, 0, 36, -24, 24, 0x30B0D8);                 /* cross-guard */
+                box(-32, 32, 36, sword_mm - 120.f, -6, 6, 0xC8C0B8);      /* blade */
+                box(-16, 16, sword_mm - 120.f, sword_mm, -5, 5, 0xE0D8D0);  /* point */
+                VPIX_Render_AddMesh(HS, sv, sp);
+            }
+            VPIX_Instance s = g; s.handle = HS; s.poly_select = 0; s.select = 0;
+            s.on_top = 2;   /* drawn over everything: held low it went behind the cart / track and vanished (Bobby 10-28: "cant clip get hung up on anything") */
+            for (int k = 0; k < 3; k++) s.S[k] = world_scale;
+            v.inst.push_back(s);
+        }
+        /* the arm holding it (Bobby 10-27: "give it an arm attached to body like dac"): shoulder (23 cm under the eyes, 19 cm out to
+           that side, along the head's level heading) -> elbow -> the grip; upper arm 30 cm, forearm 32 cm, the elbow bent down and out
+           when the hand comes in closer. Two boxes of a dark sleeve, MallVR meshes. */
+        {
+            const uint32_t HA = 0x7FFF0D02u;
+            static bool arm_made = false;
+            if (!arm_made) {   /* a box 1 long along +Y (0..1), 1 x 1 across, centred */
+                arm_made = true;
+                std::vector<float> av; std::vector<VPIX_MeshPoly> ap;
+                const float c8[8][3] = {{-.5f, 0, -.5f}, {.5f, 0, -.5f}, {.5f, 0, .5f}, {-.5f, 0, .5f}, {-.5f, 1, -.5f}, {.5f, 1, -.5f}, {.5f, 1, .5f}, {-.5f, 1, .5f}};
+                for (auto &q : c8) { av.push_back(q[0]); av.push_back(q[1]); av.push_back(q[2]); }
+                const int f6[6][4] = {{0, 1, 5, 4}, {1, 2, 6, 5}, {2, 3, 7, 6}, {3, 0, 4, 7}, {4, 5, 6, 7}, {3, 2, 1, 0}};
+                const float nn[6][3] = {{0, 0, -1}, {1, 0, 0}, {0, 0, 1}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}};
+                for (int fi = 0; fi < 6; fi++) { VPIX_MeshPoly q; q.n = 4; for (int k = 0; k < 4; k++) q.idx[k] = (uint32_t)f6[fi][k];
+                    q.flags = 0x202A1C36; q.nx = nn[fi][0]; q.ny = nn[fi][1]; q.nz = nn[fi][2]; ap.push_back(q); }
+                VPIX_Render_AddMesh(HA, av, ap);
+            }
+            float hf[3] = {head_now.R[1][0], head_now.R[1][1], 0}; const float hl = sqrtf(hf[0] * hf[0] + hf[1] * hf[1]);
+            if (hl > 1e-3f) {
+                hf[0] /= hl; hf[1] /= hl;
+                const float side = i ? -1.f : 1.f, hr[3] = {hf[1], -hf[0], 0};
+                float S[3], E[3];
+                for (int k = 0; k < 3; k++) S[k] = head_now.p[k] + hr[k] * 190.f * side - hf[k] * 40.f + (k == 2 ? -230.f : 0.f);
+                float dv[3], d = 0; for (int k = 0; k < 3; k++) { dv[k] = grip[k] - S[k]; d += dv[k] * dv[k]; } d = sqrtf(d);
+                const float L1 = 300.f, L2 = 320.f, dd = (std::min)(d, L1 + L2 - 1.f);
+                const float a = (L1 * L1 - L2 * L2 + dd * dd) / (2.f * dd), hgt = sqrtf((std::max)(0.f, L1 * L1 - a * a));
+                float bend[3] = {hr[0] * side * 0.4f, hr[1] * side * 0.4f, -1.f};   /* elbow: down and out */
+                float bl = 0; for (int k = 0; k < 3; k++) { bend[k] -= dv[k] / (d > 1 ? d : 1) * (bend[0] * dv[0] + bend[1] * dv[1] + bend[2] * dv[2]) / (d > 1 ? d : 1); bl += bend[k] * bend[k]; }
+                /* arm limits (Bobby 10-28: "make arm limits maybe for it ... so it does not flip under"): the elbow always ends up below
+                   the shoulder-to-hand line and to the outside; with the hand held high or across, the projection could point the
+                   elbow up or inward and the arm flipped over */
+                if (bend[2] > -0.15f * sqrtf(bl)) bend[2] = -0.15f * sqrtf(bl) - 1e-3f;
+                if ((bend[0] * hr[0] + bend[1] * hr[1]) * side < 0.f) { const float o = bend[0] * hr[0] + bend[1] * hr[1]; bend[0] -= o * hr[0]; bend[1] -= o * hr[1]; }
+                {   const float dn = d > 1 ? d : 1, pr = (bend[0] * dv[0] + bend[1] * dv[1] + bend[2] * dv[2]) / (dn * dn);   /* back square to the arm line */
+                    bl = 0; for (int k = 0; k < 3; k++) { bend[k] -= dv[k] * pr; bl += bend[k] * bend[k]; } }
+                bl = sqrtf(bl); if (bl < 1e-3f) { bend[0] = bend[1] = 0; bend[2] = -1; bl = 1; }
+                for (int k = 0; k < 3; k++) E[k] = S[k] + dv[k] / (d > 1 ? d : 1) * a + bend[k] / bl * hgt;
+                auto seg = [&](const float A[3], const float B[3], float thick) {
+                    float dir[3], len = 0; for (int k = 0; k < 3; k++) { dir[k] = B[k] - A[k]; len += dir[k] * dir[k]; } len = sqrtf(len); if (len < 1.f) return;
+                    for (float &q : dir) q /= len;
+                    float p1[3] = {dir[1], -dir[0], 0}; float pl = sqrtf(p1[0] * p1[0] + p1[1] * p1[1]); if (pl < 1e-3f) { p1[0] = 1; p1[1] = 0; pl = 1; } for (float &q : p1) q /= pl;
+                    const float p2[3] = {dir[1] * p1[2] - dir[2] * p1[1], dir[2] * p1[0] - dir[0] * p1[2], dir[0] * p1[1] - dir[1] * p1[0]};
+                    VPIX_Instance s = {}; s.handle = HA; s.light_mask = 1; s.prio = 300; s.on_top = 2;
+                    float a3[3], w3[3]; for (int k = 0; k < 3; k++) a3[k] = A[k] - head_now.p[k];
+                    tw(a3, w3); for (int k = 0; k < 3; k++) s.T[k] = HT[k] + world_scale * w3[k];
+                    tw(p1, s.R[0]); tw(dir, s.R[1]); tw(p2, s.R[2]);
+                    s.S[0] = s.S[2] = world_scale * thick; s.S[1] = world_scale * len;
+                    for (int c = 0; c < 16; c++) s.pal[c] = s.palw[c] = 0xFFFFFF;
+                    v.inst.push_back(s);
+                };
+                seg(S, E, 95.f); seg(E, grip, 80.f);
+            }
+        }
+    }
+    return v;
+}
 static bool glove_track_on() { static const bool g = getenv("VPIX_BOX_GLOVE_TRACK") && atoi(getenv("VPIX_BOX_GLOVE_TRACK")); return g; }
 static const VPIX_Frame &glove_apply(const VPIX_Frame &f, const VPIX_Pose &head_now, const VPIX_Pose &rh, const VPIX_Pose &lh) {
     if (!glove_track_on() || !head_now.valid || !f.in_head || !f.head_fed.valid) return f;
@@ -1906,12 +2473,16 @@ static int stick_axis(vr::TrackedDeviceIndex_t d) {
     rl("controller %u: stick on axis %d", (unsigned)d, a);
     return cache[d] = a;
 }
+/* VPIX_STICK_TURN=1 (Phantom Freight, Bobby 10-28: "can we make our character rotate around 360 with a joystick? ... if game is not
+   centered and ur off you cant adjust"): the right stick left/right smooth-turns you in the cart (all the way round), even in a
+   VPIX_NOTURN / VPIX_JOYAXES game; up/down stays the move, the left stick alone feeds the cart's joystick (the jump tricks) */
+static bool stick_turn() { static const bool on = getenv("VPIX_STICK_TURN") && atoi(getenv("VPIX_STICK_TURN")); return on; }
 static float head_xy_now[2] = {0, 0};  /* last head position (after yaw_off), mm: the turn pivot */
 /* turn the player about their own head: yaw_off rotates the tracked space about its origin, so
    shift the stick offset to keep the head where it was (no orbiting around the room centre) */
 static void snap_turn(float a) {
     static const bool no_turn = getenv("VPIX_NOTURN") && atoi(getenv("VPIX_NOTURN"));   /* games you only look around in (Ghost Train) */
-    if (no_turn) return;
+    if (no_turn && !stick_turn()) return;
     yaw_off += a;
     float c = cosf(a), s = sinf(a), x = head_xy_now[0], y = head_xy_now[1];
     loco[0] += x - (c * x - s * y);
@@ -2117,10 +2688,11 @@ static void desktop_input(double dt, const VPIX_Frame *f) {
         stick_side = ((GetAsyncKeyState('D') & 0x8000) ? 1.f : 0.f) - ((GetAsyncKeyState('A') & 0x8000) ? 1.f : 0.f);
         if (GetAsyncKeyState('1') & 0x8000) start = true;
         crouch_set((GetAsyncKeyState('C') & 0x8000) != 0);     /* C = hold to crouch (VPIX_CROUCH games) */
+        input.jump = (GetAsyncKeyState('E') & 0x8000) != 0;   /* E = cart hop (VPIX_JUMP, Ghost Train Hunted dev) */
         static bool c5 = false; bool k5 = (GetAsyncKeyState('5') & 0x8000) != 0;
         if (k5 && !c5) desk_coins++;
         c5 = k5;
-    } else { stick_back = stick_side = 0; crouch_set(false); }
+    } else { stick_back = stick_side = 0; crouch_set(false); input.jump = false; }
     if (joy_axes()) {                             /* desktop joystick axes: W/S y, A/D x */
         /* VPIX_TOP_BUTTONS (Ghost Train): W stays the pod's top button (moves the car); the keyboard had none (Bobby 10-18) */
         static const bool top_btns = getenv("VPIX_TOP_BUTTONS") && atoi(getenv("VPIX_TOP_BUTTONS"));
@@ -2149,13 +2721,27 @@ static void desktop_input(double dt, const VPIX_Frame *f) {
         float v[3] = {fw[0] * conv - hx * hand_reach, fw[1] * conv - hy * hand_reach, 1700 + fw[2] * conv - 1200};
         gaz = atan2f(-v[0], v[1]); gel = atan2f(v[2], sqrtf(v[0] * v[0] + v[1] * v[1]));
     }
-    azel_pose(desk_hand, gaz + mouse_az, gel + mouse_el, hx + test_hand[0], hy + test_hand[1], 1200 + test_hand[2]);
+    azel_pose(desk_hand, gaz + mouse_az + test_hand_az, gel + mouse_el, hx + test_hand[0], hy + test_hand[1], 1200 + test_hand[2]);
     /* VPIX_DESK_HAND_AT_EYE=1 (run_su3k.sh: Total Recoil in a window): the gun = the eye, so it aims exactly at the screen centre
        whatever the game's tracker scale is (Bobby 10-18: 'make the gun aim center where we look') */
     static const bool hand_eye = getenv("VPIX_DESK_HAND_AT_EYE") && atoi(getenv("VPIX_DESK_HAND_AT_EYE"));
     if (hand_eye && !bot) azel_pose(desk_hand, desk_az + mouse_az, desk_el + mouse_el, 0, 0, 1700);
     stick_twist(desk_hand);
     if (desk_box() && !bot) desk_box_hands(dt, focused() && (GetAsyncKeyState(VK_LBUTTON) & 0x8000), focused() && (GetAsyncKeyState(VK_RBUTTON) & 0x8000));
+    /* VPIX_SWORD in the window (Phantom Freight, Bobby 10-28: "for desktop mode make the sword in left hand swing able by looking around
+       or by button"): the left hand holds the blade at your left, pointing where you look (look around = sweep it); Q or F slashes it
+       across the front, left to right and down (0.25 s out, 0.2 s back) */
+    static const bool desk_sword = getenv("VPIX_SWORD") && atof(getenv("VPIX_SWORD")) > 0 && !desk_box();
+    if (desk_sword && !bot) {
+        static float sw = 0.f; static bool out = false, was = false;
+        const bool k = focused() && ((GetAsyncKeyState('Q') | GetAsyncKeyState('F')) & 0x8000) != 0;
+        if (k && !was && sw < 0.3f) out = true; was = k;
+        if (out) { sw += (float)dt / 0.25f; if (sw >= 1.f) { sw = 1.f; out = false; } } else sw = (std::max)(0.f, sw - (float)dt / 0.2f);
+        const float e = sw * sw * (3.f - 2.f * sw);
+        const float az = desk_az + mouse_az + 0.35f - 1.6f * e, el = desk_el + mouse_el - 0.15f + 0.5f * sinf(e * 3.14159f) - 0.5f * e;
+        const float rx = cosf(desk_az), ry = sinf(desk_az), fx = -sinf(desk_az), fy = cosf(desk_az);
+        azel_pose(desk_hand2, az, el, -rx * 260.f + fx * 250.f, -ry * 260.f + fy * 250.f, 1300.f + 150.f * e);
+    }
     std::lock_guard<std::mutex> lk(in_mtx);
     input.head = desk_head; input.hand = desk_hand; input.hand2 = desk_hand2; input.buttons = btn; input.coins = desk_coins; input.start = start; input.vr = false; input.crouch_mm = crouch_now;
     input.voice_mute = focused() && (GetAsyncKeyState('M') & 0x8000) != 0;   /* window: M = voice chat mute on / off */
@@ -2186,17 +2772,41 @@ static void thread_main() {
     HINSTANCE hi = GetModuleHandle(NULL);
     WNDCLASSA wc = {}; wc.lpfnWndProc = wndproc; wc.hInstance = hi; wc.lpszClassName = "VPIXRender";
     wc.hCursor = LoadCursor(NULL, IDC_ARROW); RegisterClassA(&wc);
+    const int sbs = sbs_mode();
+    if (sbs) { win_w = 1920; win_h = 1080; }
     /* VPIX_WIN_W / _H: window size (video capture: 1920x1080) */
     if (getenv("VPIX_WIN_W") && atoi(getenv("VPIX_WIN_W")) > 0) win_w = atoi(getenv("VPIX_WIN_W"));
     if (getenv("VPIX_WIN_H") && atoi(getenv("VPIX_WIN_H")) > 0) win_h = atoi(getenv("VPIX_WIN_H"));
     RECT r = {0, 0, win_w, win_h}; AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
     /* VPIX_WIN_X: borderless window at (x, 0) - a full 1920x1080 capture area on one monitor */
     const char *wx = getenv("VPIX_WIN_X");
-    HWND hw = wx ? CreateWindowExA(WS_EX_TOPMOST, "VPIXRender", "MallVR - Gainesphere Studios", WS_POPUP | WS_VISIBLE,
-                                 atoi(wx), 0, win_w, win_h + 1, NULL, NULL, hi, NULL)   /* +1 row: an exact-fullscreen window goes to
+    int pos_x = wx ? atoi(wx) : 0, pos_y = 0;
+    std::vector<RECT> mons; int mon_i = 0;      /* VPIX_SBS: the displays, and the one the window is on */
+    if (sbs) {                                  /* VPIX_SBS_MONITOR=N: the Nth display Windows lists */
+        /* real pixels on a scaled display (Windows 125 % etc.): an unaware 1920 x 1080 window came out 2400 x 1350 = cropped / blurry */
+        typedef void *(WINAPI *PDpiCtx)(void *);
+        PDpiCtx dpi = (PDpiCtx)GetProcAddress(GetModuleHandleA("user32.dll"), "SetThreadDpiAwarenessContext");   /* Windows 10 1607+ */
+        if (dpi) dpi((void *)(intptr_t)-4);     /* DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 */
+        EnumDisplayMonitors(NULL, NULL, [](HMONITOR, HDC, LPRECT r, LPARAM l) -> BOOL { ((std::vector<RECT> *)l)->push_back(*r); return TRUE; }, (LPARAM)&mons);
+        for (size_t i = 0; i < mons.size(); i++)
+            rl("SBS: display %u at (%ld, %ld) %ld x %ld", (unsigned)i + 1, mons[i].left, mons[i].top, mons[i].right - mons[i].left, mons[i].bottom - mons[i].top);
+        const int mi = getenv("VPIX_SBS_MONITOR") ? atoi(getenv("VPIX_SBS_MONITOR")) : 0;
+        for (size_t i = 0; i < mons.size(); i++) if (mons[i].left == 0 && mons[i].top == 0) mon_i = (int)i;   /* the main display */
+        if (mi >= 1 && mi <= (int)mons.size()) mon_i = mi - 1;
+        if (!wx && !mons.empty()) {
+            pos_x = mons[mon_i].left; pos_y = mons[mon_i].top;
+            if (!getenv("VPIX_WIN_W")) win_w = mons[mon_i].right - mons[mon_i].left;
+            if (!getenv("VPIX_WIN_H")) win_h = mons[mon_i].bottom - mons[mon_i].top;
+        }
+        rl("SBS %s: %d x %d window at (%d, %d)", sbs == 2 ? "half (each eye squeezed to half width)" : "full (each eye 4:3 in its half)", win_w, win_h, pos_x, pos_y);
+    }
+    int sbs_h = win_h;                          /* VPIX_SBS: the picture's height (the borderless window is one row taller) */
+    HWND hw = (wx || sbs) ? CreateWindowExA(WS_EX_TOPMOST, "VPIXRender", "MallVR - Gainesphere Studios", WS_POPUP | WS_VISIBLE,
+                                 pos_x, pos_y, win_w, win_h + 1, NULL, NULL, hi, NULL)   /* +1 row: an exact-fullscreen window goes to
                                     independent flip and screen capture reads black */
                  : CreateWindowA("VPIXRender", "MallVR - Gainesphere Studios", WS_OVERLAPPEDWINDOW | WS_VISIBLE,
                                  40, 40, r.right - r.left, r.bottom - r.top, NULL, NULL, hi, NULL);
+    if (sbs) { SetClassLongPtrA(hw, GCLP_HCURSOR, 0); SetCursor(NULL); SetForegroundWindow(hw); }   /* no pointer in the picture; keys + mouse go here */
     HDC dc = GetDC(hw);
     PIXELFORMATDESCRIPTOR pfd = {sizeof(pfd), 1, PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL | PFD_DOUBLEBUFFER, PFD_TYPE_RGBA, 32};
     pfd.cDepthBits = 24;
@@ -2206,6 +2816,140 @@ static void thread_main() {
     SwapIntervalFn swi = (SwapIntervalFn)wglGetProcAddress("wglSwapIntervalEXT");
     depth_setup();                         /* VPIX_DEPTH_FIX: before any FBO is made */
     EyeFB desk_fb; int desk_w = 0, desk_h = 0;   /* depth fix: the desktop view renders into its own float-depth FBO */
+    /* VPIX_AERIAL3K games (Pac-Man VR): the window shows the game's spectator camera (frame aer_*). On by default with a headset (the
+       watchers' screen while you play), off in a window; V flips it. Drawn with the game's own camera as it is, no head */
+    bool aer_on = false, aer_init = false, aer_vwas = false;
+    auto draw_aerial = [&](const VPIX_Frame &vf) {
+        VPIX_Frame a; a.frame = vf.frame; a.fov_deg = vf.fov_deg; memcpy(a.clear, vf.clear, 3);
+        memcpy(a.cam_R, vf.aer_R, sizeof(a.cam_R)); memcpy(a.cam_T, vf.aer_T, sizeof(a.cam_T));
+        a.n_lights = vf.n_lights; for (int i = 0; i < 4; i++) a.lights[i] = vf.lights[i];
+        a.inst = vf.aer_inst; a.blits = vf.aer_blits;
+        /* the ghosts are flat cut-out cards (BLINKY.ASC: one 1500 x 2100 quad) turned to face the player; from 470000 up they showed edge-on,
+           a sliver beside their 3D eyes (Bobby 11-01: "like a flat paper from the side"). A flat model standing up is laid face-up to this
+           camera: its normal onto the camera, its height along the screen's up */
+        /* turned about the card's own middle, not the model origin: the ghost cards stand on their foot (the eyes, 3D, sat at the card's
+           bottom edge, Bobby 11-01 "eyes too low") and the warp tunnel ("stargate") cards are built 13750 out from an origin in the maze
+           centre (both swung into the middle). A card built off its origin lays its top towards that origin (Bobby: right one turned
+           90 left, left one 90 right) */
+        struct Flat { int ax; float ctr[3], big; };
+        std::vector<VPIX_Instance *> solids;
+        struct Card { float c[3], up[3], h; };   /* a ghost card laid face-up: its middle, screen up, half height */
+        std::vector<Card> cards;
+        { static std::map<uint32_t, Flat> flat_axis;   /* handle -> the local axis the card is flat along (-1 = a solid), its middle */
+          std::lock_guard<std::mutex> lk(mtx);
+          for (VPIX_Instance &in : a.inst) {
+              auto fa = flat_axis.find(in.handle);
+              if (fa == flat_axis.end()) {
+                  auto m = meshes.find(in.handle); if (m == meshes.end() || m->second->v.size() < 9) continue;   /* not built yet: next frame */
+                  float lo[3] = {1e30f, 1e30f, 1e30f}, hi[3] = {-1e30f, -1e30f, -1e30f}; const std::vector<float> &v = m->second->v;
+                  for (size_t i = 0; i + 2 < v.size(); i += 3) for (int c = 0; c < 3; c++) { lo[c] = (std::min)(lo[c], v[i + c]); hi[c] = (std::max)(hi[c], v[i + c]); }
+                  int ax = -1; float big = (std::max)(hi[0] - lo[0], (std::max)(hi[1] - lo[1], hi[2] - lo[2]));
+                  for (int c = 0; c < 3; c++) if (big > 0 && hi[c] - lo[c] < 0.02f * big) ax = c;
+                  Flat fl; fl.ax = ax; fl.big = big; for (int c = 0; c < 3; c++) fl.ctr[c] = 0.5f * (lo[c] + hi[c]);
+                  fa = flat_axis.emplace(in.handle, fl).first;
+              }
+              const int k = fa->second.ax; if (in.backdrop) continue;
+              if (k < 0) { solids.push_back(&in); continue; }
+              const float *ctr = fa->second.ctr;
+              const float *nrm = in.R[k], *fw = a.cam_R[1];
+              if (fabsf(nrm[0] * fw[0] + nrm[1] * fw[1] + nrm[2] * fw[2]) > 0.5f) continue;   /* lying flat already (floor tiles) */
+              int up = -1; float best = 0;                  /* the card's height axis: the one nearest world up */
+              for (int c = 0; c < 3; c++) if (c != k && fabsf(in.R[c][2]) > best) { best = fabsf(in.R[c][2]); up = c; }
+              if (up < 0) continue;
+              const int third = 3 - k - up; const float sg = in.R[up][2] < 0 ? -1.f : 1.f;
+              float mid0[3]; for (int c = 0; c < 3; c++) mid0[c] = in.S[0] * ctr[0] * in.R[0][c] + in.S[1] * ctr[1] * in.R[1][c] + in.S[2] * ctr[2] * in.R[2][c];
+              float sz = 0.f; { auto m = meshes.find(in.handle); const std::vector<float> &v = m->second->v;
+                  for (size_t i = 0; i + 2 < v.size(); i += 3) sz = (std::max)(sz, fabsf(v[i + up] - ctr[up])); }
+              float upd[3] = {sg * a.cam_R[2][0], sg * a.cam_R[2][1], sg * a.cam_R[2][2]};
+              const float off = sqrtf(mid0[0] * mid0[0] + mid0[1] * mid0[1]);
+              const bool gate = off > 4.f * sz * fabsf(in.S[up]);
+              if (gate) {   /* built off its origin: top towards the origin, in the screen plane */
+                  float t[3] = {-mid0[0], -mid0[1], -mid0[2]}; const float dn = t[0] * fw[0] + t[1] * fw[1] + t[2] * fw[2];
+                  for (int c = 0; c < 3; c++) t[c] -= dn * fw[c];
+                  const float L = sqrtf(t[0] * t[0] + t[1] * t[1] + t[2] * t[2]);
+                  if (L > 0.f) for (int c = 0; c < 3; c++) upd[c] = sg * t[c] / L;
+              }
+              float det = in.R[0][0] * (in.R[1][1] * in.R[2][2] - in.R[1][2] * in.R[2][1]) - in.R[0][1] * (in.R[1][0] * in.R[2][2] - in.R[1][2] * in.R[2][0]) + in.R[0][2] * (in.R[1][0] * in.R[2][1] - in.R[1][1] * in.R[2][0]);
+              const float rt[3] = {upd[1] * fw[2] - upd[2] * fw[1], upd[2] * fw[0] - upd[0] * fw[2], upd[0] * fw[1] - upd[1] * fw[0]};   /* screen right of the new up */
+              for (int c = 0; c < 3; c++) { in.R[k][c] = -fw[c]; in.R[up][c] = upd[c]; in.R[third][c] = rt[c]; }
+              float d2 = in.R[0][0] * (in.R[1][1] * in.R[2][2] - in.R[1][2] * in.R[2][1]) - in.R[0][1] * (in.R[1][0] * in.R[2][2] - in.R[1][2] * in.R[2][0]) + in.R[0][2] * (in.R[1][0] * in.R[2][1] - in.R[1][1] * in.R[2][0]);
+              if ((det < 0) != (d2 < 0)) for (int c = 0; c < 3; c++) in.R[third][c] = -in.R[third][c];   /* keep a mirrored card mirrored, not flipped */
+              for (int c = 0; c < 3; c++) in.T[c] += mid0[c] - (in.S[0] * ctr[0] * in.R[0][c] + in.S[1] * ctr[1] * in.R[1][c] + in.S[2] * ctr[2] * in.R[2][c]);
+              const float h = sz * fabsf(in.S[up]);
+              if (gate) {   /* the stargate: out over the tunnel door (it becomes the frame), lifted above it (Bobby 11-01 screenshot) */
+                  /* fitted to its door (Bobby 11-01 "can it be made to match its frame"): the card is the door's 2000 x 2250 opening (it fills the
+                     arch in 3D); from above the door is a 1000 x 3500 block. Squeezed to the door's 1000 depth about its middle, left at the opening's
+                     2000 width, in the middle of the block (the brown ends frame it), lifted over the door's 3000 top */
+                  const float dep = 1000.f / (2.f * h);
+                  for (int c = 0; c < 3; c++) in.T[c] += -(dep - 1.f) * in.S[up] * ctr[up] * in.R[up][c] - 4000.f * fw[c];
+                  in.S[up] *= dep;
+              } else { Card cd; for (int c = 0; c < 3; c++) { cd.c[c] = in.T[c] + mid0[c]; cd.up[c] = sg * upd[c]; } cd.h = h; cards.push_back(cd); }
+          }
+          /* the ghosts' 3D eyes sit at the front of the ghost (its facing side), which from above is the card's edge, low on the body
+             (Bobby 11-01 "dropped eyes to ghost waist"): onto the card's upper face, a little towards where the ghost looks */
+          for (VPIX_Instance *e : solids) {
+              auto fe = flat_axis.find(e->handle); if (fe == flat_axis.end()) continue;
+              const float *ct = fe->second.ctr; float em[3];
+              const float esz = fe->second.big * (std::max)(fabsf(e->S[0]), (std::max)(fabsf(e->S[1]), fabsf(e->S[2])));
+              for (int c = 0; c < 3; c++) em[c] = e->T[c] + e->S[0] * ct[0] * e->R[0][c] + e->S[1] * ct[1] * e->R[1][c] + e->S[2] * ct[2] * e->R[2][c];
+              const Card *best = nullptr; float bd = 0.f;
+              for (const Card &cd : cards) { const float dx = em[0] - cd.c[0], dy = em[1] - cd.c[1], d = dx * dx + dy * dy;
+                  if (d < 1.2f * cd.h * 1.2f * cd.h && (!best || d < bd)) { best = &cd; bd = d; } }
+              if (!best || esz > 0.6f * best->h) continue;   /* eyes only, not the maze blocks beside a ghost */
+              float want[3]; for (int c = 0; c < 3; c++) want[c] = best->c[c] + 0.3f * (em[c] - best->c[c]) + 0.4f * best->h * best->up[c];
+              for (int c = 0; c < 2; c++) e->T[c] += want[c] - em[c];
+          } }
+        float R[3][3], T[3], P[16]; VPIX_Pose none;
+        eye_camera(a, none, none, R, T);
+        const float asp = win_h ? (float)win_w / win_h : 1.f;
+        /* zoom to the maze: the game's aerial window was a small picture with its own lens (the main view's left the maze a speck in
+           the middle, Bobby 11-01 screenshot). Fit the models' centres (not the cloud cards round it) with a margin for their size */
+        { std::vector<float> needs;
+          for (const VPIX_Instance &in : a.inst) {
+              if (in.backdrop) continue;
+              float d[3] = {in.T[0] - a.cam_T[0], in.T[1] - a.cam_T[1], in.T[2] - a.cam_T[2]};
+              float x = d[0] * a.cam_R[0][0] + d[1] * a.cam_R[0][1] + d[2] * a.cam_R[0][2], y = d[0] * a.cam_R[1][0] + d[1] * a.cam_R[1][1] + d[2] * a.cam_R[1][2],
+                    z = d[0] * a.cam_R[2][0] + d[1] * a.cam_R[2][1] + d[2] * a.cam_R[2][2];
+              if (y > 1.f) needs.push_back((std::max)(fabsf(x), fabsf(z) * asp) / y);
+          }
+          /* the cloud cards ringing Pac-Man's maze are ordinary models, ~3x as far out: fit what lies within 2.2x the median (the pellets
+             fill the maze evenly, so the median sits about half-way out) */
+          if (!needs.empty()) { std::sort(needs.begin(), needs.end()); const float lim = 2.2f * needs[needs.size() / 2]; float need = 0.f;
+              for (float n : needs) if (n <= lim) need = n;
+              /* and the corners of those models: the temple's wedges all have their origin in the middle, so their centres alone zoomed onto the pit (Bobby 11-01) */
+              { std::lock_guard<std::mutex> lk(mtx);
+                for (const VPIX_Instance &in : a.inst) {
+                  if (in.backdrop) continue;
+                  auto m = meshes.find(in.handle); if (m == meshes.end()) continue;
+                  auto to_need = [&](const float *w) { const float d[3] = {w[0] - a.cam_T[0], w[1] - a.cam_T[1], w[2] - a.cam_T[2]};
+                      const float x = d[0] * a.cam_R[0][0] + d[1] * a.cam_R[0][1] + d[2] * a.cam_R[0][2], y = d[0] * a.cam_R[1][0] + d[1] * a.cam_R[1][1] + d[2] * a.cam_R[1][2],
+                                  z = d[0] * a.cam_R[2][0] + d[1] * a.cam_R[2][1] + d[2] * a.cam_R[2][2];
+                      return y > 1.f ? (std::max)(fabsf(x), fabsf(z) * asp) / y : 0.f; };
+                  if (to_need(in.T) > lim) continue;
+                  const std::vector<float> &v = m->second->v;
+                  for (size_t i = 0; i + 2 < v.size(); i += 3) {
+                      float w[3]; for (int c = 0; c < 3; c++) w[c] = in.T[c] + in.S[0] * v[i] * in.R[0][c] + in.S[1] * v[i + 1] * in.R[1][c] + in.S[2] * v[i + 2] * in.R[2][c];
+                      need = (std::max)(need, to_need(w)); }
+                } }
+              if (need > 0.f) a.fov_deg = 2.f * atanf(need * 1.12f) * 57.29578f; } }
+        frustum(a.fov_deg, asp, P);
+        bool fb = rev_z && win_w > 0 && win_h > 0;
+        if (fb && (desk_w != win_w || desk_h != win_h)) {
+            free_fb(desk_fb); desk_w = win_w; desk_h = win_h;
+            if (!make_eye_fb(desk_fb, desk_w, desk_h)) { rl("desktop depth FBO failed"); free_fb(desk_fb); }
+        }
+        fb = fb && desk_fb.fbo;
+        glBindFramebuffer_(GL_FRAMEBUFFER, fb ? desk_fb.fbo : 0);
+        glViewport(0, 0, win_w, win_h);
+        { std::lock_guard<std::mutex> lk(mtx); draw_scene(a, P, R, T, win_w, win_h); draw_sprites(a, R, T); }
+        if (fb) {
+            glBindFramebuffer_(GL_READ_FRAMEBUFFER, desk_fb.fbo); glBindFramebuffer_(GL_DRAW_FRAMEBUFFER, 0);
+            glBlitFramebuffer_(0, 0, desk_w, desk_h, 0, 0, win_w, win_h, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+        }
+        glBindFramebuffer_(GL_FRAMEBUFFER, 0);
+    };
+    EyeFB sbs_fb[2]; int sbs_rw = 0, sbs_rh = 0; bool sbs_ok = sbs && load_fbo();   /* VPIX_SBS: one target per eye */
+    if (sbs && !sbs_ok) rl("SBS: no FBO support, flat window instead");
 
     /* ---- SteamVR ---- */
     vr::IVRSystem *sys = NULL;
@@ -2246,6 +2990,16 @@ static void thread_main() {
     vr::TrackedDevicePose_t poses[vr::k_unMaxTrackedDeviceCount];
     bool pad_was = false, menu_was = false, vr_start = false, lpad_was = false, lgrip_was = false, lturn_was = false, rpad_was = false, right_stick = false, aim_was = false, reach_was = false; int vr_coins = 0;
     load_settings();
+    SbsAdj sa = sbs_env_adj(); int sbs_cur = sbs; bool sbs_help = false; double sbs_show = sbs ? 8.0 : 0.0; GLuint sbs_font = 0;
+    if (settings.count("sbs_ipd")) sa.ipd = settings["sbs_ipd"];
+    if (settings.count("sbs_zoom")) sa.zoom = settings["sbs_zoom"];
+    if (settings.count("sbs_sep")) sa.sep = settings["sbs_sep"];
+    if (settings.count("sbs_vy")) sa.vy = settings["sbs_vy"];
+    if (settings.count("sbs_detail")) sa.detail = settings["sbs_detail"];
+    if (settings.count("sbs_swap")) sa.swap = settings["sbs_swap"] != 0;
+    if (settings.count("sbs_hud")) hud_m_live = settings["sbs_hud"];
+    if (sbs) rl("SBS adjust: eyes %.0f mm, size %.0f%%, spacing %+.0f px, height %+.0f px, detail %.0f%%, swap %d, 2D depth %.1f m",
+                sa.ipd, sa.zoom * 100, sa.sep, sa.vy, sa.detail * 100, sa.swap ? 1 : 0, hud_stereo_m());
     unsigned long long vr_frames = 0;
     double since_start = 0;
     while (running) {
@@ -2262,7 +3016,10 @@ static void thread_main() {
             vr::VRCompositor()->WaitGetPoses(poses, vr::k_unMaxTrackedDeviceCount, NULL, 0);
             /* the gun hand: right-hand controller, else any controller */
             vr::TrackedDeviceIndex_t ci = sys->GetTrackedDeviceIndexForControllerRole(vr::TrackedControllerRole_RightHand);
-            if (ci == vr::k_unTrackedDeviceIndexInvalid || !poses[ci].bPoseIsValid)
+            /* only with no right-hand controller at all does any controller stand in. A right controller that just lost tracking
+               for a moment keeps it (its last pose is held below): falling back then took the LEFT controller as the right hand
+               (Bobby 10-28: "at one point my right arm became my left tracking wise", and the left arm vanished with it) */
+            if (ci == vr::k_unTrackedDeviceIndexInvalid)
                 for (vr::TrackedDeviceIndex_t i = 1; i < vr::k_unMaxTrackedDeviceCount; i++)
                     if (sys->GetTrackedDeviceClass(i) == vr::TrackedDeviceClass_Controller && poses[i].bPoseIsValid) { ci = i; break; }
             uint32_t btn = 0;
@@ -2281,7 +3038,7 @@ static void thread_main() {
                     a.aimpad[0] = a.lmove[0]; a.aimpad[1] = a.lmove[1]; a.reach = true; a.reachpad[0] = a.rmove[0]; a.reachpad[1] = a.rmove[1];
                     a.lmove[0] = a.lmove[1] = a.rmove[0] = a.rmove[1] = 0.f;
                 }
-                input.throttle = a.thr; input.brake = a.brk; input.top = a.top; input.b2 = a.crouch;
+                input.throttle = a.thr; input.brake = a.brk; input.top = a.top; input.b2 = a.crouch; input.fire2 = a.mode;
                 haptics_play();
                 if (a.fire) btn |= VPIX_BTN_TRIGGER;
                 /* Boxing special move ('when your special move bar is full and flashing, get in range and press both buttons' - its
@@ -2293,7 +3050,24 @@ static void thread_main() {
                    right grip / right stick click / left trigger */
                 static const bool top_btns = getenv("VPIX_TOP_BUTTONS") && atoi(getenv("VPIX_TOP_BUTTONS"));
                 static const bool thumb_b = getenv("VPIX_THUMB_ON_B") && atoi(getenv("VPIX_THUMB_ON_B"));
-                if (top_btns && (a.top || a.mode)) btn |= VPIX_BTN_WALK;
+                /* VPIX_DUAL_GUN (Phantom Freight): the left trigger is the left gun, not a top button */
+                static const bool dual_gun_in = getenv("VPIX_DUAL_GUN") && atof(getenv("VPIX_DUAL_GUN")) > 0;
+                /* VPIX_JUMP (Ghost Train Hunted, dev): the left trigger hops the cart instead of moving it (the right grip / stick click still
+                   move); with VPIX_DUAL_GUN the left trigger is the left gun, so the hop is on B (the crouch button) */
+                static const bool jump_in = getenv("VPIX_JUMP") && atoi(getenv("VPIX_JUMP"));
+                input.jump = jump_in && (dual_gun_in ? a.crouch : a.mode);
+                /* VPIX_MOVE_STICK=1 (Phantom Freight, Bobby 10-27: "make sure the press button to move works, it was stuck on, we need to be
+                   able to slow down"): the right grip registers while just holding an Index controller, so the top button (move) never let
+                   go. Move = the right stick pushed up or down (Bobby: "right stick push up down or in ... unless there is conflict"), let
+                   go = the cart brakes, so a rider can stop anywhere; the grips don't move it. Not the stick click: on Index it is the
+                   'mode' action = the left gun's trigger. A stays the jump (with VPIX_DUAL_GUN) */
+                static const bool move_stick = getenv("VPIX_MOVE_STICK") && atoi(getenv("VPIX_MOVE_STICK"));
+                /* VPIX_LTRIG_MOVE=1 (Phantom Freight with the sword in the left hand, Bobby 10-29: "the left trigger is making the gun shoot so
+                   lets just make left trigger be move foward"): the left trigger moves the cart too (the HLE stops it firing) */
+                static const bool ltrig_move = getenv("VPIX_LTRIG_MOVE") && atoi(getenv("VPIX_LTRIG_MOVE"));
+                if (ltrig_move && a.mode) btn |= VPIX_BTN_WALK;
+                if (move_stick) { if (fabsf(a.rmove[1]) > 0.4f) btn |= VPIX_BTN_WALK; }
+                else if (top_btns && (a.top || (a.mode && !dual_gun_in && !jump_in))) btn |= VPIX_BTN_WALK;
                 /* VPIX_LTRIG_THUMB (Zero Hour: reload = the rifle's thumb button): left trigger only - the right grip registers while just holding
                    an Index controller, so TopButtons reloaded non-stop in VR (Bobby 10-18 'reload was auto in vr') */
                 static const bool ltrig_thumb = getenv("VPIX_LTRIG_THUMB") && atoi(getenv("VPIX_LTRIG_THUMB"));
@@ -2309,9 +3083,9 @@ static void thread_main() {
                 float rx = a.rmove[0], ry = a.rmove[1], lsx = a.lmove[0], lsy = a.lmove[1];
                 if (joy_axes()) {                          /* the sticks are the pod joystick's axes; click = top button */
                     if (a.walk) btn |= VPIX_BTN_WALK;
-                    joy_in[0] = fabsf(lsx) >= fabsf(rx) ? lsx : rx; joy_in[1] = fabsf(lsy) >= fabsf(ry) ? lsy : ry;
+                    joy_in[0] = fabsf(lsx) >= fabsf(rx) || stick_turn() ? lsx : rx; joy_in[1] = fabsf(lsy) >= fabsf(ry) ? lsy : ry;
                     for (float &v : joy_in) v = fabsf(v) < 0.15f ? 0.f : v;
-                    rx = ry = 0;                             /* no stick turning */
+                    if (!stick_turn()) rx = 0; ry = 0;       /* no stick turning (VPIX_STICK_TURN: the right stick's left/right turns) */
                 } else
                 if (lean_mm() > 0) {                       /* lean games: both sticks lean; stick click = the top button */
                     if (a.walk) btn |= VPIX_BTN_WALK;
@@ -2479,8 +3253,28 @@ static void thread_main() {
             stick_twist(input.hand);
             {   /* the left controller as a second hand (VPIX_TWO_HANDS, Boxing: either hand punches) */
                 vr::TrackedDeviceIndex_t li = sys->GetTrackedDeviceIndexForControllerRole(vr::TrackedControllerRole_LeftHand);
-                input.hand2 = (li != vr::k_unTrackedDeviceIndexInvalid && li != ci && poses[li].bPoseIsValid)
-                            ? vr_to_pose(poses[li].mDeviceToAbsoluteTracking) : VPIX_Pose();
+                /* no left-hand role (ride 5 log: "left controller LOST (role index -1, right 3)" from the start and never back, Bobby
+                   10-28: "the left arm ... keeps just going away"): SteamVR can leave a controller without a hand role; then the other
+                   tracked controller that isn't the right hand is the left */
+                if (li == vr::k_unTrackedDeviceIndexInvalid)
+                    for (vr::TrackedDeviceIndex_t i = 1; i < vr::k_unMaxTrackedDeviceCount; i++)
+                        if (i != ci && sys->GetTrackedDeviceClass(i) == vr::TrackedDeviceClass_Controller && poses[i].bPoseIsValid) { li = i; break; }
+                /* a short tracking dropout (under 1 s) keeps the last pose instead of hiding the hand (the left arm "disappearing at
+                   times", Bobby 10-28) */
+                static VPIX_Pose last2; static double last2_t = -10.0; static double now_t = 0.0; now_t += dt;
+                if (li != vr::k_unTrackedDeviceIndexInvalid && li != ci && poses[li].bPoseIsValid) { input.hand2 = vr_to_pose(poses[li].mDeviceToAbsoluteTracking); last2 = input.hand2; last2_t = now_t; }
+                else input.hand2 = (li != vr::k_unTrackedDeviceIndexInvalid && li != ci && now_t - last2_t < 12.0) ? last2 : VPIX_Pose();   /* 12 s (10-29 log: the left controller itself drops its pose ~10 s at a time) */
+                /* 3 s now (ride 3, Bobby 10-28: the sword arm "at times it disapears"; held low at the side the controller can drop
+                   out of the base stations' view for longer than 1 s). Logged, to see next ride whether it is that. */
+                {   /* dev: every SteamVR device every 10 s, 30 times (the left hand that keeps going away, Bobby 10-29) */
+                    static double next_dev = 2.0; static int ndev = 0;
+                    if (now_t > next_dev && ndev < 30) { next_dev = now_t + 10.0; ndev++; std::string ds;
+                        for (vr::TrackedDeviceIndex_t i = 0; i < 16; i++) { const int cl = (int)sys->GetTrackedDeviceClass(i); if (!cl) continue;
+                            char b[64]; snprintf(b, sizeof(b), " [%u cls %d role %d %s%s]", (unsigned)i, cl, (int)sys->GetControllerRoleForTrackedDeviceIndex(i),
+                                                 poses[i].bPoseIsValid ? "pose" : "nopose", sys->IsTrackedDeviceConnected(i) ? "" : " off"); ds += b; }
+                        rl("VR devices t=%.0f:%s (left role -> %d, right -> %d)", now_t, ds.c_str(), (int)li, (int)ci); } }
+                static bool was2 = true; static int nlost = 0; const bool real2 = li != vr::k_unTrackedDeviceIndexInvalid && li != ci && poses[li].bPoseIsValid;
+                if (real2 != was2) { was2 = real2; if (nlost < 40) { nlost++; rl("left controller %s (role index %d, right %d)", real2 ? "tracked" : "LOST", (int)li, (int)ci); } }
             }
             input.buttons = btn; input.coins = vr_coins; input.start = vr_start; input.vr = true; input.gun_pitch = gun_pitch; input.hand_reach = hand_reach; input.hand_zr = hand_zr; input.punch_gain = punch_gain; input.spread_mm = spread_mm; input.gun_dx = gun_dx; input.gun_dz = gun_dz; input.gun_dy = gun_dy; input.aim_mode = aim_mode;
             input.crouch_mm = crouch_now;
@@ -2493,15 +3287,26 @@ static void thread_main() {
             head_now = desk_head; eye_pose[0] = desk_head;
         }
 
+        rq_apply();
         {
-            std::lock_guard<std::mutex> lk(mtx);
-            if (have_pending) { cur = pending; have_pending = false; have = true;
+            std::lock_guard<std::mutex> lk(pend_mtx);
+            if (have_pending) { std::swap(cur, pending); have_pending = false; have = true;
                 static unsigned long nfl = 0; if (getenv("VPIX_FRAMELOG") && nfl++ % 300 == 0)
                     rl("frame %lu inst %u blits %u in_head %d camT=(%.0f %.0f %.0f)", cur.frame, (unsigned)cur.inst.size(), (unsigned)cur.blits.size(), cur.in_head ? 1 : 0, cur.cam_T[0], cur.cam_T[1], cur.cam_T[2]); }
         }
+        {   /* VPIX_RATELOG=1 (dev): draws and game frames per second, every 5 s (Pac-Man VR felt slow while the game held 60) */
+            static const bool ratelog = getenv("VPIX_RATELOG") && atoi(getenv("VPIX_RATELOG"));
+            static unsigned long draws = 0, f0 = 0; static ULONGLONG t0 = 0; draws++;
+            if (ratelog) { ULONGLONG t = GetTickCount64(); if (!t0) { t0 = t; f0 = cur.frame; }
+                if (t - t0 >= 5000) { rl("rate: %.1f draws/s, game %.1f frames/s", draws * 1000.0 / (t - t0), (cur.frame - f0) * 1000.0 / (t - t0)); t0 = t; draws = 0; f0 = cur.frame; } }
+        }
         if (have) hold_update(cur, input.hand);           /* VPIX_HOLD_VIEW: frozen game camera (round over) */
         const VPIX_Frame &vf0 = have ? hold_apply(cur) : cur;   /* only this thread writes input */
-        const VPIX_Frame &vf = (have && sys) ? glove_apply(vf0, head_now, input.hand, input.hand2) : vf0;   /* VPIX_BOX_GLOVE_TRACK */
+        const VPIX_Frame &vf1 = (have && sys) ? glove_apply(vf0, head_now, input.hand, input.hand2) : vf0;   /* VPIX_BOX_GLOVE_TRACK */
+        const VPIX_Frame &vf = have ? dual_guns_apply(vf1, head_now, input.hand, input.hand2, input.gun_pitch) : vf1;   /* VPIX_DUAL_GUN_MODEL */
+        if (!aer_init) { aer_init = true; aer_on = sys != nullptr || (getenv("VPIX_AERIAL_WIN") && atoi(getenv("VPIX_AERIAL_WIN"))); }   /* VPIX_AERIAL_WIN=1 (dev): the window starts on it */
+        { const bool k = focused() && (GetAsyncKeyState('V') & 0x8000) != 0;
+          if (k && !aer_vwas && vf.aer) { aer_on = !aer_on; rl("window view: %s (V)", aer_on ? "spectator (game's aerial camera)" : "player"); } aer_vwas = k; }
         if (sys) {
             for (int e = 0; e < 2; e++) {
                 glBindFramebuffer_(GL_FRAMEBUFFER, eyes[e].fbo);
@@ -2512,14 +3317,23 @@ static void thread_main() {
                 if (have) {
                     float R[3][3], T[3];
                     eye_camera(vf, eye_pose[e], head_now, R, T);
+                    if (hud_stereo_m() > 0.f) {   /* VPIX_HUD_STEREO: head centre = between the two eye cameras; its offset in this eye's GL coords */
+                        float R2[3][3], T2[3]; eye_camera(vf, eye_pose[1 - e], head_now, R2, T2);
+                        static const float C[3][3] = {{1, 0, 0}, {0, 0, 1}, {0, -1, 0}};
+                        float d[3], CR[3][3]; for (int i = 0; i < 3; i++) d[i] = 0.5f * (T2[i] - T[i]);
+                        mat_mul3(C, R, CR); for (int i = 0; i < 3; i++) hud_off[i] = CR[i][0] * d[0] + CR[i][1] * d[1] + CR[i][2] * d[2];
+                    }
                     std::lock_guard<std::mutex> lk(mtx);       /* meshes/textures may be added meanwhile */
                     draw_scene(vf, P, R, T, ew, eh);
                     draw_sprites(vf, R, T);
                     draw_static(vf, P);
                     draw_flic(vf, P);
                     draw_blits(vf, P);
+                    draw_sprites(vf, R, T, 2); glDepthFunc(rev_z ? GL_GEQUAL : GL_LEQUAL);   /* MallVR titles on top */
                 } else { glViewport(0, 0, ew, eh); glClearColor(0, 0, 0, 1); glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT); }
                 draw_splash(P, splash_a);
+                if (e == 0 && shot && have && GetTickCount64() >= next_shot) {   /* VPIX_SHOT: the left eye too, as the headset shows it */
+                    char p[512]; snprintf(p, sizeof(p), "%s%03d_eye.bmp", shot, shot_no); save_bmp(p, ew, eh); }
                 glBindFramebuffer_(GL_FRAMEBUFFER, 0);
                 vr::Texture_t tx = {(void *)(uintptr_t)eyes[e].tex, vr::TextureType_OpenGL, vr::ColorSpace_Gamma};
                 vr::EVRCompositorError ce = vr::VRCompositor()->Submit((vr::EVREye)e, &tx);
@@ -2527,6 +3341,7 @@ static void thread_main() {
             }
             glFlush();
             /* mirror the left eye, letterboxed into the window (the spectator view replaces it) */
+            if (!spect && aer_on && have && vf.aer) draw_aerial(vf); else
             if (!spect) {
             glBindFramebuffer_(GL_READ_FRAMEBUFFER, eyes[0].fbo); glBindFramebuffer_(GL_DRAW_FRAMEBUFFER, 0);
             glViewport(0, 0, win_w, win_h); glClearColor(0, 0, 0, 1); glClear(GL_COLOR_BUFFER_BIT);
@@ -2536,6 +3351,134 @@ static void thread_main() {
             glBindFramebuffer_(GL_FRAMEBUFFER, 0);
             }
             vr_frames++;
+        } else if (have && sbs_ok) {
+            /* VPIX_SBS: each eye rendered at the game's 4:3 into its own target, then placed in its half of the window */
+            if (focused()) {                            /* the adjust keys (one step per press), saved at once */
+                static bool was[13] = {};
+                static const int K[13] = {VK_F1, VK_F2, VK_F3, VK_F4, VK_F5, VK_F6, VK_F7, VK_F8, VK_F9, VK_F10, VK_F11, VK_F12, VK_NEXT};
+                bool any = false;
+                for (int i = 0; i < 13; i++) {
+                    const bool d = (GetAsyncKeyState(K[i]) & 0x8000) != 0, hit = d && !was[i]; was[i] = d;
+                    if (!hit) continue;
+                    any = true;
+                    switch (i) {
+                    case 0: sbs_help = !sbs_help; break;
+                    case 1: sa.ipd = (std::max)(0.f, sa.ipd - 4.f); break;
+                    case 2: sa.ipd = (std::min)(200.f, sa.ipd + 4.f); break;
+                    case 3: sa.zoom = (std::max)(0.4f, sa.zoom - 0.05f); break;
+                    case 4: sa.zoom = (std::min)(1.f, sa.zoom + 0.05f); break;
+                    case 5: sa.sep -= 4.f; break;
+                    case 6: sa.sep += 4.f; break;
+                    case 7: sa.vy -= 4.f; break;
+                    case 8: sa.vy += 4.f; break;
+                    case 9: sa.swap = !sa.swap; break;
+                    case 10: sbs_cur = sbs_cur == 2 ? 1 : 2; break;
+                    case 11: { static const float st[5] = {0.f, 1.f, 1.5f, 2.5f, 4.f}; int k = 0; while (k < 5 && st[k] <= hud_stereo_m() + 0.01f) k++; hud_m_live = st[k % 5]; break; }
+                    case 12: if (mons.size() > 1) {     /* next display: the window takes its size */
+                                 mon_i = (mon_i + 1) % (int)mons.size(); const RECT &m = mons[mon_i];
+                                 sbs_h = m.bottom - m.top;
+                                 SetWindowPos(hw, HWND_TOPMOST, m.left, m.top, m.right - m.left, sbs_h + 1, SWP_SHOWWINDOW);
+                                 rl("SBS: moved to display %d (%ld, %ld) %ld x %d", mon_i + 1, m.left, m.top, m.right - m.left, sbs_h);
+                             } break;
+                    }
+                }
+                { static bool pu = false, hm = false; const bool u = (GetAsyncKeyState(VK_PRIOR) & 0x8000) != 0, h = (GetAsyncKeyState(VK_HOME) & 0x8000) != 0;
+                  if (u && !pu) { sa.detail = sa.detail > 0.9f ? 0.75f : sa.detail > 0.6f ? 0.5f : 1.f; any = true; }   /* render detail: slow PCs */
+                  if (h && !hm) { sa = sbs_env_adj(); hud_m_live = -1.f; sbs_cur = sbs; any = true; }                      /* everything back to the start values */
+                  pu = u; hm = h; }
+                if (any) {
+                    sbs_show = 4.0;
+                    settings["sbs_ipd"] = sa.ipd; settings["sbs_zoom"] = sa.zoom; settings["sbs_sep"] = sa.sep; settings["sbs_vy"] = sa.vy;
+                    settings["sbs_detail"] = sa.detail; settings["sbs_swap"] = sa.swap ? 1.f : 0.f; settings["sbs_hud"] = hud_stereo_m();
+                    save_settings();
+                    rl("SBS adjust: %s, eyes %.0f mm, size %.0f%%, spacing %+.0f px, height %+.0f px, detail %.0f%%, swap %d, 2D depth %.1f m", sbs_cur == 2 ? "half" : "full",
+                       sa.ipd, sa.zoom * 100, sa.sep, sa.vy, sa.detail * 100, sa.swap ? 1 : 0, hud_stereo_m());
+                }
+            }
+            if (sbs_show > 0) sbs_show -= dt;
+            const int half = win_w / 2, H = (std::min)(win_h, sbs_h), y0 = win_h - H;   /* the popup's spare row is the bottom one */
+            const float A = screen_aspect;
+            int dw, dh;                                 /* the eye's picture in the window */
+            if (sbs_cur == 2) { dh = H; dw = (int)(H * A / 2 + 0.5f); if (dw > half) { dw = half; dh = (int)(2 * half / A + 0.5f); } }
+            else { dw = half; dh = (int)(half / A + 0.5f); if (dh > H) { dh = H; dw = (int)(H * A + 0.5f); } }
+            dw = (int)(dw * sa.zoom + 0.5f); dh = (int)(dh * sa.zoom + 0.5f);
+            /* half: rendered at the shown 4:3, the blit squeezes it; detail < 1 renders fewer pixels and the blit scales them up */
+            const int rw = (std::max)(64, (int)((sbs_cur == 2 ? 2 * dw : dw) * sa.detail + 0.5f)), rh = (std::max)(48, (int)(dh * sa.detail + 0.5f));
+            if (rw != sbs_rw || rh != sbs_rh) {
+                for (int e = 0; e < 2; e++) { free_fb(sbs_fb[e]); if (!make_eye_fb(sbs_fb[e], rw, rh)) rl("SBS eye target %d failed", e); }
+                sbs_rw = rw; sbs_rh = rh; rl("SBS eyes %d x %d, shown %d x %d in each %d x %d half", rw, rh, dw, dh, half, H);
+            }
+            if (!sbs_font) {                            /* the readout's letters: the window's GDI font as GL display lists */
+                sbs_font = glGenLists(96);
+                HFONT fnt = CreateFontA(-26, 0, 0, 0, FW_BOLD, 0, 0, 0, ANSI_CHARSET, 0, 0, NONANTIALIASED_QUALITY, 0, "Arial");
+                HGDIOBJ old = SelectObject(dc, fnt); wglUseFontBitmapsA(dc, 32, 96, sbs_font); SelectObject(dc, old); DeleteObject(fnt);
+            }
+            const float ipd = sa.ipd;
+            float P[16], R[2][3][3], T[2][3];
+            frustum(vf.fov_deg, A, P);
+            for (int e = 0; e < 2; e++) {               /* eye = the head moved half the eye distance along its own right axis */
+                VPIX_Pose ep = eye_pose[0]; const float o = (e ? 0.5f : -0.5f) * ipd;
+                for (int k = 0; k < 3; k++) ep.p[k] += o * ep.R[0][k];
+                desk_view = true; eye_camera(vf, ep, head_now, R[e], T[e]); desk_view = false;
+            }
+            std::lock_guard<std::mutex> lk(mtx);
+            for (int e = 0; e < 2; e++) {
+                if (hud_stereo_m() > 0.f) {             /* VPIX_HUD_STEREO: as in the headset, the 2D layer sits at a depth from the head centre */
+                    static const float C[3][3] = {{1, 0, 0}, {0, 0, 1}, {0, -1, 0}};
+                    float d[3], CR[3][3]; for (int i = 0; i < 3; i++) d[i] = 0.5f * (T[1 - e][i] - T[e][i]);
+                    mat_mul3(C, R[e], CR); for (int i = 0; i < 3; i++) hud_off[i] = CR[i][0] * d[0] + CR[i][1] * d[1] + CR[i][2] * d[2];
+                }
+                glBindFramebuffer_(GL_FRAMEBUFFER, sbs_fb[e].fbo);
+                draw_scene(vf, P, R[e], T[e], rw, rh);
+                draw_sprites(vf, R[e], T[e]);
+                draw_static(vf, P);
+                draw_flic(vf, P);
+                draw_blits(vf, P);
+                draw_sprites(vf, R[e], T[e], 2); glDepthFunc(rev_z ? GL_GEQUAL : GL_LEQUAL);   /* MallVR titles on top */
+                draw_desk_dot(vf, P);
+                draw_splash(P, splash_a);
+            }
+            hud_off[0] = hud_off[1] = hud_off[2] = 0.f;
+            glBindFramebuffer_(GL_FRAMEBUFFER, 0);
+            glViewport(0, 0, win_w, win_h); glClearColor(0, 0, 0, 1); glClear(GL_COLOR_BUFFER_BIT);
+            for (int e = 0; e < 2; e++) {               /* half e shows eye e (F10: the other); spacing moves the pictures apart / together */
+                const int x0 = e * half + (half - dw) / 2 + (int)(e ? sa.sep : -sa.sep), y1 = y0 + (H - dh) / 2 + (int)sa.vy;
+                glBindFramebuffer_(GL_READ_FRAMEBUFFER, sbs_fb[sa.swap ? 1 - e : e].fbo); glBindFramebuffer_(GL_DRAW_FRAMEBUFFER, 0);
+                glBlitFramebuffer_(0, 0, rw, rh, x0, y1, x0 + dw, y1 + dh, GL_COLOR_BUFFER_BIT, (sbs_cur == 2 || rw != dw) ? GL_LINEAR : GL_NEAREST);
+            }
+            glBindFramebuffer_(GL_FRAMEBUFFER, 0);
+            if (sbs_help || sbs_show > 0) {             /* readout, window pixels: the same place in both halves (reads as far away) */
+                char ln[12][96]; int n = 0;
+                snprintf(ln[n++], 96, "MALLVR 3D: %s   (F11 SBS / HALF-SBS)", sbs_cur == 2 ? "HALF-SBS" : "SBS");
+                snprintf(ln[n++], 96, "EYE DISTANCE %.0f MM   F2 - / F3 +", sa.ipd);
+                snprintf(ln[n++], 96, "PICTURE SIZE %.0f%%   F4 - / F5 +", sa.zoom * 100);
+                snprintf(ln[n++], 96, "LENS SPACING %+.0f   F6 CLOSER / F7 APART", sa.sep);
+                snprintf(ln[n++], 96, "HEIGHT %+.0f   F8 DOWN / F9 UP", sa.vy);
+                snprintf(ln[n++], 96, "EYES %s   F10 SWAP", sa.swap ? "SWAPPED" : "NORMAL");
+                if (hud_stereo_m() > 0.f) snprintf(ln[n++], 96, "TEXT DEPTH %.1f M   F12", hud_stereo_m()); else snprintf(ln[n++], 96, "TEXT DEPTH FLAT   F12");
+                snprintf(ln[n++], 96, "DETAIL %.0f%%   PAGE UP (LOWER = FASTER)", sa.detail * 100);
+                snprintf(ln[n++], 96, "NEXT SCREEN   PAGE DOWN");
+                snprintf(ln[n++], 96, "RESET   HOME     HIDE   F1     QUIT   ESC");
+                glViewport(0, 0, win_w, win_h);
+                glMatrixMode(GL_PROJECTION); glLoadIdentity(); glOrtho(0, win_w, 0, win_h, -1, 1);
+                glMatrixMode(GL_MODELVIEW); glLoadIdentity();
+                glDisable(GL_DEPTH_TEST); glDisable(GL_TEXTURE_2D); glDisable(GL_FOG); glDisable(GL_LIGHTING); glDisable(GL_ALPHA_TEST); glDisable(GL_CULL_FACE);
+                const float lh = 30.f, bw = (float)half - 60.f, top = y0 + H * 0.5f + n * lh * 0.5f;
+                for (int e = 0; e < 2; e++) {
+                    const float bx = e * half + (half - bw) * 0.5f;
+                    glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+                    glColor4f(0, 0, 0, 0.75f); glRectf(bx, top - n * lh - 10.f, bx + bw, top + 8.f);
+                    glDisable(GL_BLEND);
+                    for (int i = 0; i < n; i++) {
+                        if (i == 0) glColor3f(1.f, 0.85f, 0.f); else glColor3f(1.f, 1.f, 1.f);
+                        glRasterPos2f(bx + 14.f, top - (i + 1) * lh + 6.f); glListBase(sbs_font - 32); glCallLists((GLsizei)strlen(ln[i]), GL_UNSIGNED_BYTE, ln[i]);
+                    }
+                }
+                glEnable(GL_DEPTH_TEST);
+            }
+            glBindFramebuffer_(GL_FRAMEBUFFER, 0);
+        } else if (have && aer_on && vf.aer) {
+            draw_aerial(vf);
         } else if (have) {
             float R[3][3], T[3], P[16];
             desk_view = true; eye_camera(vf, eye_pose[0], head_now, R, T); desk_view = false;
@@ -2558,6 +3501,7 @@ static void thread_main() {
             draw_static(vf, P);
             draw_flic(vf, P);
             draw_blits(vf, P);
+            draw_sprites(vf, R, T, 2); glDepthFunc(rev_z ? GL_GEQUAL : GL_LEQUAL);   /* MallVR titles on top */
             draw_desk_dot(vf, P);
             draw_ref_view(win_w, win_h);
             draw_splash(P, splash_a);
@@ -2596,7 +3540,7 @@ static void thread_main() {
             glBlitFramebuffer_(0, 0, spec_w, spec_h, 0, 0, win_w, win_h, GL_COLOR_BUFFER_BIT, GL_LINEAR);
             glBindFramebuffer_(GL_FRAMEBUFFER, 0);
         }
-        if (shot && have && GetTickCount64() >= next_shot) {
+        if (shot && have && (GetTickCount64() >= next_shot || bot_shot_now.exchange(false))) {
             char p[512]; snprintf(p, sizeof(p), "%s%03d_f%lu.bmp", shot, shot_no++, cur.frame);
             static const unsigned long long shot_ms = getenv("VPIX_SHOT_MS") ? strtoull(getenv("VPIX_SHOT_MS"), NULL, 10) : 5000;   /* dev: shot interval */
             save_bmp(p); next_shot = GetTickCount64() + shot_ms;
@@ -2626,12 +3570,11 @@ float VPIX_Render_ModelMinZ(uint32_t handle, const float R[3][3], const float S[
 bool VPIX_Render_AddModel(uint32_t handle, const uint8_t *data, size_t len) {
     Mesh *m = parse_bin(data, len);
     if (!m) return false;
-    std::lock_guard<std::mutex> lk(mtx);
-    meshes[handle].reset(m);
+    std::shared_ptr<Mesh> sp(m); rq_push([handle, sp] { meshes[handle] = sp; });
     return true;
 }
 
-bool VPIX_Render_AddMesh(uint32_t handle, const std::vector<float> &verts, const std::vector<VPIX_MeshPoly> &polys) {
+static Mesh *make_mesh(const std::vector<float> &verts, const std::vector<VPIX_MeshPoly> &polys) {
     Mesh *m = new Mesh();
     m->v = verts;
     for (const VPIX_MeshPoly &q : polys) {
@@ -2642,14 +3585,26 @@ bool VPIX_Render_AddMesh(uint32_t handle, const std::vector<float> &verts, const
         for (int i = 0; i < q.n; i++) { p.idx[i] = q.idx[i]; p.vcol[i] = q.vcol[i]; p.uv[i][0] = q.uv[i][0]; p.uv[i][1] = q.uv[i][1]; if ((size_t)q.idx[i] * 3 + 2 >= verts.size()) ok = false; }
         if (ok) m->p.push_back(p);
     }
-    if (m->p.empty()) { delete m; return false; }
+    if (m->p.empty()) { delete m; return nullptr; }
     if (decal_stack()) stack_decals(m, decal_gap());
-    std::lock_guard<std::mutex> lk(mtx);
-    meshes[handle].reset(m);
+    return m;
+}
+bool VPIX_Render_AddMesh(uint32_t handle, const std::vector<float> &verts, const std::vector<VPIX_MeshPoly> &polys) {
+    Mesh *m = make_mesh(verts, polys); if (!m) return false;
+    std::shared_ptr<Mesh> sp(m); rq_push([handle, sp] { meshes[handle] = sp; });
     return true;
 }
 
+/* a HIRES mesh (one texture, uv per corner): drawn from a GL display list, see the draw loop */
+bool VPIX_Render_AddMeshHires(uint32_t handle, const std::vector<float> &verts, const std::vector<VPIX_MeshPoly> &polys) {
+    Mesh *m = make_mesh(verts, polys); if (!m) return false;
+    static const bool slow = getenv("VPIX_HIRES_SLOW") && atoi(getenv("VPIX_HIRES_SLOW"));   /* dev: the old per-polygon path, to compare */
+    if (!slow) { m->hires = true; m->layers = 1; }
+    std::shared_ptr<Mesh> sp(m); rq_push([handle, sp] { meshes[handle] = sp; });
+    return true;
+}
 void VPIX_Render_ModelName(uint32_t handle, const char *file) {
+    if (getenv("VPIX_BAKE") && file) { std::lock_guard<std::mutex> lk(mtx); bake_names[handle] = file; }
     (void)handle; (void)file;
 }
 
@@ -2658,8 +3613,7 @@ bool VPIX_Render_AddTexture(uint32_t handle, const uint8_t *data, size_t len) {
     if (!t) return false;
     { size_t blue = 0; for (uint32_t v : t->rgba) if (v == 0xFFFF0000u) blue++;
       rl("texture %08X %dx%d blue=%u", handle, t->w, t->h, (unsigned)blue); }
-    std::lock_guard<std::mutex> lk(mtx);
-    textures[handle].reset(t);
+    std::shared_ptr<Tex> sp(t); rq_push([handle, sp] { textures[handle] = sp; });
     return true;
 }
 
@@ -2668,21 +3622,23 @@ bool VPIX_Render_AddTextureRGBA(uint32_t handle, int w, int h, const uint32_t *r
     Tex *t = new Tex(); t->w = w; t->h = h; t->rgba.assign(rgba, rgba + (size_t)w * h);
     size_t mid = 0; for (uint32_t c : t->rgba) { if (c >> 24 < 0x80) t->cut = true; if ((c >> 24) >= 0x10 && (c >> 24) < 0xF0) mid++; }
     t->soft = mid * 20 > t->rgba.size();   /* > 5% partial alpha = a real alpha channel (glow / fade), not a cut-out mask */
-    std::lock_guard<std::mutex> lk(mtx);
-    textures[handle].reset(t);
+    std::shared_ptr<Tex> sp(t); rq_push([handle, sp] { textures[handle] = sp; });
     return true;
 }
 
 /* SU3000 video textures: replace the texels in place (same size) - uploaded with glTexSubImage2D at the next draw */
-bool VPIX_Render_UpdateTextureRGBA(uint32_t handle, int w, int h, const uint32_t *rgba) {
-    std::lock_guard<std::mutex> lk(mtx);
+bool VPIX_Render_UpdateTextureRGBA(uint32_t handle, int w, int h, const uint32_t *rgba0) {
+    std::shared_ptr<std::vector<uint32_t>> px = std::make_shared<std::vector<uint32_t>>(rgba0, rgba0 + (size_t)w * h);
+    rq_push([handle, w, h, px] {
+    const uint32_t *rgba = px->data();
     auto it = textures.find(handle);
     if (it == textures.end() || !it->second || it->second->w != w || it->second->h != h) {
         Tex *t = new Tex(); t->w = w; t->h = h; t->rgba.assign(rgba, rgba + (size_t)w * h);
         textures[handle].reset(t);
-        return true;
+        return;
     }
     Tex *t = it->second.get(); memcpy(t->rgba.data(), rgba, (size_t)w * h * 4); t->cut = false; t->dirty = true;
+    });
     return true;
 }
 
@@ -2717,16 +3673,14 @@ void VPIX_PipeClose(void *pp) {
 bool VPIX_Render_AddBitmapRGBA(uint32_t handle, int w, int h, const uint32_t *rgba) {
     if (w <= 0 || h <= 0 || !rgba) return false;
     Tex *t = new Tex(); t->w = w; t->h = h; t->rgba.assign(rgba, rgba + (size_t)w * h);   /* Targa rows bottom-up = draw_blits' order */
-    std::lock_guard<std::mutex> lk(mtx);
-    bitmaps[handle].reset(t);
+    std::shared_ptr<Tex> sp(t); rq_push([handle, sp] { bitmaps[handle] = sp; });
     return true;
 }
 
 bool VPIX_Render_AddBitmap(uint32_t handle, const uint8_t *data, size_t len) {
     Tex *t = parse_vst(data, len);
     if (!t) return false;
-    std::lock_guard<std::mutex> lk(mtx);
-    bitmaps[handle].reset(t);
+    std::shared_ptr<Tex> sp(t); rq_push([handle, sp] { bitmaps[handle] = sp; });
     return true;
 }
 
@@ -2739,33 +3693,32 @@ void VPIX_Render_SetFlic(const uint32_t *rgba, int w, int h, int x, int y, bool 
 
 void VPIX_Render_SetTexture(uint32_t n, uint32_t flags, uint32_t handle, const float o[3], float su, float sv, uint32_t tflags, uint32_t mask) {
     if (n >= 0x400) return;
-    std::lock_guard<std::mutex> lk(mtx);
-    TexSlot &t = texslot[n];
-    t.flags = flags; t.handle = handle; memcpy(t.o, o, sizeof(t.o)); t.su = su; t.sv = sv; t.tflags = tflags; t.mask = mask; t.set = true;
+    const float o0 = o[0], o1 = o[1], o2 = o[2];
+    rq_push([=] { TexSlot &t = texslot[n];
+    t.flags = flags; t.handle = handle; t.o[0] = o0; t.o[1] = o1; t.o[2] = o2; t.su = su; t.sv = sv; t.tflags = tflags; t.mask = mask; t.set = true; });
     rl("texslot %X type=%08X map=%08X flags=%08X mask=%08X", n, flags, handle, tflags, mask);
 }
 
 void VPIX_Render_SetMaterial(uint32_t n, int tex, float alpha) {
     if (n >= 32) return;
-    std::lock_guard<std::mutex> lk(mtx);
-    if (mattex[n] != tex || matalpha[n] != alpha) rl("material %X tex=%X alpha=%.2f", n, tex, alpha);
-    mattex[n] = tex; matalpha[n] = alpha;
+    rq_push([=] { if (mattex[n] != tex || matalpha[n] != alpha) rl("material %X tex=%X alpha=%.2f", n, tex, alpha);
+    mattex[n] = tex; matalpha[n] = alpha; });
 }
 
 void VPIX_Render_SetMaterialColour(uint32_t n, uint32_t rgb) {
     if (n >= 32) return;
-    std::lock_guard<std::mutex> lk(mtx);
-    if (matcol[n] != rgb || !mat28) rl("material %X colour %06X (type 0x28 polygons)", n, rgb);
-    matcol[n] = rgb; mat28 = true;
+    rq_push([=] { if (matcol[n] != rgb || !mat28) rl("material %X colour %06X (type 0x28 polygons)", n, rgb);
+    matcol[n] = rgb; mat28 = true; });
 }
 
 void VPIX_Render_Submit(const VPIX_Frame &f) {
-    std::lock_guard<std::mutex> lk(mtx);
+    std::lock_guard<std::mutex> lk(pend_mtx);
     pending = f; have_pending = true;
     /* VPIX_CARD_ORDER: 2D bitmaps painted in ascending priority like the card (Olin Shotgun: score card 498, its digit 504 on top; in
        list order the card covered the digit - Bobby 10-25 "the text is behind") */
     static const bool card_order = getenv("VPIX_CARD_ORDER") && atoi(getenv("VPIX_CARD_ORDER"));
-    if (card_order) std::stable_sort(pending.blits.begin(), pending.blits.end(), [](const VPIX_Blit &a, const VPIX_Blit &b) { return a.prio < b.prio; });
+    static const bool sprite_card = getenv("VPIX_SPRITE_CARD") && atoi(getenv("VPIX_SPRITE_CARD"));   /* Olin: see draw_sprites */
+    if (card_order || sprite_card) std::stable_sort(pending.blits.begin(), pending.blits.end(), [](const VPIX_Blit &a, const VPIX_Blit &b) { return a.prio < b.prio; });
 }
 
 void VPIX_Input_Get(VPIX_Input &out) {

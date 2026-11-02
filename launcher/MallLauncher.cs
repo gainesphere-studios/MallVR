@@ -2,6 +2,7 @@
 // SU2000 pods' own operator screen (DAC BITMAPS\OPSCREEN.VST): black, bold serif capitals, yellow headings,
 // red options. Drawn at the pod's 352x288 screen size without anti-aliasing and scaled up in whole pixels.
 // launcher.ps1 compiles this once into ..\logs, shows it, runs play.ps1 with the choice, then shows it again.
+// The default look is the CYBERSPACE HALL (MallHall.cs, same 352x288 grid drawn 3x sharper); STYLE flips to this operator screen.
 using System;
 using System.Collections.Generic;
 using System.Drawing;
@@ -11,9 +12,26 @@ using System.Drawing.Text;
 using System.Text;
 using System.Windows.Forms;
 
-public class MallLauncher : Form
+public partial class MallLauncher : Form
 {
-    const int W = 352, H = 288, Rows = 7;
+    const int W = 352, H = 288, Rows = 8;
+
+    [System.Runtime.InteropServices.DllImport("user32.dll")] static extern bool ShowWindow(IntPtr h, int cmd);
+    [System.Runtime.InteropServices.DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr h);
+    [System.Runtime.InteropServices.DllImport("user32.dll")] static extern void keybd_event(byte vk, byte scan, uint flags, UIntPtr extra);
+    // Bobby 10-31: the menu came up minimized (only in the taskbar). Windows hands a new window the show state the program was
+    // started with (a minimized shortcut, a hidden PowerShell) and keeps focus from programs that aren't in front. Restore it,
+    // then a tap of Alt (Windows then allows the focus change), SetForegroundWindow, and a moment of TopMost as a fallback.
+    void ToFront()
+    {
+        try {
+            ShowWindow(Handle, 9);                                     // SW_RESTORE
+            WindowState = FormWindowState.Normal;
+            keybd_event(0x12, 0, 0, UIntPtr.Zero); keybd_event(0x12, 0, 2, UIntPtr.Zero);   // Alt down, Alt up
+            SetForegroundWindow(Handle);
+        } catch (Exception) { }
+        TopMost = true; Activate(); BringToFront(); TopMost = false;
+    }
     static readonly Color Yellow = Color.FromArgb(255, 255, 0), Red = Color.FromArgb(240, 24, 24),
         Dim = Color.FromArgb(110, 24, 24), White = Color.FromArgb(255, 255, 255), Grey = Color.FromArgb(120, 120, 120);
 
@@ -23,6 +41,7 @@ public class MallLauncher : Form
     public readonly List<int> MaxPlayers = new List<int>();   // games.ps1 MaxPlayers (linked pods; default 2)
     // the choice (also the starting state); Action = "start", "check", "update" or "quit"
     public int Game, Mode, Players, Pod = 1;      // Mode 0 headset / 1 window; Players 0 solo / 1 link this PC / 2 link network
+    public int Sbs;                               // window 3D for a head-mounted display: 0 off / 1 side-by-side / 2 half side-by-side (VPIX_SBS)
     public string Peer = "", Action = "quit";
     // online (MallOnline.cs): Net is made once by launcher.ps1; OnlinePod > 0 = start the game as that pod
     public MallOnline Net;
@@ -51,7 +70,7 @@ public class MallLauncher : Form
         small = new Font("Times New Roman", 11f, FontStyle.Bold, GraphicsUnit.Pixel),
         mono = new Font("Courier New", 13f, FontStyle.Bold, GraphicsUnit.Pixel);   // the typed address: its dots survive at this size
     readonly List<KeyValuePair<Rectangle, string>> hits = new List<KeyValuePair<Rectangle, string>>();
-    int scale = 3, blink;
+    int scale = 3, blink, ticks;
     string hover = "";
     bool editPeer;
     readonly Timer timer = new Timer();
@@ -97,9 +116,16 @@ public class MallLauncher : Form
         Rectangle s = Screen.PrimaryScreen.WorkingArea;
         scale = Math.Max(1, Math.Min((s.Width - 40) / W, (s.Height - 60) / H));
         ClientSize = new Size(W * scale, H * scale);
-        timer.Interval = 400;
+        // the .bat starts PowerShell hidden and the intro window opens first: make sure the menu itself comes up in front
+        // after the intro closes Windows may refuse focus to the menu (it then sits behind other windows, only flashing in the
+        // taskbar): a moment of TopMost brings it to the front anyway
+        Shown += delegate { ToFront(); menuOpen = true; MusicSync(); };
+        FormClosing += delegate { menuOpen = false; MusicSync(); };
+        timer.Interval = 50;                      // the hall moves at 20 fps; blinking and the online checks stay at 400 ms
         timer.Tick += (o, e) =>
         {
+            MusicTick();
+            if (++ticks % 8 != 0) { if (HallNow) Invalidate(); return; }
             blink++;
             DevOnline();
             CountOnline();
@@ -170,18 +196,20 @@ public class MallLauncher : Form
 
         Opt(g, "MALLVR   GAME   SELECT", 10, 4, big, Yellow, null);
         Opt(g, "GAME", 10, 26, big, Yellow, null);
-        // two columns of seven (14 games; a third column fell off the screen's right edge)
+        // two columns of eight, rows 12.5 px apart (16 games; a third column fell off the screen's right edge, 8 rows at 14 px ran into MODE)
         for (int i = 0; i < Codes.Count; i++)
         {
             int col = i / Rows, row = i % Rows;
             Color c = !Found[i] ? Dim : i == Game ? Yellow : Red;
-            Opt(g, Names[i], 14 + col * 172, 43 + row * 14, txt, c, "g" + i);
+            Opt(g, Names[i], 14 + col * 172, 42 + row * 25 / 2, txt, c, "g" + i);
         }
         int y = 144;
         Opt(g, "MODE", 10, y, big, Yellow, null);
         int x = 96;
         x += Opt(g, "HEADSET", x, y + 1, txt, Mode == 0 ? Yellow : Red, "m0") + 18;
-        Opt(g, "WINDOW", x, y + 1, txt, Mode == 1 ? Yellow : Red, "m1");
+        x += Opt(g, "WINDOW", x, y + 1, txt, Mode == 1 ? Yellow : Red, "m1") + 12;
+        // window 3D (DevilMaster 10-27: his HMD shows a 1920x1080 side-by-side picture): click steps OFF -> SBS -> HALF-SBS
+        Opt(g, Sbs == 1 ? "3D SBS" : Sbs == 2 ? "3D HALF-SBS" : "3D OFF", x, y + 3, small, Mode == 1 && Sbs > 0 ? Yellow : Red, "sbs");
 
         y = 164;
         Opt(g, "PLAYERS", 10, y, big, Yellow, null);
@@ -224,6 +252,7 @@ public class MallLauncher : Form
         bool none = true; for (int i = 0; i < Found.Count; i++) if (Found[i]) none = false;
         Opt(g, "GET GAMES", nx, 272, small, none && blink % 2 == 0 ? Yellow : Red, "ggopen");
         Opt(g, "GAINESPHERE", 272, 8, small, Dim, null);
+        Opt(g, "STYLE", 312, 26, small, Red, "style");
     }
 
     // ---- GET GAMES: the community's archive.org copies, downloaded and unpacked into the games folder ----------------------
@@ -233,20 +262,26 @@ public class MallLauncher : Form
         Opt(g, "THE COMMUNITY'S ARCHIVE.ORG COPIES, STRAIGHT INTO", 14, 24, small, Dim, null);
         Opt(g, "YOUR GAMES FOLDER. ABOUT 550 MB IN ALL.", 14, 36, small, Dim, null);
         bool working = MallGetGames.Working, missing = false;
+        int step = Math.Min(45, 182 / Math.Max(1, MallGetGames.Packs.Length));   // the rows share the room above GET ALL: more items, closer rows
         for (int i = 0; i < MallGetGames.Packs.Length; i++)
         {
             MallGetGames.Pack p = MallGetGames.Packs[i];
             bool have = MallGetGames.Have(p);
             if (!have) missing = true;
-            int y = 54 + i * 45;
+            int y = 54 + i * step;
             Opt(g, p.Title + "  " + (p.Size >> 20) + " MB", 14, y, txt, have ? Dim : Red, null);
             if (have) Opt(g, "GOT IT", 290, y, txt, Dim, null);
             else if (p.Busy) Opt(g, "..." , 300, y, txt, Yellow, null);
             else if (!working) Opt(g, "GET", 300, y, txt, Red, "gg" + i);
-            Opt(g, p.Gives, 14, y + 14, small, Dim, null);
             string st = p.Status;
-            if (st != "") Opt(g, st.Length > 50 ? st.Substring(0, 50) : st, 14, y + 27, small, p.Failed ? Red : Yellow, null);
-            if (st.Length > 50) Opt(g, st.Substring(50), 14, y + 38, small, p.Failed ? Red : Yellow, null);
+            if (step >= 45)
+            {
+                Opt(g, p.Gives, 14, y + 14, small, Dim, null);
+                if (st != "") Opt(g, st.Length > 50 ? st.Substring(0, 50) : st, 14, y + 27, small, p.Failed ? Red : Yellow, null);
+                if (st.Length > 50) Opt(g, st.Substring(50), 14, y + 38, small, p.Failed ? Red : Yellow, null);
+            }
+            else if (st != "") Opt(g, st.Length > 50 ? st.Substring(0, 50) : st, 14, y + 14, small, p.Failed ? Red : Yellow, null);   // no room for two lines: the status over the blurb
+            else if (step >= 26) Opt(g, p.Gives, 14, y + 14, small, Dim, null);
         }
         int x = 14;
         if (working) x += Opt(g, "STOP", x, 240, big, Red, "ggstop") + 30;
@@ -377,10 +412,11 @@ public class MallLauncher : Form
 
     protected override void OnPaint(PaintEventArgs e)
     {
-        using (Graphics g = Graphics.FromImage(canvas)) DrawScreen(g);
-        e.Graphics.InterpolationMode = InterpolationMode.NearestNeighbor;
+        Bitmap b = Render();
+        bool hall = b != canvas;
+        e.Graphics.InterpolationMode = hall ? InterpolationMode.HighQualityBilinear : InterpolationMode.NearestNeighbor;
         e.Graphics.PixelOffsetMode = PixelOffsetMode.Half;
-        e.Graphics.DrawImage(canvas, new Rectangle(0, 0, W * scale, H * scale), 0, 0, W, H, GraphicsUnit.Pixel);
+        e.Graphics.DrawImage(b, new Rectangle(0, 0, W * scale, H * scale), 0, 0, b.Width, b.Height, GraphicsUnit.Pixel);
     }
 
     string HitAt(Point p)
@@ -402,6 +438,7 @@ public class MallLauncher : Form
     {
         if (id == "") return;
         status = "";
+        if (HallDo(id)) return;
         editPeer = id == "peer";
         bool wasName = editName;
         editName = id == "oname";
@@ -424,7 +461,8 @@ public class MallLauncher : Form
         if (wasName && !editName) NameDone();      // clicking anywhere else finishes the typed name
         char k = id[0];
         int n = id.Length > 1 && char.IsDigit(id[1]) ? int.Parse(id.Substring(1)) : -1;
-        if (k == 'g' && n >= 0) Game = n;
+        if (id == "sbs") { Sbs = (Sbs + 1) % 3; if (Sbs > 0) Mode = 1; }   // a side-by-side picture is a window mode
+        else if (k == 'g' && n >= 0) Game = n;
         else if (k == 'm' && n >= 0) Mode = n;
         else if (id == "p3") { OpenOnline(); }
         else if (id[0] == 'o') { OnlineDo(id); }
@@ -471,7 +509,9 @@ public class MallLauncher : Form
             else if (e.KeyCode == Keys.Enter || e.KeyCode == Keys.Escape) editPeer = false;
             Invalidate(); e.Handled = true; return;
         }
-        int cols = Rows;
+        int cols = HallNow ? 999 : Rows;       // the hall has one column: left / right flip the exhibit sheets
+        if (HallNow && (e.KeyCode == Keys.Left || e.KeyCode == Keys.Right))
+        { sheetTab = (sheetTab + (e.KeyCode == Keys.Right ? 1 : 2)) % 3; Invalidate(); e.Handled = true; return; }
         switch (e.KeyCode)
         {
             case Keys.Up: if (Game > 0) Game--; break;
@@ -723,11 +763,7 @@ public class MallLauncher : Form
     public const int CanvasW = W, CanvasH = H;
     public bool InHeadset;                        // shown on the headset panel: the hint line tells how to reach the in-game menu
 
-    public Bitmap VrFrame()
-    {
-        using (Graphics g = Graphics.FromImage(canvas)) DrawScreen(g);
-        return canvas;
-    }
+    public Bitmap VrFrame() { return Render(); }
 
     // laser at x, y in screen pixels; click = trigger pulled
     public void VrPoint(int x, int y, bool click)
@@ -765,12 +801,12 @@ public class MallLauncher : Form
     // dev check: draw the screen to a PNG at the window's scale (launcher.ps1 -Shot)
     public void SavePng(string path)
     {
-        using (Graphics g = Graphics.FromImage(canvas)) DrawScreen(g);
+        Bitmap c = Render();
         using (Bitmap big2 = new Bitmap(W * 3, H * 3))
         using (Graphics g = Graphics.FromImage(big2))
         {
-            g.InterpolationMode = InterpolationMode.NearestNeighbor; g.PixelOffsetMode = PixelOffsetMode.Half;
-            g.DrawImage(canvas, new Rectangle(0, 0, W * 3, H * 3), 0, 0, W, H, GraphicsUnit.Pixel);
+            g.InterpolationMode = c == canvas ? InterpolationMode.NearestNeighbor : InterpolationMode.HighQualityBilinear; g.PixelOffsetMode = PixelOffsetMode.Half;
+            g.DrawImage(c, new Rectangle(0, 0, W * 3, H * 3), 0, 0, c.Width, c.Height, GraphicsUnit.Pixel);
             big2.Save(path, ImageFormat.Png);
         }
     }

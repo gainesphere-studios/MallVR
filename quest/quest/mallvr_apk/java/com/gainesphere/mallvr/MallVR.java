@@ -25,6 +25,14 @@ public class MallVR {
         try { return c.getPackageManager().getPackageInfo(c.getPackageName(), 0).versionName; } catch (Exception e) { return "?"; }
     }
 
+    /* the Meta store build (build_mallvr_apk.sh --store): no GET GAMES, players copy their own game files in. The sideload build keeps it. */
+    public static boolean store(Context c) {
+        try {
+            android.os.Bundle m = c.getPackageManager().getApplicationInfo(c.getPackageName(), android.content.pm.PackageManager.GET_META_DATA).metaData;
+            return m != null && m.getBoolean("com.gainesphere.mallvr.store");
+        } catch (Exception e) { return false; }
+    }
+
     /* the launcher's own log (logs/quest_launcher.log): permission, downloads, starts, errors. Goes into Report a problem. */
     public static synchronized void log(String s) {
         android.util.Log.i("MallVR", s);
@@ -47,6 +55,7 @@ public class MallVR {
         public int maxPlayers = 2;
         public Map<Integer, Map<String, String>> pods = new HashMap<>();   // pod -> env (games.json "pods")
         public String[] podArgs;     // launch line per pod (Ghost Train)
+        public JSONArray options;    // its OPTIONS rows (games.json "options", from engine\options.ps1)
         // found by find()
         public int state;            // 0 missing, 1 READY, 2 different version (may work), 3 needs its CD image
         public File exeFile, dataPath, cue, cdAudioDir;
@@ -75,6 +84,7 @@ public class MallVR {
             }
             JSONArray pa = o.optJSONArray("podArgs");
             if (pa != null) { g.podArgs = new String[pa.length()]; for (int j = 0; j < pa.length(); j++) g.podArgs[j] = pa.getString(j); }
+            g.options = o.optJSONArray("options");
             out.add(g);
         }
         return out;
@@ -159,7 +169,9 @@ public class MallVR {
     public static class Plan { public String conf, tag; public HashMap<String, String> env = new HashMap<>(); }
 
     public static Plan plan(Context c, Game g) throws IOException { return plan(c, g, 0); }
-    public static Plan plan(Context c, Game g, int pod) throws IOException {
+    public static Plan plan(Context c, Game g, int pod) throws IOException { return plan(c, g, pod, null); }
+    // opts = the online host's OPTIONS (MallOnline.options, "time:60,death:1"; null / "none" = the player's own files), as play.ps1 -Options
+    public static Plan plan(Context c, Game g, int pod, String opts) throws IOException {
         if (pod > 0 && !g.pods.containsKey(pod)) throw new IOException(g.name + " has no online pod " + pod);
         Plan p = new Plan(); p.tag = g.code.toLowerCase(Locale.US) + (pod > 0 ? "_pod" + pod : "");
         LOGS.mkdirs(); SETTINGS.mkdirs();
@@ -181,7 +193,8 @@ public class MallVR {
             }
         }
         String ovLine = "";
-        if (pod > 0 && gameDir != null) ovLine = "mount -t overlay c \"" + podOverlay(g, gameDir, pod).getPath() + "\"\n";
+        Map<String, String> chosen = optParse(opts);
+        if (pod > 0 && gameDir != null) ovLine = "mount -t overlay c \"" + podOverlay(g, gameDir, pod, chosen).getPath() + "\"\n";
         for (Map.Entry<String, String> e : (pod > 0 ? g.pods.get(pod) : g.env).entrySet()) {
             String v = e.getValue().replace("@CDSIG@", sig);
             if (v.startsWith("@")) {
@@ -216,7 +229,7 @@ public class MallVR {
              .append("mount c \"").append(driveC.getPath()).append("\"\n").append(ovLine).append(cdLine).append("\nc:\nset dos4g=quiet\nset vpctemp=c:\\vpctemp\n")
              .append(g.su3k ? "set BLASTER=A220 I5 D1 H5 P330 T6\nset SOUND=C:\\SB16\n" : "")
              .append("path c:\\dos;c:\\utils\ncd \\").append(exeDir).append("\n").append(exeDir).append(" ")
-             .append(pod > 0 && g.podArgs != null && pod <= g.podArgs.length ? g.podArgs[pod - 1] : g.args)
+             .append(optArgs(g, pod > 0 && g.podArgs != null && pod <= g.podArgs.length ? g.podArgs[pod - 1] : g.args, chosen))
              .append(" > c:\\gameout.txt\nexit\n");
         }
         File conf = new File(LOGS, p.tag + ".conf");
@@ -227,9 +240,10 @@ public class MallVR {
 
     /* play.ps1's linked-pod files: each pod gets its own writable layer over C: (settings/pod<n>) holding the game's settings file with
        network on and master (pod 1) / slave, so the real game files stay as they are. Same lines play.ps1 writes. */
-    static File podOverlay(Game g, File gameDir, int pod) throws IOException {
+    static File podOverlay(Game g, File gameDir, int pod, Map<String, String> chosen) throws IOException {
         File ov = new File(SETTINGS, "pod" + pod); ov.mkdirs();
         String dir = gameDir.getName();
+        optFiles(g, gameDir, ov, chosen);           // options first; the network lines below keep them
         boolean master = pod == 1;
         if (g.code.equals("DAC")) podLines(gameDir, ov, dir, "RUNFILES/DEFAULTS.DN2", 6, l -> { l.set(4, "1 "); l.set(5, master ? "1 " : "0 "); });
         else if (g.code.equals("DN2")) podLines(gameDir, ov, dir, "RUNFILES/DEFAULTS.DN2", 4, l -> { l.set(2, "1 "); l.set(3, master ? "1 " : "0 "); });
@@ -245,6 +259,89 @@ public class MallVR {
             out.getParentFile().mkdirs(); FileOutputStream o = new FileOutputStream(out); o.write(b); o.close();
         }
         return ov;
+    }
+    /* OPTIONS (engine\options.ps1, same rules as its Add-MVOptionArgs / Write-MVOptionFiles): the host's choices on the launch line and
+       in the pod's layer. An unknown value = the row's default. No choices = the player's own file values put back. */
+    static Map<String, String> optParse(String s) {
+        Map<String, String> m = new HashMap<>();
+        if (s != null) for (String part : s.split(",")) { int i = part.indexOf(':'); if (i > 0) m.put(part.substring(0, i), part.substring(i + 1)); }
+        return m;
+    }
+    static String optValue(JSONObject r, Map<String, String> chosen) {
+        String v = chosen.get(r.optString("key")), d = r.optString("default");
+        JSONArray vs = r.optJSONArray("values");
+        if (v != null && vs != null) for (int i = 0; i < vs.length(); i++) if (v.equals(vs.optString(i))) return v;
+        return d;
+    }
+    static String optArgs(Game g, String args, Map<String, String> chosen) {
+        if (g.options == null || chosen.isEmpty()) return args;
+        List<String> w = new ArrayList<>();
+        for (String a : args.split(" ")) if (!a.isEmpty()) w.add(a);
+        for (int i = 0; i < g.options.length(); i++) {
+            JSONObject r = g.options.optJSONObject(i);
+            if (r == null || !"arg".equals(r.optString("kind"))) continue;
+            String v = optValue(r, chosen);
+            if (v.equals(r.optString("default"))) continue;
+            JSONObject drop = r.optJSONObject("drop"), map = r.optJSONObject("argMap");
+            if (drop != null && drop.has(v)) w.remove(drop.optString(v));          // case-sensitive: Zone's /T is not /t
+            if (map != null) { if (map.has(v)) w.add(map.optString(v)); }
+            else if (r.has("arg")) w.add(r.optString("arg").replace("{0}", v));
+        }
+        return String.join(" ", w);
+    }
+    static void optFiles(Game g, File gameDir, File ov, Map<String, String> chosen) throws IOException {
+        if (g.options == null) return;
+        boolean own = chosen.isEmpty();
+        Map<String, List<JSONObject>> byFile = new LinkedHashMap<>();
+        for (int i = 0; i < g.options.length(); i++) {
+            JSONObject r = g.options.optJSONObject(i);
+            if (r == null || !"file".equals(r.optString("kind"))) continue;
+            String f = r.optString("file").replace('\\', '/');
+            if (!byFile.containsKey(f)) byFile.put(f, new ArrayList<>());
+            byFile.get(f).add(r);
+        }
+        for (Map.Entry<String, List<JSONObject>> e : byFile.entrySet()) {
+            File orig = resolve(gameDir, e.getKey());
+            if (orig == null) continue;
+            File out = new File(ov, gameDir.getName() + "/" + e.getKey());
+            File src = out.isFile() ? out : orig;
+            out.getParentFile().mkdirs();
+            if (e.getValue().get(0).has("dword")) {
+                byte[] b = readBytes(src), ob = readBytes(orig);
+                for (JSONObject r : e.getValue()) {
+                    int at = 4 * r.optInt("dword");
+                    if (b.length < at + 4) continue;
+                    if (own) { if (ob.length >= at + 4) System.arraycopy(ob, at, b, at, 4); }
+                    else { int v = Integer.parseInt(optValue(r, chosen)); b[at] = (byte) v; b[at + 1] = (byte) (v >> 8); b[at + 2] = (byte) (v >> 16); b[at + 3] = (byte) (v >> 24); }
+                }
+                FileOutputStream o = new FileOutputStream(out); o.write(b); o.close();
+                continue;
+            }
+            String text = new String(readBytes(src), "ISO-8859-1"), otext = new String(readBytes(orig), "ISO-8859-1");
+            for (JSONObject r : e.getValue()) {
+                String v = optValue(r, chosen);
+                if (r.has("lines")) text = own ? otext : r.optJSONObject("lines").optString(v, "").replace("|", "\r\n") + "\r\n";
+                else if (r.has("key2")) {
+                    java.util.regex.Pattern pat = java.util.regex.Pattern.compile("(?m)^(" + java.util.regex.Pattern.quote(r.optString("key2")) + "[ \t]+)\\S+");
+                    String val = v;
+                    if (own) { java.util.regex.Matcher m = pat.matcher(otext); if (m.find()) { String[] t = m.group().split("\\s+"); val = t[t.length - 1]; } }
+                    text = pat.matcher(text).replaceAll("$1" + java.util.regex.Matcher.quoteReplacement(val));
+                }
+                else if (r.has("token")) {
+                    int n = r.optInt("token");
+                    String val = v;
+                    if (own) { String t = nthToken(otext, n); if (t != null) val = t; }
+                    java.util.regex.Matcher m = java.util.regex.Pattern.compile("\\S+").matcher(text);
+                    int k = 0; while (m.find()) { if (k++ == n) { text = text.substring(0, m.start()) + val + text.substring(m.end()); break; } }
+                }
+            }
+            FileOutputStream o = new FileOutputStream(out); o.write(text.getBytes("ISO-8859-1")); o.close();
+        }
+    }
+    static String nthToken(String s, int n) {
+        java.util.regex.Matcher m = java.util.regex.Pattern.compile("\\S+").matcher(s);
+        int k = 0; while (m.find()) if (k++ == n) return m.group();
+        return null;
     }
     interface LineEdit { void edit(List<String> lines); }
     static void podLines(File gameDir, File ov, String dir, String rel, int need, LineEdit ed) throws IOException {

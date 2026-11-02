@@ -27,6 +27,9 @@ Set it up once as an emulator, then each game is just its EXE.
      ZONE\ZONE.EXE  Zone Hunter
      GHOST\GHOST.EXE Ghost Train
      SFL\SFL.EXE    Shoot For Loot
+     PEARL\PEARL.EXE Sea Diving
+   Buggy Ball, Total Recoil, Zero Hour and Zeneca: use the NO EMULATOR SETUP below
+   (their Play_ files), since their EXEs don't follow the pattern above.
    Easier: add each one by hand (Add Game, Launching tab, Application Path = the EXE,
    Emulation tab = MallVR) and type the title.
    Choose "Copy" off for the files - leave them where they are.

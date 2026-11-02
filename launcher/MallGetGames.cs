@@ -100,7 +100,7 @@ public class MallGetGames
             long size; if (!long.TryParse(f[5].Trim(), out size) || size <= 0) continue;
             string sha = f[6].Trim().ToLowerInvariant(), un = f[7].Trim(), item = f[3].Trim(), file = f[4].Trim();
             if (sha.Length != 40 || item == "" || file == "" || item.Contains("/") || item.Contains("..") || file.Contains("..")) continue;
-            if (!(un == "7z" || un.StartsWith("7z-keep:") || un == "zip" || un == "zip-cd" || un.StartsWith("zip-cd-inner:"))) continue;
+            if (!(un == "7z" || un.StartsWith("7z-keep:") || un == "zip" || un == "zip-cd" || un.StartsWith("zip-cd-inner:") || un.StartsWith("zip-su3k:") || un.StartsWith("zip-in:") || un.StartsWith("7z-sub:"))) continue;
             string id = f[0].Trim().ToLowerInvariant();
             bool okId = id != ""; foreach (char ch in id) if (!char.IsLetterOrDigit(ch) && ch != '_' && ch != '-') okId = false;
             if (!okId) continue;
@@ -142,6 +142,7 @@ public class MallGetGames
     {
         ServicePointManager.SecurityProtocol |= (SecurityProtocolType)3072;     // TLS 1.2 on .NET 4.x
         Directory.CreateDirectory(Downloads);
+        if (p.Unpack.StartsWith("zip-su3k:") && Su3kDrive() == null) throw new IOException("GET THE SU3000 DUMP FIRST");
         string done = Path.Combine(Downloads, p.File), part = done + ".part";
         long need = p.Size * 4;                                                 // archive + unpacked, roughly
         long free = new DriveInfo(Path.GetPathRoot(Path.GetFullPath(Games))).AvailableFreeSpace;
@@ -168,8 +169,11 @@ public class MallGetGames
         string un = p.Unpack;
         if (un == "7z") Un7z(done, null);
         else if (un.StartsWith("7z-keep:")) Un7z(done, un.Substring(8));
+        else if (un.StartsWith("7z-sub:")) Un7z(done, un.Substring(7));
+        else if (un.StartsWith("zip-in:")) Unzip(done, Path.Combine(Games, un.Substring(7)), false);
         else if (un == "zip") Unzip(done, Games, false);
         else if (un == "zip-cd") Unzip(done, Games, true);
+        else if (un.StartsWith("zip-su3k:")) Unzip(done, Path.Combine(Su3kDrive(), un.Substring(9)), false, "DOS4GW.EXE");
         else if (un.StartsWith("zip-cd-inner:"))
         {
             string inner = Path.Combine(Downloads, "_inner.zip");
@@ -238,6 +242,18 @@ public class MallGetGames
             Directory.Delete(tmp, true);
             throw new IOException("THIS WINDOWS CAN'T UNPACK .7Z: OPEN GAMES\\_DOWNLOADS\\" + Path.GetFileName(a).ToUpper() + " WITH 7-ZIP INTO GAMES");
         }
+        string[] sub = keep == null ? new string[0] : keep.Split('>');   // 7z-sub: folder name part > sub folder > new folder in games
+        if (sub.Length == 3)
+        {
+            string from = null;
+            foreach (string d in Directory.GetDirectories(tmp, "*", SearchOption.AllDirectories))
+                if (Path.GetFileName(d).Contains(sub[0]) && Directory.Exists(Path.Combine(d, sub[1]))) { from = Path.Combine(d, sub[1]); break; }
+            if (from == null) { Directory.Delete(tmp, true); throw new IOException("THE ARCHIVE HAS NO FOLDER " + sub[1].ToUpper()); }
+            Directory.CreateDirectory(Path.Combine(Games, sub[2]));
+            MoveInto(from, Path.Combine(Path.Combine(Games, sub[2]), sub[1]));
+            Directory.Delete(tmp, true);
+            return;
+        }
         List<string> tops = new List<string>();
         if (keep != null)
         {
@@ -270,7 +286,16 @@ public class MallGetGames
     }
 
     // .zip into 'to'; cdOnly: just the .CUE / .BIN files, flat
-    static void Unzip(string a, string to, bool cdOnly)
+    // the SU3000 drive's root: the folder holding ZERO\ZERO.EXE, wherever the player's copy is under games
+    static string Su3kDrive()
+    {
+        try { foreach (string f in Directory.GetFiles(Games, "ZERO.EXE", SearchOption.AllDirectories))
+              { string d = Path.GetDirectoryName(f); if (Path.GetFileName(d).Equals("ZERO", StringComparison.OrdinalIgnoreCase)) return Path.GetDirectoryName(d); } }
+        catch (Exception) { }
+        return null;
+    }
+
+    static void Unzip(string a, string to, bool cdOnly, string skip = null)
     {
         using (FileStream fs = System.IO.File.OpenRead(a))
         using (ZipArchive z = new ZipArchive(fs, ZipArchiveMode.Read))
@@ -280,6 +305,7 @@ public class MallGetGames
                 if (Cancel) throw new IOException("STOPPED WHILE UNPACKING: PRESS GET AGAIN");
                 string name = e.FullName.Replace('\\', '/');
                 bool dir = name.EndsWith("/");
+                if (skip != null && name.Equals(skip, StringComparison.OrdinalIgnoreCase)) continue;
                 if (cdOnly)
                 {
                     string u = name.ToUpperInvariant();

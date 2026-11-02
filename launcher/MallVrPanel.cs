@@ -633,8 +633,9 @@ public class MallVrPanel
 
     void Upload(Bitmap c, bool force)
     {
-        int w = c.Width * Up, hgt = c.Height * Up;
-        if (big == null) big = new Bitmap(w, hgt, PixelFormat.Format32bppArgb);
+        int k = c.Width >= MallLauncher.CanvasW * Up ? 1 : Up;     // the hall arrives already 3x (MallHall.cs)
+        int w = c.Width * k, hgt = c.Height * k;
+        if (big == null || big.Width != w || big.Height != hgt) { if (big != null) big.Dispose(); big = new Bitmap(w, hgt, PixelFormat.Format32bppArgb); }
         using (Graphics g = Graphics.FromImage(big))
         {
             g.InterpolationMode = InterpolationMode.NearestNeighbor; g.PixelOffsetMode = PixelOffsetMode.Half;

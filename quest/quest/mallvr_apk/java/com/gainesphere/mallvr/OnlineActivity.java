@@ -149,7 +149,7 @@ public class OnlineActivity extends Activity {
         MallVR.Game g = game(code);
         if (g == null || g.exeFile == null && g.nativ == null) { net.note = "YOU DON'T HAVE " + code + ": LEAVING THE GROUP"; net.leave(); return; }
         try {
-            MallVR.Plan p = MallVR.plan(this, g, pod);
+            MallVR.Plan p = MallVR.plan(this, g, pod, net.options);
             writeVoicePods();
             net.beginGame(pod);
             playing = code; gameStartedAt = System.currentTimeMillis(); gameSeen = false;
@@ -215,7 +215,7 @@ public class OnlineActivity extends Activity {
             for (int i = 0; i < r.size(); i++) grp.append(i > 0 ? " " : "").append(r.get(i).replace(' ', '_')).append(':').append(i < rp.size() ? rp.get(i) : "PC");
             PlayNotes.add("online", "game", code, "role", host ? "host" : "member", "quick", startedQuick ? "1" : "0",
                 "via", host ? (net.upnpMapped ? "upnp" : "punch") : net.joinVia, "connect_secs", host ? "" : String.format(Locale.US, "%.1f", net.joinSecs),
-                "lag_ms", net.lagNote(), "arrived", host ? net.arrivals() : "", "group", grp.toString(), "wifi", wifi(), "ver", MallVR.version(this));
+                "lag_ms", net.lagNote(), "arrived", host ? net.arrivals() : "", "group", grp.toString(), "wifi", wifi(), "match", net.matchId, "ver", MallVR.version(this));
             if (!net.switchGame.isEmpty())
                 PlayNotes.add("group_switch", "from", code, "to", net.switchGame, "role", host ? "host" : "member", "pod", "" + net.switchPod, "answers", host ? net.switchNote : "");
             new Thread(PlayNotes::flush).start();

@@ -6,19 +6,34 @@ Your headset is the pod headset, your RIGHT controller is the joystick.
 MallVR uses SteamVR Input, so every button can be remapped in
 SteamVR > Settings > Controllers > Manage Controller Bindings > MallVR.
 
+MENU IN A GAME (the BUTTON MASHER MENU) - every controller
+   PRESS AND KEEP HOLDING A + B TOGETHER (Vive wands: both menu buttons) UNTIL THE MENU APPEARS.
+   A quick press does nothing: keep holding for a full second. You feel small ticks while you
+   hold, then a strong buzz in both hands and the menu shows in front of you.
+   RESUME = back to the game. BACK TO MENU = close the game and pick another one.
+   SWITCH GAME (host of an online group) = move the whole group to another game.
+   REPORT A PROBLEM = type what went wrong on the SteamVR keyboard; this game's logs go with it.
+   PLAY NOTES ON / OFF = the anonymous play notes (see docs\CHANGES.txt).
+   The game keeps running behind the menu, but your trigger and buttons don't reach it.
+   Hold A + B again (until the buzz) to close the menu. Needs the MallVR launcher in HEADSET mode.
+
 VALVE INDEX (tested)
    Look around ............ move your head
    Aim / punch ............ RIGHT controller
    Fire / punch ........... RIGHT trigger
-   Coin + start ........... RIGHT A, or LEFT A or B
+   Coin + start ........... B (either hand)
+   Game button ............ A (either hand) - what it does depends on the game, see GAME BUTTONS below
    Walk forward / back .... RIGHT or LEFT stick up / down
    Turn ................... RIGHT stick left / right (smooth turn, pivots on your head)
    Strafe left / right .... LEFT stick left / right
    Gun aim up / down ...... touch near the top / bottom edge of the LEFT touchpad
    Arm reach in / out ..... touch near the left / right edge of the RIGHT touchpad
-   Crouch ................. hold the RIGHT B button (Dactyl Nightmare 1 + 2)
+   Crouch ................. hold A (Dactyl Nightmare 1 + 2)
+   Voice chat ............. on by itself in linked / online games; click the LEFT stick = mic off,
+                            click again = mic on (short buzz = off, long buzz = on). Window: M
    Credits ................ free play, no coins needed
-   Aim and reach are saved per game, for next time.
+   Aim and reach are saved per game, for next time (Boxing: the touchpads do nothing, so a thumb
+   resting on them can't change your reach mid-fight).
 
 HTC VIVE WANDS
    Fire ................... RIGHT trigger
@@ -26,9 +41,50 @@ HTC VIVE WANDS
    Snap turn .............. grips (30 degrees)
    Gun aim / arm reach .... LEFT touchpad up-down / left-right
    Coin + start ........... RIGHT menu button
-   Crouch ................. hold the LEFT menu button (Dactyl Nightmare 1 + 2)
+   Game button ............ LEFT menu button (crouch in Dactyl, turbo in Buggy Ball, Boxing special)
 
-Quest and other controllers: SteamVR picks the closest layout; remap there if needed.
+GAME BUTTONS - the extra controls each game had on the pod
+   The arcade joystick had a trigger plus a top/thumb button; some games used them together.
+   Dactyl Nightmare 1 + 2 . hold A to crouch (window: hold C)
+   Buggy Ball ............. A = turbo (the right grip still works too). Window: Space or right mouse
+   Virtuality Boxing ...... SPECIAL MOVE: when your special bar is full and flashing, get close and
+                            press A, or pull either trigger (window: Space). Each boxer has his own
+                            special. Punches don't need any button.
+   Total Recoil ........... left trigger flips free / assisted aim; A, B or stick down = menu next
+
+TWO-PLAYER BOXING (Link_Virtuality_Boxing_This_PC.bat / _Network.bat, or LINKED in the launcher)
+   Head to head like the arcade's two-seat pod: pod 1's PC runs both boxers, pod 2 boxes from its own
+   headset (or window). Both press start (B), then punch to pick your boxer.
+
+META QUEST / OCULUS TOUCH (through SteamVR: Quest Link, Air Link or Virtual Desktop)
+   Fire / punch ........... RIGHT trigger
+   Coin + start ........... B
+   Game button ............ A or X (crouch in Dactyl, turbo in Buggy Ball, Boxing special)
+   Walk / turn / strafe ... the sticks, same as the Index (above)
+   Mode ................... LEFT trigger (Total Recoil aim mode; Pac-Man: walk back)
+   Voice chat ............. click the LEFT stick = mic off / on
+   ADJUST (gun aim, reach). HOLD Y: while you hold it you stand still and the sticks adjust instead:
+      LEFT stick up / down .... gun aim up / down (2 degrees per push)
+      RIGHT stick left / right  arm reach in / out (Total Recoil: moves the gun)
+      Push, let the stick come back to the middle, push again for the next step. Saved per game.
+   If an older MallVR binding was saved for your Quest, pick "MallVR - Meta Quest / Oculus Touch"
+   in SteamVR > Settings > Controllers > Manage Controller Bindings > MallVR.
+
+KEYBOARD ADJUSTERS IN VR (any headset: click the MallVR game window first, so it has the keyboard)
+   Up / Down arrow ........ gun aim up / down
+   Left / Right arrow ..... arm reach in / out
+   VIRTUALITY BOXING (the controllers can't change these, so a thumb can't bump them mid-fight):
+      Right arrow ......... punches land with a SHORTER jab (try this first if your hits don't count)
+      Left arrow .......... a LONGER jab is needed
+      Up / Down arrow ..... right arm higher / lower
+      [ and ] ............. gloves closer together / wider apart
+   Every press gives a short buzz in both hands and is saved for next time.
+
+PAC-MAN VR
+   Walk forward ........... RIGHT trigger (or a stick up, as before)
+   Walk back .............. LEFT trigger (or a stick down)
+
+Other controllers: SteamVR picks the closest layout; remap there if needed.
 
 NO HEADSET / WINDOW MODE (Play_<Game>_NoVR.bat, or WINDOW in MallVR_Launcher.bat)
    Every game also runs in a normal window with keyboard and mouse.
@@ -62,4 +118,6 @@ NO HEADSET / WINDOW MODE (Play_<Game>_NoVR.bat, or WINDOW in MallVR_Launcher.bat
                             extends). Face the opponent. You move by LEANING, like the arcade pod:
                             stand where you want to box, then press coin / start (that spot becomes
                             the centre). Lean forward / back / to the sides to step, or hold a stick
-                            to lean. Play standing. (Your own gloves are not drawn in first person yet.)
+                            to lean. Play standing.
+                            WINDOW MODE: left mouse button = left punch, right mouse button = right
+                            punch, Space = special move, W / S / A / D = lean.

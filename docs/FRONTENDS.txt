@@ -1,0 +1,112 @@
+MALLVR - ADD IT TO YOUR FRONT END OR MULTICADE
+================================================
+
+MallVR gives you three ways in: the desktop launcher (MallVR_Launcher.bat, the
+operator-menu game select screen), the same launcher in VR (coming), and one launcher
+file per game for front ends and multicades. This
+file is about the third one.
+
+The short version: every game has its own launcher file in your MallVR folder.
+Any front end that can start a program can start MallVR games.
+
+  Play_<Game>.bat        the game in your headset (turn the headset on first)
+  Play_<Game>_NoVR.bat   the same game in a window, keyboard + mouse
+  MallVR_Launcher.bat    the MallVR game select screen (solo, linked, ONLINE)
+
+The game files:
+  Play_Dactyl_Nightmare.bat     Play_Dactyl_Nightmare_2.bat   Play_Pac-Man_VR.bat
+  Play_Zone_Hunter.bat          Play_Ghost_Train.bat          Play_Virtuality_Boxing.bat
+  Play_Missile_Command_VR.bat   Play_Olin_Shotgun.bat         Play_Shoot_For_Loot.bat
+  Play_Sea_Diving.bat           Play_Buggy_Ball.bat           Play_Total_Recoil.bat
+  Play_Zero_Hour.bat            Play_Zeneca.bat
+
+Each one waits until you close the game, so your front end comes back when you quit.
+Want online play or linked pods from your front end? Add MallVR_Launcher.bat as one more
+entry and pick ONLINE there.
+
+Tip for every front end: make the platform/system name "Virtuality" (or
+"Virtuality SU2000" + "Virtuality SU3000" if you like them split). Total Recoil, Zero
+Hour and Zeneca are the SU3000 games.
+
+Artwork: most scrapers don't know these games. Use the screenshots on
+gainesphere.com/pages/mallvr, your own captures, or SteamGridDB.
+
+
+LAUNCHBOX / BIGBOX
+------------------
+Full steps: docs\LAUNCHBOX.txt. Quickest way:
+  Add Game > Launching tab > Application Path = <your MallVR folder>\Play_Dactyl_Nightmare.bat
+  Platform = Virtuality. Repeat for each Play_ file.
+  Works in BigBox too, so it's ready for an arcade cabinet setup.
+
+
+STEAM / STEAMVR
+---------------
+Full steps: docs\STEAM.txt. Add each Play_ file as a Non-Steam Game and tick
+"Include in VR Library" so you can start the games from inside SteamVR with the
+headset already on.
+
+
+PLAYNITE
+--------
+1. Main menu > Add Game > Manually.
+2. Name: the game's title. Platform: Virtuality.
+3. Installation tab: tick Installed, Installation folder = your MallVR folder.
+4. Actions tab: Add action, Type = File, Path = Play_Dactyl_Nightmare.bat (the game's
+   Play_ file), Working directory = your MallVR folder. Tick "Play action".
+5. Save. Repeat for each game.
+Playtime not counting? On the Actions tab set tracking to "Folder".
+
+
+RETROBAT (EmulationStation for Windows)
+---------------------------------------
+RetroBat has a "Windows" system for PC programs, and it accepts .bat files.
+1. Copy the Play_ files you want into  <RetroBat>\roms\windows\
+   Rename them if you like (e.g. "Dactyl Nightmare.bat") - the name is what RetroBat shows.
+2. Open each copied file in Notepad and check the path at the end points at your
+   MallVR folder. If not, use shortcuts instead: right-click a Play_ file in your MallVR
+   folder > Create shortcut, then move the shortcut (.lnk) into roms\windows.
+   (Shortcuts are the safest choice: they always start in the MallVR folder.)
+3. In RetroBat: Main menu > Game settings > Update gamelists.
+
+
+ATTRACT-MODE / ATTRACT-MODE PLUS
+--------------------------------
+Make an emulator for MallVR that runs the .bat files:
+  executable   cmd
+  args         /c "[rompath][name][romext]"
+  rompath      <your MallVR folder>\
+  romext       .bat
+Then build the romlist. It will list every .bat in the folder: delete the lines you
+don't want (Check_My_Games, Update, the _NoVR and Link_ files) from the romlist, or copy
+only the Play_ files into a folder of their own and point rompath there.
+
+
+HYPERSPIN / ROCKETLAUNCHER
+--------------------------
+Add a system named Virtuality using RocketLauncher's PC Launcher module, and set each
+game's application to its Play_ file in your MallVR folder.
+
+
+ANY OTHER FRONT END
+-------------------
+Look for "add a Windows game", "add an executable" or "PC games" and point it at the
+game's Play_ file. If it insists on .exe files, make a Windows shortcut to the Play_ file
+and add the shortcut.
+
+
+ARCADE CABINETS AND MULTICADES
+------------------------------
+- Start from the cabinet's front end with a headset: turn the headset and SteamVR on
+  before you start a game. Use the Play_ files.
+- No headset on the cabinet (screen only): use the _NoVR files.
+- The arcade buttons: coin = 5, start = 1, fire = Space on the keyboard (more in
+  docs\CONTROLS.txt). Map your encoder or JoyToKey to those keys.
+- Escape closes the game and returns to your front end.
+
+
+NOT LISTED HERE YET
+-------------------
+EmuVR and other VR front ends: we haven't found a clean way to start a VR game from
+inside another VR app yet. Got a front end working that isn't here? Post your setup
+in the MallVR Discord and we'll add it to this file.

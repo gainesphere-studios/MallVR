@@ -9,6 +9,7 @@ param([Parameter(Mandatory = $true)][string]$Out)
 $ErrorActionPreference = 'Stop'
 $eng = Join-Path (Split-Path -Parent $PSScriptRoot) 'package\engine'
 . (Join-Path $eng 'games.ps1')
+. (Join-Path $eng 'options.ps1')   # each game's OPTIONS rows: the headset applies the online host's choices (MallVR.plan)
 $play = [IO.File]::ReadAllText((Join-Path $eng 'play.ps1'))
 $a = $play.IndexOf("`$env:VPIX_PLAY = '1'"); $b = $play.IndexOf("if (`$Desktop) { `$env:VPIX_VR = '0' }")
 if ($a -lt 0 -or $b -le $a) { throw "play.ps1 changed: the VPIX_* env block anchors are gone (update make_games_json.ps1)" }
@@ -22,6 +23,7 @@ $Root = '@ROOT@'; $Engine = '@ENGINE@'; $logs = '@LOGS@'; $settings = '@SETTINGS
 $list = @()
 foreach ($code in $Games.Keys) {
     $info = $Games[$code]
+    if ($info.ModScript) { continue }    # mod games on another game's files (Phantom Freight): PC only, no overlay / mod support on the Quest yet
     Get-ChildItem Env: | Where-Object { $_.Name -like 'VPIX_*' } | ForEach-Object { Remove-Item "Env:$($_.Name)" }
     $tag = $code.ToLower(); $sig = '@CDSIG@'
     & $block
@@ -34,6 +36,13 @@ foreach ($code in $Games.Keys) {
         if ($null -ne $info[$k] -and "$($info[$k])" -ne '') { $g[$k.Substring(0, 1).ToLower() + $k.Substring(1)] = $info[$k] }
     }
     $g["env"] = $ev
+    $opt = @(Get-MVOptionRows $code | ForEach-Object {
+        $r = [ordered]@{ key = $_.Key; kind = $_.Kind; default = $_.Default; values = @($_.Values | ForEach-Object { ($_ -split '=', 2)[0] }) }
+        if ($_.Arg -is [hashtable]) { $r.argMap = $_.Arg } elseif ($_.Arg) { $r.arg = $_.Arg }
+        foreach ($k in 'Drop', 'File', 'Token', 'Dword', 'Key2', 'Lines') { if ($null -ne $_[$k]) { $r[$k.Substring(0, 1).ToLower() + $k.Substring(1)] = $_[$k] } }
+        $r
+    })
+    if ($opt.Count) { $g["options"] = $opt }
     # online (crossplay): the same block once per pod, as the PC launcher runs play.ps1 -Pod <n> -Peers 127.0.0.1:<27110 + n>
     # (MallOnline's relay port), so a Quest pod gets exactly the env a PC pod gets: VPIX_NET, the 60 fps cap, Boxing's remote seat...
     if ($info.Link) {
@@ -56,6 +65,6 @@ foreach ($code in $Games.Keys) {
     $list += $g
 }
 Get-ChildItem Env: | Where-Object { $_.Name -like 'VPIX_*' } | ForEach-Object { Remove-Item "Env:$($_.Name)" }
-$json = [ordered]@{ made = (Get-Date -Format 'yyyy-MM-dd HH:mm'); games = $list } | ConvertTo-Json -Depth 5
+$json = [ordered]@{ made = (Get-Date -Format 'yyyy-MM-dd HH:mm'); games = $list } | ConvertTo-Json -Depth 8
 [IO.File]::WriteAllText($Out, $json, (New-Object Text.UTF8Encoding $false))
 "games.json: $($list.Count) games -> $Out"

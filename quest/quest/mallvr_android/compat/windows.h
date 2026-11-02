@@ -93,6 +93,17 @@ typedef struct { HANDLE hProcess, hThread; DWORD dwProcessId, dwThreadId; } PROC
 #define VK_OEM_PLUS 0xBB
 #define VK_OEM_MINUS 0xBD
 #define VK_F1 0x70
+#define VK_F2 0x71
+#define VK_F3 0x72
+#define VK_F4 0x73
+#define VK_F5 0x74
+#define VK_F6 0x75
+#define VK_F7 0x76
+#define VK_F8 0x77
+#define VK_F9 0x78
+#define VK_F10 0x79
+#define VK_F11 0x7A
+#define VK_F12 0x7B
 #define VK_OEM_1 0xBA
 #define VK_OEM_2 0xBF
 #define VK_OEM_3 0xC0
@@ -133,6 +144,26 @@ static inline BOOL ClientToScreen(HWND, POINT *) { return TRUE; }
 static inline BOOL GetCursorPos(POINT *p) { if (p) p->x = p->y = 0; return TRUE; }
 static inline BOOL SetCursorPos(int, int) { return TRUE; }
 static inline int ShowCursor(BOOL) { return 0; }
+/* VPIX_SBS (PC side-by-side window, 10-29): monitors, cursor, topmost. No displays on the headset, so SBS never finds one */
+typedef void *HMONITOR; typedef RECT *LPRECT;
+typedef BOOL (*MONITORENUMPROC)(HMONITOR, HDC, LPRECT, LPARAM);
+static inline BOOL EnumDisplayMonitors(HDC, const RECT *, MONITORENUMPROC, LPARAM) { return TRUE; }
+#define GCLP_HCURSOR (-12)
+static inline DWORD_PTR SetClassLongPtrA(HWND, int, LONG_PTR) { return 0; }
+static inline HCURSOR SetCursor(HCURSOR) { return NULL; }
+static inline BOOL SetForegroundWindow(HWND) { return TRUE; }
+#define HWND_TOPMOST ((HWND)(intptr_t)-1)
+#define SWP_SHOWWINDOW 0x0040
+static inline BOOL SetWindowPos(HWND, HWND, int, int, int, int, UINT) { return TRUE; }
+/* the SBS settings overlay's GDI bitmap font: no font, so its text lists stay empty */
+typedef void *HFONT, *HGDIOBJ;
+#define FW_BOLD 700
+#define ANSI_CHARSET 0
+#define NONANTIALIASED_QUALITY 3
+static inline HFONT CreateFontA(int, int, int, int, int, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, LPCSTR) { return NULL; }
+static inline HGDIOBJ SelectObject(HDC, HGDIOBJ) { return NULL; }
+static inline BOOL DeleteObject(HGDIOBJ) { return TRUE; }
+static inline BOOL wglUseFontBitmapsA(HDC, DWORD, DWORD, DWORD) { return FALSE; }
 
 /* WGL = one EGL pbuffer context with gl4es on top (vpix_android.cpp) */
 HGLRC wglCreateContext(HDC);

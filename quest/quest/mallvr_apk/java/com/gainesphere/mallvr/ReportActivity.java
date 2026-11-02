@@ -72,7 +72,10 @@ public class ReportActivity extends Activity {
            .append("Headset: ").append(MallVR.device()).append("\n")
            .append("Last game: ").append(last).append(when > 0 ? " started " + new Date(when) : "").append("\n")
            .append("Report made: ").append(new Date()).append("\n")
-           .append("Free space: ").append(MallVR.ROOT.getUsableSpace() >> 20).append(" MB\n\nGame check:\n");
+           .append("Free space: ").append(MallVR.ROOT.getUsableSpace() >> 20).append(" MB\n")
+           .append("VR (OpenXR) in the last game: ").append(tag.isEmpty() ? "-" : PlayNotes.xr(new File(MallVR.LOGS, tag + ".render"))[0]).append("\n")
+           .append("OpenXR runtime broker: ").append(broker("org.khronos.openxr.runtime_broker")).append(" / system ").append(broker("org.khronos.openxr.system_runtime_broker"))
+           .append("\n\nGame check:\n");
         try { List<MallVR.Game> gs = MallVR.load(this); MallVR.find(gs); for (MallVR.Game g : gs) rep.append("  ").append(g.code).append(": ").append(g.stateText()).append(g.exeFile != null ? "  " + g.exeFile : "").append(g.why.isEmpty() ? "" : "  (" + g.why + ")").append("\n"); }
         catch (Exception e) { rep.append("  (couldn't check: ").append(e).append(")\n"); }
 
@@ -96,7 +99,12 @@ public class ReportActivity extends Activity {
         return z;
     }
 
-    static void put(ZipOutputStream o, String name, byte[] data, long[] used) throws IOException {
+    /* the Khronos OpenXR loader finds the headset's runtime through these providers (both missing on the 2026-10-31 report's headset) */
+    String broker(String auth) {
+        try { return getPackageManager().resolveContentProvider(auth, 0) != null ? "found" : "not found"; } catch (Exception e) { return "?"; }
+    }
+
+    static void put(ZipOutputStream o,String name, byte[] data, long[] used) throws IOException {
         if (used[0] + data.length > CAP) return;
         o.putNextEntry(new ZipEntry(name)); o.write(data); o.closeEntry(); used[0] += data.length / 4;   // text zips ~4:1
     }

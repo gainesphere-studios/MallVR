@@ -22,8 +22,13 @@ struct VPIX_Instance {
     uint8_t poly_select = 0;  /* VPIX_POLY_SELECT models: draw a polygon with select bits only if they meet 'select' (PIXMODEL +0x50) */
     uint32_t select = 0;
     uint8_t one_sided = 0;    /* VPIX_ONE_SIDED models: type 0x22 polygons back-face culled (Zone's VR logo); 2 = every polygon; 3 = every polygon's back side drawn flat grey */
-    uint8_t on_top = 0;       /* VPIX_ON_TOP: drawn last, depth test off (Missile Command skip sign over the gun housing) */
+    uint8_t on_top = 0;       /* VPIX_ON_TOP: drawn last, depth test off (Missile Command skip sign over the gun housing); 2 = in front of everything but depth-tested among themselves (our guns, sword, arms) */
     uint8_t backdrop = 0;     /* SU3000 cloud cards: drawn first (the HLE orders them so) with depth write off, never hide what lies behind */
+    uint8_t bright = 0;       /* lit from within: drawn full colour, the game lights ignored (Phantom Freight pumpkins) */
+    float lum = 1.f;          /* HIRES meshes: light level (the museum's spotlight on the narrated piece, the rest dimmer) */
+    float gloss = 0.f;        /* HIRES meshes: 0..1 specular shine on top of the texture (glossy plastic pods / cabinets, 10-29) */
+    uint32_t statue = 0;      /* HIRES meshes: 0xRRGGBB = drawn untextured in this one colour (the ending's glossy statue people, 10-29) */
+    uint8_t grime = 0;        /* VPIX_GRIME: dirtied track piece (darker / mottled polygons) */
     uint8_t headlock = 0;     /* drawn relative to the game camera = locked to the head: 1 PEARL sell messages (VPIX_PANEL_HEADLOCK, full colour), 2 with a screen picture (VPIX_PICTURE_HEADLOCK, shaded) */
 };
 
@@ -47,6 +52,7 @@ struct VPIX_Blit {
     float pos[3];             /* world position (model slot T) */
     float pivot[2];           /* +0x1E/+0x22: pivot within the sprite (from its left / bottom) */
     float tint[3] = {1, 1, 1}; /* VPIX_GLYPH_COLOUR: flag 0x800 colour at +0x2C for 1 bpp glyphs (Ghost Train letters + shadows) */
+    bool screen_size = false; /* world sprite whose dw / dh are pixels on the 352-wide screen, not world units */
     float tint2[3] = {1, 1, 1}; bool grad = false;   /* flag 0x1000: colour pair, the card fades the glyph from tint (top row) to tint2 (+0x30, bottom row): Missile Command's
                                                         score red -> yellow, PLEASE FOCUS white -> blue (reference pairs 10-25) */
     float pal0[3] = {-1, -1, -1};   /* model slot palette entry 0: the colour of a 4-shade (2 bpp) bitmap on the card (DN2 egg yellow, PEARL pearls red); -1 = none */
@@ -54,6 +60,8 @@ struct VPIX_Blit {
     int32_t prio = 0;         /* model slot +0x54: the card's draw priority (higher = in front); VPIX_BLIT_PRIORITY games use it */
     bool backdrop = false;    /* VPIX_BLIT_PRIORITY: priority below every 3D model in the view -> drawn behind the 3D scene */
     bool mid = false;         /* PEARL: a 3D model has a higher priority -> drawn between the models (those above it in front) */
+    bool top = false;         /* world sprite drawn last, over the 2D layer, no depth test (MallVR's own 3D titles / trick words) */
+    bool nofog = false;       /* world sprite drawn without the fog (Phantom Freight targets: the pulsing fog made them fade in and out) */
 };
 
 struct VPIX_Frame {
@@ -69,8 +77,10 @@ struct VPIX_Frame {
     float walk_yaw = 0;       /* VPIX_WALK_TURN (Pac-Man): the fake head turn inside head_fed (strafe / back); camera-space lights undo it */
     float player_height = 0;  /* mm, calibrated by the game at the "focus visette" step (0 = not yet) */
     float crouch_mm = 0;      /* VPIX_CROUCH games: how far head_fed was lowered by the crouch button (the eye drops the same) */
+    int8_t dual_flash = -1;   /* VPIX_DUAL_GUN: hand whose muzzle flashes this frame (0 right, 1 left, -1 none) */
     int game_mode = -1;       /* game_mode of local slot 0 when the game has the symbol (DAC: 0 play, 3 GAME OVER, 7 initials, 2 attract), else -1 */
     bool hold = false;        /* renderer only (VPIX_HOLD_VIEW): game camera frozen, head_fed = the pose that built it */
+    bool lock_view = false;   /* VPIX_ATTRACT_LOCK: the game is in its attract: the view is locked to the head (no look-around), eyes keep their stereo offset */
     uint32_t static_tex = 0;  /* PIX_DrawStatic this frame: texture handle filling the view as TV static (0 = none) */
     uint16_t static_w = 0, static_h = 0, static_rx = 0, static_ry = 0;   /* texel window size + the call's two random words (offset) */
     /* the game's light table (PIX_SetLightSource: 4 lights x 0x38, the card gets ambient +0, diffuse +8, world direction +0x10;
@@ -81,7 +91,20 @@ struct VPIX_Frame {
     std::vector<Line> lines;  /* PIX_DrawLine this frame, screen pixels (Sea Diving's air-dial needle) */
     std::vector<VPIX_Instance> inst;
     std::vector<VPIX_Blit> blits;
+    /* VPIX_AERIAL3K (run_su3k.sh pacman): the game's second camera for people watching (Pac-Man VR's top-down aerial_view, the cabinet
+       monitor): its camera and models. The window shows it while the headset plays (V flips the window between it and the player's view) */
+    bool aer = false; float aer_R[3][3] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}}, aer_T[3] = {0, 0, 0};
+    std::vector<VPIX_Instance> aer_inst;
+    std::vector<VPIX_Blit> aer_blits;     /* its bitmaps in the 3D world (Pac-Man VR's pellets and power pellets) */
+    /* VPIX_RTT3K (run_su3k.sh pacman): a view the game renders into a picture of its own, which it then pastes like any bitmap (Pac-Man
+       VR's alarm clock: view 5 = red sweep + blue hand, drawn into a 64 x 67 picture laid over the clock body). Blits with handle
+       VPIX_RTT_HANDLE show it */
+    bool rtt = false; float rtt_R[3][3] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}}, rtt_T[3] = {0, 0, 0};
+    std::vector<VPIX_Instance> rtt_inst;   /* its 3D models: masks, drawn in the key colour ("K BLUE" CLKMSK01..59) = see-through */
+    std::vector<VPIX_Blit> rtt_blits;      /* its screen bitmaps (handle 0x10000000 slots: the red clock face), in the picture's pixels */
+    bool clear0 = false;      /* clear to see-through (the render-to-picture pass) */
 };
+#define VPIX_RTT_HANDLE 0x9FFFFFF0u
 
 /* Controller/headset state, written by the render thread (OpenVR or desktop fallback),
    read by the HLE thread when the game asks for tracker records or the joystick. */
@@ -103,7 +126,9 @@ struct VPIX_Input {
     float crouch_mm = 0;      /* VPIX_CROUCH games: crouch button held -> head and hand fed this many mm lower */
     float gun_dx = 0, gun_dz = 0, gun_dy = 0;   /* gun_dy: mm forward (left touchpad left/right) */
     float throttle = 0, brake = 0;   /* analog triggers 0..1 (right / left, /actions/main/in/throttle + brake): Buggy Ball gas + brake */
+    bool fire2 = false;       /* left trigger held (raw): VPIX_DUAL_GUN fires the left gun with it */
     bool top = false, b2 = false;   /* right grip (top) / B buttons (crouch action), raw: Buggy Ball turbo */
+    bool jump = false;        /* VPIX_JUMP (Ghost Train Hunted, dev): cart hop button held - left trigger (B when VPIX_DUAL_GUN owns it), window: E */
     bool voice_mute = false;  /* voice chat mute button held (Index left stick click / window M); vpix_voice.h toggles on the press */
     int aim_mode = 0;         /* VPIX_AIM_MODES: 0 = free (snap on the sights only), 1 = assisted (the old way); left trigger toggles */   /* VPIX_GUN_NUDGE: mm the fed gun is moved right of the facing / up (right touchpad, saved per game) */
 };
@@ -114,6 +139,8 @@ bool VPIX_Render_AddModel(uint32_t handle, const uint8_t *data, size_t len);
 struct VPIX_MeshPoly { uint8_t n = 0; uint32_t idx[16]; uint32_t flags = 0; uint32_t vcol[16]; float nx = 0, ny = 0, nz = 1;
                        uint32_t tex = 0; float uv[16][2]; };   /* tex != 0: renderer texture handle, drawn with the per-corner uv (0..1) */
 bool VPIX_Render_AddMesh(uint32_t handle, const std::vector<float> &verts, const std::vector<VPIX_MeshPoly> &polys);
+/* the same, drawn fast (cached on the GPU): big textured meshes (the museum's hi-res models), one texture (polys[0].tex) */
+bool VPIX_Render_AddMeshHires(uint32_t handle, const std::vector<float> &verts, const std::vector<VPIX_MeshPoly> &polys);
 /* SU3000: a texture decoded by the HLE (GiGi memory), RGBA bytes in GL order */
 bool VPIX_Render_AddTextureRGBA(uint32_t handle, int w, int h, const uint32_t *rgba);
 /* model file name, as loaded by PIX_LoadModel (used by dev-only tooling; no-op otherwise) */

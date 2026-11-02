@@ -61,6 +61,16 @@ rep(`    const char *ve = getenv("VPIX_VR");
         if (!xr_up) { rl("XR eye FBOs FAILED -> OpenVR"); xr_shutdown(); }
         else SetWindowTextA(hw, "MallVR - Gainesphere Studios - OpenXR (left eye mirror)");
     }
+#ifdef __ANDROID__
+    /* Quest: without OpenXR the picture only reaches the 16x16 pbuffer and the controllers are dead, so the player is stuck on
+       DOSBox's screen with sound (report 2026-10-31, Quest 2 on old system software, xrCreateInstance -51). Close and let the
+       launcher explain (MallVRActivity "XRFAIL", LauncherActivity.xrCheck reads this log) */
+    if (!xr_up && !(ve && atoi(ve) == 0)) {
+        rl("XR not up on Quest: no picture without OpenXR, closing (the launcher explains)");
+        pmenu_init(); std::string l = "XRFAIL " + game_code(); pmenu_send(l.c_str());
+        Sleep(500); ExitProcess(0);
+    }
+#endif
     if (xr_up) {}
     else if (!(ve && atoi(ve) == 0) && vr::VR_IsHmdPresent() && load_fbo()) {`);
 rep(`    if (swi) swi(sys ? 0 : 1);`, `    if (swi) swi((sys || xr_up) ? 0 : 1);`);
@@ -73,7 +83,10 @@ rep(`        VPIX_Pose eye_pose[2], head_now;
             vr::VRCompositor()->WaitGetPoses(poses, vr::k_unMaxTrackedDeviceCount, NULL, 0);
             /* the gun hand: right-hand controller, else any controller */
             vr::TrackedDeviceIndex_t ci = sys->GetTrackedDeviceIndexForControllerRole(vr::TrackedControllerRole_RightHand);
-            if (ci == vr::k_unTrackedDeviceIndexInvalid || !poses[ci].bPoseIsValid)
+            /* only with no right-hand controller at all does any controller stand in. A right controller that just lost tracking
+               for a moment keeps it (its last pose is held below): falling back then took the LEFT controller as the right hand
+               (Bobby 10-28: "at one point my right arm became my left tracking wise", and the left arm vanished with it) */
+            if (ci == vr::k_unTrackedDeviceIndexInvalid)
                 for (vr::TrackedDeviceIndex_t i = 1; i < vr::k_unMaxTrackedDeviceCount; i++)
                     if (sys->GetTrackedDeviceClass(i) == vr::TrackedDeviceClass_Controller && poses[i].bPoseIsValid) { ci = i; break; }`,
     `        VPIX_Pose eye_pose[2], head_now;
@@ -87,7 +100,10 @@ rep(`        VPIX_Pose eye_pose[2], head_now;
             vr::VRCompositor()->WaitGetPoses(poses, vr::k_unMaxTrackedDeviceCount, NULL, 0);
             /* the gun hand: right-hand controller, else any controller */
             ci = sys->GetTrackedDeviceIndexForControllerRole(vr::TrackedControllerRole_RightHand);
-            if (ci == vr::k_unTrackedDeviceIndexInvalid || !poses[ci].bPoseIsValid)
+            /* only with no right-hand controller at all does any controller stand in. A right controller that just lost tracking
+               for a moment keeps it (its last pose is held below): falling back then took the LEFT controller as the right hand
+               (Bobby 10-28: "at one point my right arm became my left tracking wise", and the left arm vanished with it) */
+            if (ci == vr::k_unTrackedDeviceIndexInvalid)
                 for (vr::TrackedDeviceIndex_t i = 1; i < vr::k_unMaxTrackedDeviceCount; i++)
                     if (sys->GetTrackedDeviceClass(i) == vr::TrackedDeviceClass_Controller && poses[i].bPoseIsValid) { ci = i; break; }
             }`);
@@ -120,7 +136,7 @@ rep(`            {   /* the left controller as a second hand (VPIX_TWO_HANDS, Bo
                 vr::TrackedDeviceIndex_t li`);
 
 // 5. rendering: projection from the OpenXR view, copy into the swapchain, end the frame
-rep(`        const VPIX_Frame &vf = (have && sys) ? glove_apply`, `        const VPIX_Frame &vf = (have && (sys || xr_up)) ? glove_apply`);
+rep(`        const VPIX_Frame &vf1 = (have && sys) ? glove_apply`, `        const VPIX_Frame &vf1 = (have && (sys || xr_up)) ? glove_apply`);
 rep(`        if (sys) {
             for (int e = 0; e < 2; e++) {`, `        if (sys || xr_up) {
             for (int e = 0; e < 2; e++) {`);

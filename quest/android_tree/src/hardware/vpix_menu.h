@@ -63,7 +63,11 @@ static bool pmenu_frame(VPIX_Acts &a, double dt) {
         if (!strncmp(buf, "RESUME", 6)) { if (pmenu.open) rl("menu: resume"); pmenu.open = false; }
         else if (!strncmp(buf, "QUIT", 4)) { rl("menu: back to the launcher"); pperf_flush(); ExitProcess(0); }
         else if (!strncmp(buf, "OPEN", 4)) pmenu.open = true;     /* the launcher's panel is up (also after a lost MENU line) */
+        else if (!strncmp(buf, "MIC ", 4)) { VPIX_Voice_SetMuted(atoi(buf + 4)); rl("menu: mic %s", atoi(buf + 4) ? "muted" : "live"); }
     }
+    /* tell the launcher the mic state whenever it changes (its VOICE CHAT page shows MIC LIVE / MUTED) */
+    static int mic_told = -1;
+    if (VPIX_Voice_Muted() != mic_told) { mic_told = VPIX_Voice_Muted(); pmenu_send(mic_told ? "MIC 1" : "MIC 0"); }
     bool combo = a.menu && a.crouch;
     if (combo) {
         /* a small tick every quarter second while held, so a quick press-and-let-go is felt as "not yet" (Bobby 10-25: he pressed

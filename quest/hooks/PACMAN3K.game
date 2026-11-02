@@ -1,0 +1,20 @@
+# Pac-Man VR v00.00.69 prototype (archive.org pacman_202009): AWE32 SDK called directly -> our mixer plays its WAVs (vpix_hle.cpp hle_awe32, 11-01)
+# LoadWAV's sample table: { char name[30]; int loop; } x 17 -> bank n + 1
+global awe_samples 0009F708
+hook aweinit R 00029C41 6858000000e8c7050000535152565755 0 0
+hook aweclose R 00029F50 6824000000e8b8020000535152565755 0 0
+# Pascal (callee pops): (ch, note, vel), (ch, controller, value), (ch, program), (ch, lsb, msb)
+hook AWE32NOTEOFF R 00042840 5589e583ec045756530fb77d1089f9c1 12 0
+hook AWE32NOTEON R 000428D0 5589e5668b5508668b4d10668b450c66 12 0
+hook AWE32CONTROLLER R 00042E94 5589e55756668b450c6683f85b0f87a5 12 0
+hook AWE32PROGRAMCHANGE R 000431E0 83ec1857565366b80100668b4c242c0f 8 0
+hook AWE32PITCHBEND R 000433D0 5589e583ec04575653668b4d08c1e107 12 0
+# the SDK's own inner routines (only called from the ones above): silent
+hook awe32NoteOffInner R 00049D44 5589e55756530fb74514c1e0080fb775 0 0
+hook awe32IsPlayingInner R 00049DAC 5589e55756530fb74d14c1e1080fb745 0 0
+# levels (11-01): the prototype only has stage 1, the title after it; vpix_hle.cpp pac_hook: level 2 = the cut temple (MODELS\STAGE2), level 3 = maze 1, arcade speeds
+hook pac_init L 000211F2 6834000000e816900000535156575589 0 0
+hook pac_is_over L 00023C00 6834000000e808660000535152565755 0 0
+hook pac_load_map L 00023EA5 6880000000e863630000535152565755 0 0
+hook pac_fade_in L 000233DC 6830000000e82c6e0000535152565755 0 0
+hook pac_eat_pills L 000246D6 6834000000e8325b0000535152565755 0 0

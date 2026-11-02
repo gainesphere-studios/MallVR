@@ -6,19 +6,27 @@
 #   play.ps1 dac -Pod 1                          pod 1 = master, pod 2.. = slaves (follow the master's start)
 #   play.ps1 dac -Pod 2 -Peers 192.168.1.20      the other pods' addresses (default: pods on this PC)
 #   -Desktop                                     no headset for this copy (a window, keyboard controls)
-param([Parameter(Mandatory = $true)][string]$Game, [int]$Pod = 0, [string]$Peers = '', [switch]$Desktop)
+#   -Options 'time:60,death:1'                   the game's OPTIONS (options.ps1) from the online host, instead of settings\options_<CODE>.txt ('none' = defaults)
+param([Parameter(Mandatory = $true)][string]$Game, [int]$Pod = 0, [string]$Peers = '', [switch]$Desktop, [string]$Options = '')
 $ErrorActionPreference = 'Stop'
 $Engine = $PSScriptRoot
 $Root = Split-Path -Parent $Engine
 . (Join-Path $Engine 'games.ps1')
+. (Join-Path $Engine 'options.ps1')
 
 function Fail($msg) {
     Add-Type -AssemblyName System.Windows.Forms
     [void][System.Windows.Forms.MessageBox]::Show($msg, 'MallVR', 'OK', 'Error')
     exit 2      # the launcher's play notes: "couldn't start", not a crash
 }
-# the engine is a 64-bit program: on 32-bit Windows it can't start at all, headset or window (bug list 10-24: a Win10 32-bit PC)
-if (-not [Environment]::Is64BitOperatingSystem) { Fail "MallVR needs 64-bit Windows 10 or 11.`n`nThis PC runs 32-bit Windows, which can't start MallVR's engine (with or without a headset)." }
+# the engine is a 64-bit program. 32-bit Windows gets the 32-bit build in engine\x86, window mode only (DevilMaster 10-22:
+# a Win10 32-bit PC; SteamVR needs 64-bit Windows anyway). Copies without engine\x86 say so instead of a game that never opens.
+$dosbox = Join-Path $Engine 'dosbox-x.exe'
+if (-not [Environment]::Is64BitOperatingSystem -or $env:MALLVR_FORCE_X86 -eq '1') {   # MALLVR_FORCE_X86: dev test of the 32-bit path
+    $dosbox = Join-Path $Engine 'x86\dosbox-x.exe'
+    if (-not (Test-Path -LiteralPath $dosbox)) { Fail "MallVR needs 64-bit Windows 10 or 11.`n`nThis PC runs 32-bit Windows, which can't start MallVR's engine (with or without a headset)." }
+    $Desktop = $true
+}
 
 # game code from a code or an EXE path
 $code = [IO.Path]::GetFileNameWithoutExtension($Game).ToUpper()
@@ -29,6 +37,15 @@ if (Test-Path -LiteralPath $Game -PathType Leaf) {
 }
 if (-not $Games.Contains($code)) { Fail "Unknown game '$Game'.`n`nKnown games: $($Games.Keys -join ', ')" }
 $info = $Games[$code]
+# its VERSION row (options.ps1): another build, with its own entry in games.ps1. An EXE path means that very EXE
+if (-not (Test-Path -LiteralPath $Game -PathType Leaf)) {
+    $v = Get-MVVersion $code (Join-Path $Root 'settings') $Options
+    if ($v) { $code = $v; $info = $Games[$code] }
+}
+# a game built on another one's files (Phantom Freight = Ghost Train): Base = that game's code (EXE, .INF, hook table, link settings)
+$base = $(if ($info.Base) { $info.Base } else { $code })
+$family = $(if ($info.CloneOf) { $info.CloneOf } else { $base })   # a clone (games.ps1) has that game's settings files and OPTIONS
+$optCode = $(if ($info.CloneOf) { $info.CloneOf } else { $code })
 $exeName = $(if ($info.Exe) { $info.Exe } else { $code })
 # native rebuild (Buggy Ball): no DOS EXE, the engine runs the game from its data folder (games\...\BALL\RUNFILES\CARS.DBS)
 if ($info.Native) {
@@ -46,14 +63,30 @@ else {
         Where-Object { $_.Directory.Name -ieq $exeName }
     $exe = $null
     foreach ($c in $cands) {
+        # another build's EXE (games.ps1 VersionOf) has the same name: a version entry takes only its own, the game itself skips those
+        $vh = (Get-FileHash -LiteralPath $c.FullName -Algorithm SHA1).Hash.ToLower()
+        if ($info.VersionOf) { if ($vh -eq $info.Sha1) { $exe = $c.FullName; break }; continue }
+        if (@($Games.Values | Where-Object { $_.VersionOf -and $_.Sha1 -eq $vh }).Count) { continue }
         $isSu3k = $false
         foreach ($k in $Games.Keys) { if ($Games[$k].Su3k -and $Games[$k].Exe -ieq $exeName -and $Games[$k].Sha1 -eq (Get-FileHash -LiteralPath $c.FullName -Algorithm SHA1).Hash.ToLower()) { $isSu3k = $true } }
         if ([bool]$info.Su3k -eq $isSu3k) { $exe = $c.FullName; break }
     }
 }
+if (-not $exe -and $info.GetHint) { Fail "$($info.Name) isn't installed.`n`nPress GET GAMES and get $($info.GetHint)." }
 if (-not $exe) { Fail "$($info.Name) was not found.`n`nPut your Virtuality $(if ($info.Su3k) { 'SU3000' } else { 'SU2000' }) HDD dump inside the 'games' folder, then run Check_My_Games.bat." }
 $gameDir = Split-Path -Parent $exe
 $driveC = Split-Path -Parent $gameDir           # the dump root: holds DAC\, PAC\, DOS\ ...
+
+# a build that came as just its game folder (games.ps1 CloneOf): the drive around it (the card's CONFIG.VPC, DOS4GW in UTILS ...) copied once from the SU2000 dump
+if ($info.CloneOf) {
+    $su = Get-ChildItem -LiteralPath (Join-Path $Root 'games') -Recurse -Filter 'DOS4GW.EXE' -File -ErrorAction SilentlyContinue | Where-Object { $_.Directory.Name -ieq 'UTILS' } | Select-Object -First 1
+    foreach ($n in 'CONFIG.VPC', 'KEYWORD.VPC', 'VPCEXEC.BAT', 'UTILS', 'DOS', 'VPCSYS', 'VPCTEMP') {
+        if (Test-Path -LiteralPath (Join-Path $driveC $n)) { continue }
+        if (-not $su) { Fail "$($info.Name) needs the SU2000 dump too.`n`nPress GET GAMES and get SU2000 HDD DUMP." }
+        $from = Join-Path (Split-Path -Parent $su.DirectoryName) $n
+        if (Test-Path -LiteralPath $from) { Copy-Item -LiteralPath $from -Destination $driveC -Recurse -Force }
+    }
+}
 
 # CD-ROM drive F: the game's disc image when it needs one, else an empty folder (MSCDEX still answers)
 $cdLine = "mount f `"$(Join-Path $Engine 'emptycd')`" -t cdrom"
@@ -66,7 +99,7 @@ if ($info.Cd) {
 
 # disc-check signature for games without an image: CODE and NAME lines from the game's .INF
 $sig = ''
-$inf = Join-Path $gameDir "$code.INF"
+$inf = Join-Path $gameDir "$(if ($info.CloneOf) { $info.Exe } else { $base }).INF"
 if (Test-Path -LiteralPath $inf) {
     $c = ''; $n = ''
     foreach ($line in Get-Content -LiteralPath $inf) {
@@ -76,11 +109,15 @@ if (Test-Path -LiteralPath $inf) {
     $sig = "$c|$n"
 }
 
+if ($info.CdSig) { $sig = $info.CdSig }
 $logs = Join-Path $Root 'logs'
 $settings = Join-Path $Root 'settings'
 New-Item -ItemType Directory -Force $logs, $settings | Out-Null
 $g = $code.ToLower()
 $tag = $g
+# the game's OPTIONS (options.ps1): the player's settings\options_<CODE>.txt, or the online host's -Options
+$optSaved = Read-MVOptions $optCode $settings $Options
+$optFiles = @(Get-MVOptionRows $optCode | Where-Object { $_.Kind -eq 'file' }).Count -gt 0
 
 # linked pod: its own writable layer over C: (network settings, scores) so pods can share one game folder
 $ovLine = ''
@@ -89,9 +126,11 @@ if ($Pod -gt 0) {
     $maxPods = $(if ($info.MaxPlayers) { [int]$info.MaxPlayers } else { 4 })
     if ($Pod -gt $maxPods) { Fail "$($info.Name) links $maxPods pods at most: pod number must be 1 to $maxPods." }
     $tag = "${g}_pod$Pod"
-    $ov = Join-Path $settings "pod$Pod"
+    $ov = Join-Path $settings $(if ($info.Overlay) { "$($info.Overlay)_pod$Pod" } else { "pod$Pod" })   # Overlay games: their own layer per pod
     New-Item -ItemType Directory -Force $ov | Out-Null
-    if ($code -eq 'DAC') {
+    # options first (same files as the network lines below, which then keep them)
+    if ($optFiles) { [void](Write-MVOptionFiles $optCode $gameDir $ov $optSaved) }
+    if ($family -eq 'DAC') {
         # RUNFILES\DEFAULTS.DN2: line 5 = network on, line 6 = master (1) / slave (0)
         $dn2 = Join-Path $ov 'DAC\RUNFILES\DEFAULTS.DN2'
         $src = if (Test-Path -LiteralPath $dn2) { $dn2 } else { Join-Path $gameDir 'RUNFILES\DEFAULTS.DN2' }
@@ -101,7 +140,7 @@ if ($Pod -gt 0) {
         New-Item -ItemType Directory -Force (Split-Path -Parent $dn2) | Out-Null
         [IO.File]::WriteAllText($dn2, ($lines -join "`r`n") + "`r`n")
     }
-    if ($code -eq 'DN2') {
+    if ($family -eq 'DN2') {
         # Dactyl Nightmare 2 keeps a shorter RUNFILES\DEFAULTS.DN2: line 3 = network on, line 4 = master (1) / slave (0)
         $dn2 = Join-Path $ov 'DN2\RUNFILES\DEFAULTS.DN2'
         $src = if (Test-Path -LiteralPath $dn2) { $dn2 } else { Join-Path $gameDir 'RUNFILES\DEFAULTS.DN2' }
@@ -111,7 +150,7 @@ if ($Pod -gt 0) {
         New-Item -ItemType Directory -Force (Split-Path -Parent $dn2) | Out-Null
         [IO.File]::WriteAllText($dn2, ($lines -join "`r`n") + "`r`n")
     }
-    if ($code -eq 'GHOST') {
+    if ($family -eq 'GHOST') {
         # RUNFILES\LASTSETS.DBS (operator screen settings): line 2 = network link on (else the operator settings switch /nm /ns off)
         $ls = Join-Path $ov 'GHOST\RUNFILES\LASTSETS.DBS'
         $src = if (Test-Path -LiteralPath $ls) { $ls } else { Join-Path $gameDir 'RUNFILES\LASTSETS.DBS' }
@@ -121,7 +160,7 @@ if ($Pod -gt 0) {
         New-Item -ItemType Directory -Force (Split-Path -Parent $ls) | Out-Null
         [IO.File]::WriteAllText($ls, ($lines -join "`r`n") + "`r`n")
     }
-    if ($code -eq 'PEARL') {
+    if ($base -eq 'PEARL') {
         # RUNFILES\SETTINGS.PRL (Dactyl engine, read as numbers): line 2 = network on, line 3 = master (1) / slave (0)
         $sp = Join-Path $ov 'PEARL\RUNFILES\SETTINGS.PRL'
         $src = if (Test-Path -LiteralPath $sp) { $sp } else { Join-Path $gameDir 'RUNFILES\SETTINGS.PRL' }
@@ -131,7 +170,7 @@ if ($Pod -gt 0) {
         New-Item -ItemType Directory -Force (Split-Path -Parent $sp) | Out-Null
         [IO.File]::WriteAllText($sp, ($lines -join "`r`n") + "`r`n")
     }
-    if ($code -eq 'SFL') {
+    if ($base -eq 'SFL') {
         # CONFIG.BIN = 5 x int32 {?, time, hiscore keep, network 0 none / 1 master / 2 slave, camera}
         $cb = Join-Path $ov 'SFL\CONFIG.BIN'
         $src = if (Test-Path -LiteralPath $cb) { $cb } else { Join-Path $gameDir 'CONFIG.BIN' }
@@ -143,8 +182,64 @@ if ($Pod -gt 0) {
     }
     $ovLine = "mount -t overlay c `"$ov`""
 }
+# solo with options in the game's settings files: a layer of its own (settings\opt_<code>, or the Overlay game's), so the player's game
+# files never change. Used from the first time the options were saved on, so the scores stay in one place after that.
+elseif ($optFiles -and ($info.Overlay -or $Options -or (Test-Path -LiteralPath (Join-Path $settings "options_$optCode.txt")))) {
+    $ov = Join-Path $settings $(if ($info.Overlay) { $info.Overlay } else { "opt_$g" })
+    New-Item -ItemType Directory -Force $ov | Out-Null
+    [void](Write-MVOptionFiles $optCode $gameDir $ov $optSaved)
+    $ovLine = "mount -t overlay c `"$ov`""
+}
+# RANDOM ENEMIES (options.ps1): a shuffled copy of the level data in a layer of its own, reshuffled each launch. OFF = no layer, the original data
+$shuffleRow = Get-MVOptionRows $optCode | Where-Object { $_.Shuffle } | Select-Object -First 1
+if ($shuffleRow -and (Get-MVOptionValue $shuffleRow $optSaved) -ne $shuffleRow.Default) {
+    if (-not $ovLine) { $ov = Join-Path $settings "opt_$g"; New-Item -ItemType Directory -Force $ov | Out-Null; $ovLine = "mount -t overlay c `"$ov`"" }
+    try { Write-MVZoneShuffle $gameDir $ov (Get-Random -Maximum 2147483647) }
+    catch { Fail "$($info.Name) could not shuffle its enemies.`n`n$($_.Exception.Message)" }
+}
+# Overlay = <name> (Phantom Freight): the game always runs on its own writable layer over C: (settings\<name>), so its scores and
+# settings never touch the base game's files; engine\mods\<name>\ (its changed game files, same paths as on C:) is copied on top
+if ($info.Overlay) {
+    if ($Pod -le 0) { $ov = Join-Path $settings $info.Overlay; New-Item -ItemType Directory -Force $ov | Out-Null; $ovLine = "mount -t overlay c `"$ov`"" }
+    $mods = Join-Path $Engine "mods\$($info.Overlay)"
+    if (Test-Path -LiteralPath $mods) { Copy-Item -Path (Join-Path $mods '*') -Destination $ov -Recurse -Force }
+    # ModScript (Phantom Freight: phantom_mod.ps1): makes its changed files from the player's own base-game files (never shipped)
+    if ($info.ModScript) {
+        try { & (Join-Path $Engine $info.ModScript) -Src (Join-Path $gameDir 'RUNFILES') -Dst (Join-Path $ov "$base\RUNFILES") | Out-Null }
+        catch { Fail "$($info.Name) could not be set up from your $base files.`n`n$($_.Exception.Message)" }
+    }
+}
 $conf = Join-Path $logs "$tag.conf"
 $gameArgs = $(if ($Pod -gt 0 -and $info.PodArgs) { $info.PodArgs[$Pod - 1] } else { $info.Args })   # linked pods: their own launch line (Ghost Train car + master/slave)
+$gameArgs = Add-MVOptionArgs $optCode $gameArgs $optSaved   # the OPTIONS' own switches (Boxing /t /S /G /l, Zone /J ...)
+# music from the player's CD image (games.ps1 CdRip): the tracks CdMap names, to WAVs once. The game's /cd+ only with music to play
+$ripDir = ''
+if ($info.CdRip) {
+    $cue = Get-ChildItem -LiteralPath (Join-Path $Root 'games') -Recurse -Filter $info.CdRip -File -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($cue) { try {
+        $dir = Join-Path $settings "cd_$code"; New-Item -ItemType Directory -Force $dir | Out-Null
+        $at = @{}; $n = 0
+        foreach ($l in Get-Content -LiteralPath $cue.FullName) {
+            if ($l -match 'TRACK\s+(\d+)') { $n = [int]$Matches[1] }
+            elseif ($l -match 'INDEX\s+01\s+(\d+):(\d+):(\d+)') { $at[$n] = ([int]$Matches[1] * 60 + [int]$Matches[2]) * 75 + [int]$Matches[3] }
+        }
+        $bin = [IO.Path]::ChangeExtension($cue.FullName, '.BIN')
+        foreach ($m in $info.CdMap -split ',') {
+            $t = [int]($m -split ':')[1]; $wav = Join-Path $dir ('TRACK{0:00}.WAV' -f $t)
+            if (Test-Path -LiteralPath $wav) { continue }
+            $from = [long]$at[$t] * 2352; $bytes = $(if ($at.ContainsKey($t + 1)) { [long]($at[$t + 1] - $at[$t]) * 2352 } else { (Get-Item -LiteralPath $bin).Length - $from })
+            $i = [IO.File]::OpenRead($bin); $o = [IO.File]::Create("$wav.part"); $w = New-Object IO.BinaryWriter($o)
+            $w.Write([Text.Encoding]::ASCII.GetBytes('RIFF')); $w.Write([int]($bytes + 36)); $w.Write([Text.Encoding]::ASCII.GetBytes('WAVEfmt ')); $w.Write([int]16); $w.Write([int16]1); $w.Write([int16]2)
+            $w.Write([int]44100); $w.Write([int]176400); $w.Write([int16]4); $w.Write([int16]16); $w.Write([Text.Encoding]::ASCII.GetBytes('data')); $w.Write([int]$bytes); $w.Flush()
+            [void]$i.Seek($from, 'Begin'); $buf = New-Object byte[] 1048576; $left = $bytes
+            while ($left -gt 0) { $r = $i.Read($buf, 0, [int][Math]::Min($left, $buf.Length)); if ($r -le 0) { break }; $o.Write($buf, 0, $r); $left -= $r }
+            $w.Close(); $i.Close()
+            Move-Item -LiteralPath "$wav.part" $wav
+        }
+        $ripDir = $dir
+    } catch { $ripDir = '' } }
+    $gameArgs = "$(if ($ripDir) { '/cd+' } else { '/cd-' }) $gameArgs"
+}
 $exeDir = $exeName.ToLower()
 if ($info.Su3k) {
     # SU3000 / 2000E pod PC: Pentium, 64 MB, Sound Blaster 16 (the AWE32 module is answered by the engine)
@@ -194,7 +289,7 @@ exit
 Get-ChildItem -LiteralPath $logs -Filter "$tag.*" -File | Where-Object { $_.Extension -ne '.conf' } | Remove-Item -Force
 $env:VPIX_PLAY = '1'
 $env:VPIX_LOG = Join-Path $logs $tag
-$env:VPIX_HOOKS = $(if ($info.Native) { '' } else { Join-Path $Engine "hooks\$code.hooks" })
+$env:VPIX_HOOKS = $(if ($info.Native) { '' } else { Join-Path $Engine "hooks\$base.hooks" })
 $env:VPIX_SETTINGS = Join-Path $settings 'vpix_settings.txt'
 $env:VPIX_CDSIG = $sig
 $env:VPIX_FPS = "$($info.Fps)"
@@ -213,6 +308,7 @@ $env:VPIX_GLYPH_COLOUR = $(if ($info.GlyphColour) { '1' } else { '0' })   # lett
 $env:VPIX_SCARED_FACE = $(if ($info.ScaredFace) { '1' } else { '0' })   # Pac-Man: scared faces on blue ghosts
 $env:VPIX_FLIC_CENTRE = $(if ($info.FlicCentre) { '1' } else { '0' })   # Pac-Man: FLIC position is the centre
 $env:VPIX_MATERIALS = $(if ($info.Materials) { '1' } else { '0' })   # Pac-Man: type 0x68 polygons textured through PIX_SetMaterial (blue ghosts)
+$env:VPIX_SNOW = $(if ($info.Snow) { '1' } else { '0' })   # Dactyls: what wears PIX_DrawStatic's texture (portals) shows moving TV snow
 $env:VPIX_HIDE_OWN_HEAD = $(if ($info.HideOwnHead) { '1' } else { '0' })   # DAC: own head model locked behind the eye (view went inside it)
 $env:VPIX_CROUCH = $(if ($info.Crouch) { '1' } else { '0' })   # DAC/DN2: hold the crouch button = head fed 400 mm lower (the game's crouch state)
 $env:VPIX_HOLD_VIEW = $(if ($info.HoldView) { '1' } else { '0' })   # DAC/DN2: round over (frozen game camera): look around + gun stay live
@@ -223,6 +319,15 @@ $env:VPIX_NEAR_MODELS = $(if ($info.NearModels) { $info.NearModels } else { '' }
 $env:VPIX_ONE_SIDED = $(if ($info.OneSided) { $info.OneSided } else { '' })   # ZONE: vr_logo white panels one-sided
 $env:VPIX_POLY_SELECT = $(if ($info.PolySelect) { $info.PolySelect } else { '' })   # ZONE: scorepow bonus box shows only the picked strokes
 $env:VPIX_MUZZLE = $(if ($info.Muzzle) { $info.Muzzle } else { '' })   # ZONE: first gun's muzzle flash, a burst per own shot sound
+$env:VPIX_DUAL_GUN = $(if ($info.DualGun) { "$($info.DualGun)" } else { '0' })   # Phantom Freight: a gun in each hand, shots per second
+# its gun model: Zone Hunter's (kickW\gun.bin, has a muzzle flash) when the player has Zone, else the base game's DualGunModel
+$env:VPIX_DUAL_GUN_MODEL = ''
+if ($info.DualGun) {
+    $zg = Get-ChildItem -LiteralPath (Join-Path $Root 'games') -Recurse -Filter 'GUN.BIN' -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.Directory.Name -ieq 'KICKW' } | Select-Object -First 1 -ExpandProperty FullName
+    if (-not $zg -and $info.DualGunModel) { $zg = Join-Path $gameDir $info.DualGunModel }
+    if ($zg -and (Test-Path -LiteralPath $zg)) { $env:VPIX_DUAL_GUN_MODEL = $zg }
+}
 $env:VPIX_PICTURE_HEADLOCK = $(if ($info.PictureLock -is [bool]) { if ($info.PictureLock) { '1' } else { '0' } } elseif ($info.PictureLock) { "$($info.PictureLock)" } else { '0' })   # ZONE: opening title + logo locked to the view with the picture
 $env:VPIX_PICTURE_WAIT_MS = $(if ($info.PictureWait) { "$($info.PictureWait)" } else { '0' })   # ZONE: picture held back until its texts are up
 $env:VPIX_PANEL_WORLD = $(if ($info.PanelWorld) { '1' } else { '0' })   # ZONE: attract 2D layer fixed to the game camera
@@ -248,13 +353,22 @@ if ($info.CdAudio) {
         Select-Object -First 1 -ExpandProperty FullName
     if ($cdDir) { $env:VPIX_CD_DIR = $cdDir }
 }
+if ($ripDir) { $env:VPIX_CD_DIR = $ripDir }
+if ($info.CdMap) { $env:VPIX_CD_MAP = $info.CdMap } else { Remove-Item Env:VPIX_CD_MAP -ErrorAction SilentlyContinue }
 $env:VPIX_PICTURE_BACK = $(if ($info.PictureBack -is [bool]) { if ($info.PictureBack) { '1' } else { '0' } } elseif ($info.PictureBack) { "$($info.PictureBack)" } else { '0' })   # ZONE 1: big opaque screen picture = bottom layer; SFL 2: translucent ones too
 $env:VPIX_BLIT_PRIORITY = $(if ($info.BlitPriority) { '1' } else { '0' })   # DAC: bitmaps in the card's priority order; title/intro picture under the 3D logos + texts
 $env:VPIX_BLIT_UNDER = $(if ($info.BlitUnder) { $info.BlitUnder } else { '' })   # PAC 'bells': alarm clock bells under the clock face
 $env:VPIX_HIDE_ABOVE = $(if ($info.HideAbove) { "$($info.HideAbove)" } else { '' })   # SFL 5000: under the level (character select) the level is not drawn
 $env:VPIX_DEPTH_FIX = $(if ($info.DepthFix) { '1' } else { '0' })   # reversed-Z float depth: no z-fighting of distant decals
 $env:VPIX_PRIO_LAYERS = $(if ($info.PrioLayers) { '1' } else { '0' })   # Olin Shotgun: models in the card's priority layers (back panels / dome never hide targets)
+$env:VPIX_BRIGHT_MODELS = $(if ($info.BrightModels) { $info.BrightModels } else { '' })   # Pac-Man: floor + ghost cards at full colour (card match 11-01)
 $env:VPIX_LIGHT_WORLD = $(if ($info.LightWorld) { '1' } else { '0' })   # Olin Shotgun: the game's lights are world directions (card match 10-25)
+$env:VPIX_PAL6 = $(if ($info.Pal6) { '1' } else { '0' })   # Olin Shotgun: 6-bit Gouraud palette colours (the big-top tent was near black, 10-27)
+$env:VPIX_SPRITE_CARD = $(if ($info.SpriteCard) { '1' } else { '0' })   # Olin Shotgun: score digits over their cards, stopwatch number (10-27)
+$env:VPIX_KEY_FRINGE = $(if ($info.KeyFringe) { [string]$info.KeyFringe } else { '0' })   # Olin Shotgun: no blue edge round the stopwatch (10-27)
+$env:VPIX_SPRITE_TOP = $(if ($info.SpriteTop) { $info.SpriteTop } else { '' })   # Olin Shotgun: QUALIFIED sign over the score cards (10-27)
+$env:VPIX_SKY_SPRITE = $(if ($info.SkySprite) { $info.SkySprite } else { '' })   # Missile Command: the moons in the blue sky, painted right after the sky (11-01)
+$env:VPIX_PAD5_BLACK = $(if ($info.Pad5Black) { '1' } else { '0' })   # Dactyl 2: platform corners black, not cyan (11-01)
 $env:VPIX_HIDE_DEATH_BOX = $(if ($info.DeathBox) { '1' } else { '0' })   # DAC: black death/respawn box only drawn from inside
 if ($info.HandXY) { $env:VPIX_HAND_XY = "$($info.HandXY)" } else { Remove-Item Env:VPIX_HAND_XY -ErrorAction SilentlyContinue }   # tracker scale (Boxing: real mm)
 $env:VPIX_JOYAXES = $(if ($info.JoyAxes) { '1' } else { '0' })   # thumbsticks = pod joystick axes
@@ -275,7 +389,7 @@ $env:VPIX_DESK_BOX = $(if ($info.DeskBox) { '1' } else { '0' })   # window mode:
 $env:VPIX_TRIM_LOCK = $(if ($info.TrimLock) { '1' } else { '0' })   # touchpad trims off, saved reach / arm height ignored (Boxing: thumbs brushed the pads mid-punch)
 $env:VPIX_BOX_KO_LIFT = $(if ($info.KoLift) { '1' } else { '0' })   # KO'd boxer lifted onto the mat (no sinking)
 $env:VPIX_DECAL_STACK = $(if ($info.DecalStack) { '1' } else { '0' })   # coplanar floor decals in card order (Boxing ring, DN2 arena; no flicker)
-foreach ($kv in @(@('HandFwdOff', 'VPIX_HAND_FWD_OFF'), @('HandReachFight', 'VPIX_HAND_REACH_FIGHT'), @('PunchRel', 'VPIX_BOX_PUNCH_REL'), @('HandXSpread', 'VPIX_HAND_X_SPREAD'),
+foreach ($kv in @(@('HandFwdOff', 'VPIX_HAND_FWD_OFF'), @('HandReachFight', 'VPIX_HAND_REACH_FIGHT'), @('PunchRel', 'VPIX_BOX_PUNCH_REL'), @('HandXSpread', 'VPIX_HAND_X_SPREAD'), @('SelectFeed', 'VPIX_BOX_SELECT_FEED'),
                   @('HandZRight', 'VPIX_HAND_Z_RIGHT'), @('KoExtra', 'VPIX_BOX_KO_EXTRA'), @('DecalBias', 'VPIX_DECAL_BIAS'))) {
     if ($info[$kv[0]]) { Set-Item "Env:$($kv[1])" "$($info[$kv[0]])" } else { Remove-Item "Env:$($kv[1])" -ErrorAction SilentlyContinue }
 }
@@ -304,6 +418,11 @@ $env:VPIX_BLIT3K_PRIO = $(if ($info.Blit3kPrio) { '1' } else { '0' })
 $env:VPIX_LTRIG_THUMB = $(if ($info.LtrigThumb) { '1' } else { '0' })
 $env:VPIX_FOG3K = $(if ($info.Fog3k) { '1' } else { '0' })
 $env:VPIX_MULTIVIEW3K = $(if ($info.Multiview3k) { '1' } else { '0' })   # ZENECA: scene split over views sharing one camera
+# Pac-Man VR prototype: its eye view, the watchers' aerial view, sky colour, the clock's own picture, a coin starts
+foreach ($kv in @(@('View3k', 'VPIX_VIEW3K'), @('Aerial3k', 'VPIX_AERIAL3K'), @('Sky3k', 'VPIX_SKY3K'), @('Rtt3k', 'VPIX_RTT3K'))) {
+    if ($info[$kv[0]]) { Set-Item "Env:$($kv[1])" "$($info[$kv[0]])" } else { Remove-Item "Env:$($kv[1])" -ErrorAction SilentlyContinue }
+}
+if ($info.CoinStarts) { $env:VPIX_COIN_STARTS = '1' } else { Remove-Item Env:VPIX_COIN_STARTS -ErrorAction SilentlyContinue }
 $env:VPIX_DESK_ATTRACT_LOCK = $(if ($info.Su3k) { '1' } else { '0' })   # window only: no mouse look while the camera is scripted
 if ($info.Mpeg) {   # its MPEG movies through ffmpeg (engine\ffmpeg.exe if shipped, else ffmpeg on PATH)
     $env:VPIX_MPEG_DIR = $gameDir
@@ -318,6 +437,21 @@ if ($info.Native) {
     $env:VPIX_BUGGY_MUSIC = Join-Path $Root 'music\buggy'                   # any WAVs dropped here play as the game music
 } else { Remove-Item Env:VPIX_NATIVE -ErrorAction SilentlyContinue }
 if ($Desktop) { $env:VPIX_VR = '0' }
+# RideEnv (Phantom Freight's full ride: hell, the museum, the ending): its switches from engine\<RideEnv> ({RIDE} = engine\phantom_ride,
+# built by make_package.py; {OV} = its layer). The parts made from the player's own games are found in the games folder and skipped
+# cleanly when that game isn't there: the Dactyl that snatches slow riders (Dactyl Nightmare) and the museum's visitor (its player).
+if ($info.RideEnv -and $info.Overlay) {
+    $ride = Join-Path $Engine 'phantom_ride'
+    . (Join-Path $Engine $info.RideEnv)
+    foreach ($k in $PhantomEnv.Keys) { Set-Item "Env:$k" ($PhantomEnv[$k].Replace('{RIDE}', $ride).Replace('{ENG}', $Engine).Replace('{OV}', $ov)) }
+    $dacObj = Get-ChildItem -LiteralPath (Join-Path $Root 'games') -Recurse -Filter 'DACTYL.BIN' -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.Directory.Name -ieq 'OBJECTS' } | Select-Object -First 1
+    if ($dacObj) {
+        $env:VPIX_DACTYL = $dacObj.FullName
+        $hum = Join-Path $dacObj.DirectoryName 'HUMAN.BIN'
+        $env:VPIX_MUSEUM_GUESTS = $(if (Test-Path -LiteralPath $hum) { "$hum|1800|7" } else { '' })
+    } else { $env:VPIX_DACTYL = ''; $env:VPIX_MUSEUM_GUESTS = '' }
+}
 foreach ($v in 'VPIX_SEAT_HOST', 'VPIX_SEAT_CLIENT', 'VPIX_SEAT_BIND', 'VPIX_PATCH_EXTRA') { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
 # voice chat in every linked / online game (vpix_voice.h): the mic starts live, Index left stick click (window: M) = mic off / on.
 # MALLVR_VOICE=0 turns it off for this PC.
@@ -418,7 +552,7 @@ if ($offer) {
     } catch { }                                   # an update problem never stops the game
 }
 
-$p = Start-Process -FilePath (Join-Path $Engine 'dosbox-x.exe') -WorkingDirectory $Engine -PassThru `
+$p = Start-Process -FilePath $dosbox -WorkingDirectory $Engine -PassThru `
     -ArgumentList '-conf', "`"$conf`"", '-nopromptfolder'
 $p.WaitForExit()
 exit $p.ExitCode    # the launcher tells a crash (not 0) from a normal close

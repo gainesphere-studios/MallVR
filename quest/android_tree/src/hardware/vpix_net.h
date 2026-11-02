@@ -33,6 +33,10 @@ int VPIX_Udp_Recv(int h, void *buf, size_t cap, char *from, size_t from_cap, int
    320 mu-law bytes, gated by loudness. PopMic hands out the next packet (1 = got one). On linked pods voice rides the pod network
    as its own Ethernet type (0x88B6, never reaches the game's card); the sink gets other pods' packets (src = their pod number). */
 void VPIX_Voice_Start(void);
+/* the mic's mute state, shared by the voice code (vpix_voice.h: the stick click) and the in-game menu (vpix_menu.h: MIC from the
+   launcher's VOICE CHAT page) */
+void VPIX_Voice_SetMuted(int muted);
+int VPIX_Voice_Muted(void);
 int VPIX_Voice_PopMic(uint8_t *ulaw320);
 void VPIX_Voice_SendNet(const uint8_t *ulaw, size_t n);
 typedef void (*VPIX_VoiceSink)(int src, const uint8_t *ulaw, size_t n);

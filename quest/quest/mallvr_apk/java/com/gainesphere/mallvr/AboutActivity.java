@@ -15,8 +15,10 @@ public class AboutActivity extends Activity {
         StringBuilder s = new StringBuilder();
         s.append("MallVR plays the 1990s Virtuality arcade VR games (SU2000 / SU3000) on a modified DOSBox-X. A Gainesphere project: gainesphere.com/pages/mallvr\n\n")
          .append("THANKS\nJeremy Shartzer for Buggy Ball. ErrorDan for the 3000-series games (Total Recoil, Zero Hour, Zeneca), newer versions of older games and the Zone Hunter music. ")
-         .append("nyxxic and Faulty for the original SU2000 dump, and Simon Marston for the SU2000 drive that started it all. LeonG-ZA for his SU2000 emulator work (su2000 card code, GPL-2.0).\n\n")
-         .append("MallVR ships no game files: you bring your own (GET GAMES downloads the community's archive.org copies).\n\n")
+         .append("nyxxic and Faulty for the original SU2000 dump, and Simon Marston for the SU2000 drive that started it all. LeonG-ZA for his SU2000 emulator work (su2000 card code, GPL-2.0). "
+              + "The pod photos in the game select hall are from the Simon Marston collection.\n\n")
+         .append(MallVR.store(this) ? "MallVR ships no game files: you bring your own.\n\n"
+                 : "MallVR ships no game files: you bring your own (GET GAMES downloads the community's archive.org copies).\n\n")
          .append("FREE SOFTWARE\nThis app is a modified DOSBox-X, so the whole app is under the GNU General Public License (version 2 or later). You may copy, change and share it under that licence. ")
          .append("Its complete source code (our changes, the Android project and build scripts) is MallVR-Quest-").append(MallVR.version(this))
          .append("-source.zip, posted next to this APK on gainesphere.com/pages/mallvr-download. Can't find it? Ask in the MallVR Discord and we'll send it.\n\n")

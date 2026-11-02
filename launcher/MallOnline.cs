@@ -18,6 +18,7 @@
 //   A seq 1|0 GO / STAY OUT (member -> host; none in 10 s = GO) S seq GAME id=pod ...: switch now (host -> members; ids from J)
 //   E back between games, still a group (host -> members)    C GAME: the host picked another game between games
 //   Q ms / R ms: ping / its echo (host <-> member: lag for the play notes)   Y seq: member started the game of START / switch seq
+// S also carries opt=k1:v1,k2:v2: the host's OPTIONS for that game (options.ps1), played on every pod (NETPROTO 3)
 // NETPROTO (Quest plan section 7): bumped when packets / frames change; a host refuses a joiner with another one (old joiners send none).
 // MALLVR_LAG_MS=<ms> delays every frame handed to the local pod (dev: try internet lag on one PC).
 // MALLVR_NO_UPNP=1 skips asking the router to open the host port.
@@ -59,7 +60,7 @@ public class MallOnline
     // sign-ups and bug reports are tied to it, so a name stays yours. Never shown to other players.
     public string Key = "";
     public readonly string Id;
-    public const int NetProto = 2;
+    public const int NetProto = 3;                    // 3: S carries the host's game options (opt=)
     public string Platform = "PC";
     public volatile string Status = "LOBBY";          // LOBBY / HOST / JOINED / PLAYING
     public volatile string Note = "";                 // one line for the screen
@@ -67,6 +68,10 @@ public class MallOnline
     public volatile bool ListOk;
     public string Game = "";
     public int Max = 2;
+    // OPTIONS (MallHall.cs, options.ps1): game code -> this PC's choices ("time:60,death:1"), filled by the launcher; Options = the
+    // choices of the game being started (the host's, from S), which launcher.ps1 passes to play.ps1 -Options
+    public readonly Dictionary<string, string> OptionsFor = new Dictionary<string, string>();
+    public volatile string Options = "none";
     public readonly Dictionary<string, int> MaxFor = new Dictionary<string, int>();   // game code -> players (launcher sets it from games.ps1 MaxPlayers)
     int MaxOf(string game) { int m; return MaxFor.TryGetValue(game, out m) ? m : 2; }
     // game code -> SHA1 of the game EXE this player runs (PC: games.ps1 Sha1, check.ps1 only lets that one start); a host refuses a
@@ -265,6 +270,10 @@ public class MallOnline
     {
         StringBuilder b = new StringBuilder("S\t" + sq + "\t" + game);
         foreach (Member m in members) b.Append('\t').Append(m.Id != "" ? m.Id : m.Name).Append('=').Append(m.Pod);
+        string o;
+        lock (OptionsFor) if (!OptionsFor.TryGetValue(game, out o) || o == "") o = "none";
+        Options = o;
+        b.Append("\topt=").Append(o);
         MatchId = Id + "-" + sq;
         b.Append("\tmatch=").Append(MatchId);      // older versions read it as one more id=pod pair that isn't theirs
         return b.ToString();
@@ -602,14 +611,17 @@ public class MallOnline
         else if (k == 'S')
         {
             int sq, pod = 0;
+            string opt = "none";
             if (f.Length < 3 || !int.TryParse(f[1], out sq)) return;
             for (int i = 3; i < f.Length; i++)
             {
                 string[] kv = f[i].Split('=');
                 if (kv.Length == 2 && (kv[0] == Id || kv[0] == Name)) int.TryParse(kv[1], out pod);
                 else if (kv.Length == 2 && kv[0] == "match") MatchId = HexDash(kv[1]);
+                else if (kv.Length == 2 && kv[0] == "opt") opt = OptClean(kv[1]);
             }
             if (sq <= seenSwitch) return;
+            Options = opt;
             seenSwitch = sq; seenSeq = Math.Max(seenSeq, sq); PromptSeq = 0;
             string game = Clean(f[2], 10);
             if (pod < 2 || pod > 4) { if (answered != sq) { Leave(); Note = "THE GROUP WENT TO " + game + " WITHOUT YOU"; } return; }
@@ -627,6 +639,15 @@ public class MallOnline
     }
 
     int seenSwitch, goSeq;
+
+    // the host's options string as play.ps1 takes it: letters, digits, ':' and ',' only
+    static string OptClean(string s)
+    {
+        StringBuilder b = new StringBuilder();
+        foreach (char c in s) if (char.IsLetterOrDigit(c) && c < 128 || c == ':' || c == ',') b.Append(c);
+        string r = b.ToString();
+        return r == "" || r.Length > 200 ? "none" : r;
+    }
 
     void SendHave()
     {

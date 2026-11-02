@@ -53,7 +53,11 @@ public class MallVRActivity extends SDLActivity {
                 menu.receive(p);
                 String line = new String(p.getData(), 0, p.getLength(), "US-ASCII");
                 engine = new DatagramPacket(new byte[0], 0, p.getAddress(), p.getPort());
-                if (line.startsWith("MENU")) {
+                if (line.startsWith("XRFAIL")) {     // VR didn't start (old headset software): the engine closes itself, the launcher explains
+                    MallVR.log("VR (OpenXR) didn't start: the game closed itself");
+                    PlayNotes.gameState(MallVR.LOGS, "end xr_failed");
+                    toLauncher();
+                } else if (line.startsWith("MENU")) {
                     MallVR.log("A + B held in game: back to the launcher");
                     PlayNotes.gameState(MallVR.LOGS, "end back_to_menu");
                     toLauncher();

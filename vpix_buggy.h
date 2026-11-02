@@ -591,6 +591,68 @@ static void check_goal(float dt) {
 
 /* ---- 2D bitmaps (RUNFILES\BITMAP.DBS: .ONE = 1 bpp glyphs drawn in a tint, .VST = 16-bit pictures), screen 352 x 288 ---- */
 static const uint32_t BH = 0x20000;
+/* VPIX_BUGGY_CRITTERS=<n> (dev, Bobby 10-27: "do the buggy ball up with the phantom critter ball ... a bunch of places ... like beach
+   balls we hit off or roll towards us"): n critter balls in the bowl besides the game ball. Phantom Freight's critter ball model
+   (package\engine\phantom_assets\MODELS\PFBALL\BALL_0..7.BIN, 8 chunks of one ball, radius 620 round (0,0,620)), drawn bigger.
+   Beach-ball physics: light, very bouncy, floaty; they creep downhill and toward the nearest car, so they roll at you; a car hit
+   knocks them flying (boing + rumble); out of the bowl -> back in at a new spot. They don't score and nothing scores off them.
+   VPIX_BUGGY_CRITTER_DIR = the PFBALL folder. Local only (not sent to linked players). */
+struct Critter { V p, v, w; M R; float cool = 0; };
+static std::vector<Critter> critters;
+static const float CR_R = 2600.f, CR_MASS = 60.f;
+static int critter_n() { static int n = getenv("VPIX_BUGGY_CRITTERS") ? atoi(getenv("VPIX_BUGGY_CRITTERS")) : 0; return n < 0 ? 0 : n > 12 ? 12 : n; }
+static void critter_place(Critter &k, int i) {
+    float a = 6.2831853f * (i + 0.37f) / (float)(std::max)(1, critter_n()) + (float)(rand() % 100) * 0.01f;
+    float r = bowl_a * (0.35f + 0.3f * (rand() % 100) * 0.01f);
+    k.p = V(r * cosf(a), r * sinf(a), CR_R + 9000.f); k.v = V(0, 0, 0); k.w = V(0, 0, 0); k.R = M(); k.cool = 0;
+}
+static void step_critters(float dt) {
+    const int n = critter_n();
+    if ((int)critters.size() != n) { critters.resize(n); for (int i = 0; i < n; i++) critter_place(critters[i], i); }
+    for (int i = 0; i < n; i++) {
+        Critter &k = critters[i];
+        k.v.z -= G * 0.35f * dt;                                   /* floaty */
+        k.v = k.v * powf(0.985f, dt * 30.f);                       /* air drag: a beach ball slows fast */
+        if (!cars.empty()) {                                       /* creep toward the nearest car (they roll at you) */
+            size_t best = 0; float bd = 1e30f;
+            for (size_t c = 0; c < cars.size(); c++) { float d = len(cars[c].p - k.p); if (d < bd) { bd = d; best = c; } }
+            V to = cars[best].p - k.p; to.z = 0; float l = len(to);
+            if (l > 1) k.v += to * (2500.f * dt / l);
+        }
+        V nrm;
+        float g = bowl_dist(k.p, nrm) + CR_R;
+        if (g > 0 && k.p.z < CR_R + 2000) {
+            k.p += nrm * g;
+            float vn = dot(k.v, nrm);
+            if (vn < 0) { k.v -= nrm * (1.85f * vn); if (vn < -5000) play(10, sound(4), (int)clampf(-vn / 400.f, 15, 70), 0, 4.f); }   /* boing, higher than the ball */
+            V vt = k.v - nrm * dot(k.v, nrm);
+            k.w = cross(nrm, vt) * (1.f / CR_R);
+        }
+        for (size_t c = 0; c < cars.size(); c++) {                 /* car hits: bump it away, the car barely notices */
+            Car &car = cars[c];
+            V d = k.p - car.p; float dl = len(d);
+            const float reach = CR_R + 0.5f * (car.d->coll_hi.x - car.d->coll_lo.x);
+            if (dl >= reach || dl < 1) continue;
+            V nn = norm(d + V(0, 0, 0.6f * dl));                      /* hits scoop it up */
+            k.p = car.p + norm(d) * reach;
+            float vn = dot(k.v - car.v, nn);
+            if (vn < 0) {
+                k.v -= nn * (1.9f * vn); k.v += car.v * 0.3f; car.v -= nn * (-vn * CR_MASS / car.d->mass);
+                if (k.cool <= 0 && -vn > 3000) {
+                    k.cool = 0.4f; play(11, sound(4), (int)clampf(-vn / 250.f, 30, 110), 0, 6.f);
+                    if ((int)c == me) VPIX_Haptic(2, 0.05f, clampf(-vn / 40000.f, 0.25f, 0.8f));
+                }
+            }
+        }
+        V db = k.p - ball.p; float dbl = len(db);                   /* critters bounce off the game ball too */
+        if (dbl < CR_R + lv.ball_r && dbl > 1) { V nn = db * (1.f / dbl); k.p = ball.p + nn * (CR_R + lv.ball_r); float vn = dot(k.v - ball.v, nn); if (vn < 0) k.v -= nn * (1.8f * vn); }
+        if (k.cool > 0) k.cool -= dt;
+        k.p += k.v * dt;
+        rotate(k.R, k.w, dt);
+        if (k.p.z < -bowl_c - 20000.f || k.p.z > 60000.f || k.p.x * k.p.x + k.p.y * k.p.y > (bowl_a * 1.3f) * (bowl_a * 1.3f)) critter_place(k, i);
+    }
+}
+
 struct Bmp { int w = 0, h = 0; bool ok = false; };
 static std::map<int, Bmp> bmps;
 static std::map<int, std::string> bmp_file;
@@ -929,6 +991,34 @@ static void build_frame(unsigned long fr, const VPIX_Input &in) {
     {   uint32_t pen[16]; for (int e = 0; e < 16; e++) pen[e] = lv.ballpen[e & 1];
         put(f, lv.ball_model, ball.R, ball.p, pen);
         put_logo(f);
+        {   /* VPIX_BUGGY_CRITTERS: the critter balls (8 chunks each, same transform) */
+            static int cstate = 0; const uint32_t CH = 0x7FFF0F00u;
+            if (cstate == 0 && critter_n() > 0) {
+                cstate = -1;
+                const char *cd = getenv("VPIX_BUGGY_CRITTER_DIR");
+                std::string dir = cd && *cd ? cd : "C:\\Users\\bobby\\Desktop\\Claude's Folder\\Projects\\Virtuality VR\\package\\engine\\phantom_assets\\MODELS\\PFBALL";
+                int ok = 0;
+                for (int c = 0; c < 8; c++) {
+                    std::string fn = dir + "\\BALL_" + std::to_string(c) + ".BIN";
+                    std::vector<uint8_t> d; FILE *fp = fopen(fn.c_str(), "rb");
+                    if (fp) { uint8_t buf[65536]; size_t nr; while ((nr = fread(buf, 1, sizeof(buf), fp)) > 0) d.insert(d.end(), buf, buf + nr); fclose(fp); }
+                    if (!d.empty() && VPIX_Render_AddModel(CH + c, d.data(), d.size())) ok++;
+                }
+                cstate = ok == 8 ? 1 : -1; bl("critter balls (%d) from %s: %s", critter_n(), dir.c_str(), cstate == 1 ? "loaded" : "** NOT FOUND");
+            }
+            if (cstate == 1) for (const Critter &k : critters) {
+                const float sc = CR_R / 620.f;
+                V T = k.p - k.R.r[2] * (620.f * sc);      /* the chunks sit round (0,0,620): centre them on the ball */
+                for (int c = 0; c < 8; c++) {
+                    VPIX_Instance in = {}; in.light_mask = 1; in.handle = CH + c;
+                    for (int r = 0; r < 3; r++) { in.R[r][0] = k.R.r[r].x; in.R[r][1] = k.R.r[r].y; in.R[r][2] = k.R.r[r].z; in.S[r] = sc; }
+                    in.T[0] = T.x; in.T[1] = T.y; in.T[2] = T.z;
+                    for (int e = 0; e < 16; e++) in.pal[e] = in.palw[e] = 0xFFFFFF;
+                    in.slot = (uint16_t)f.inst.size();
+                    f.inst.push_back(in);
+                }
+            }
+        }
         float t = bowl_ray(ball.p, V(0, 0, -1));
         if (t > 0 && ball.p.z < 0) {
             V hp = ball.p - V(0, 0, t), n; bowl_dist(hp, n);
@@ -1168,7 +1258,7 @@ static void tick(Bitu) {
                     if (!live) { cars[i].throttle = 0; cars[i].boost_req = false; if (cars[i].cpu) cars[i].steer = 0; } }
                 step_car(cars[i], (int)i, dt);
             }
-            step_ball(dt); collide(dt);
+            step_ball(dt); collide(dt); step_critters(dt);
             if (live && !net::following()) { check_goal(dt); if (st == S_PLAY) { time_left -= dt; level_left -= dt; } }
         }
         if (goal_banner > 0) goal_banner -= dt;

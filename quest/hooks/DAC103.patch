@@ -1,0 +1,7 @@
+# Dactyl Nightmare v01.03.00 byte patches (static addresses in its DAC.EXE).
+# VIEW_select's camera cases take the roll from a local nothing ever writes. Whatever is on the stack (NaN here) goes to fcos, and the C library's
+# range-reduce loop around it never ends in this FPU: pressing start froze the game. Roll = 0: fld dword ptr [esp+0x14] -> fldz, nop, nop.
+poke 00016E3C d9442414 d9ee9090
+poke 00017275 d9442414 d9ee9090
+poke 00017774 d9442414 d9ee9090
+poke 00017D52 d9442414 d9ee9090
