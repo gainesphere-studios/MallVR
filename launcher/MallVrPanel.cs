@@ -20,6 +20,7 @@ public class MallVrPanel
 {
     [DllImport("kernel32", CharSet = CharSet.Unicode, SetLastError = true)] static extern IntPtr LoadLibrary(string path);
 
+    public static int Theme;                          // the launcher's Style: 0 = the default theme, 1 = OPERATOR (black and red)
     const int Up = 3;                                 // panel texture = launcher canvas x3 in whole pixels (its 1-bit letters stay sharp)
     public float Metres = 1.6f, Distance = 1.5f;      // panel width, distance in front of the head
     public float BackMetres = 5.0f, BackBehind = 1.2f; // backdrop width, how far behind the panel
@@ -346,20 +347,32 @@ public class MallVrPanel
 
     void Log(string s) { if (log != null) try { System.IO.File.AppendAllText(log, DateTime.Now.ToString("HH:mm:ss.fff ") + s + "\r\n"); } catch (Exception) { } }
 
-    // the menu screen, in the launcher's operator-screen style (black, bold serif capitals, yellow headings, red options)
+    // the menu screen, laid out like the launcher's operator screen (bold serif capitals, yellow headings), in its colours or the default theme's
     System.Collections.Generic.List<System.Collections.Generic.KeyValuePair<Rectangle, string>> DrawMenu(Bitmap pc, string game, string state, string hover, bool blink)
     {
         var hits = new System.Collections.Generic.List<System.Collections.Generic.KeyValuePair<Rectangle, string>>();
         Color yellow = Color.FromArgb(255, 255, 0), red = Color.FromArgb(240, 24, 24), dim = Color.FromArgb(110, 24, 24), white = Color.White;
+        if (Theme == 0) { red = Color.FromArgb(220, 245, 255); dim = Color.FromArgb(140, 170, 200); white = Color.FromArgb(41, 231, 255); }
         using (Graphics g = Graphics.FromImage(pc))
         using (Font big = new Font("Times New Roman", 15f, FontStyle.Bold, GraphicsUnit.Pixel))
         using (Font txt = new Font("Times New Roman", 13f, FontStyle.Bold, GraphicsUnit.Pixel))
         using (Font small = new Font("Times New Roman", 11f, FontStyle.Bold, GraphicsUnit.Pixel))
         {
             g.Clear(Color.Black);
+            if (Theme == 0)
+            {
+                Rectangle all = new Rectangle(0, 0, pc.Width, pc.Height);
+                using (System.Drawing.Drawing2D.LinearGradientBrush b = new System.Drawing.Drawing2D.LinearGradientBrush(all, Color.FromArgb(44, 20, 100), Color.FromArgb(2, 2, 8), 90f)) g.FillRectangle(b, all);
+                using (Pen p = new Pen(Color.FromArgb(66, 62, 70)))
+                {
+                    for (int x = 6; x < pc.Width; x += 10) g.DrawLine(p, x, 0, x, pc.Height);
+                    for (int y = 0; y < pc.Height; y += 10) g.DrawLine(p, 0, y, pc.Width, y);
+                }
+            }
             g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.SingleBitPerPixelGridFit;
             Func<string, int, int, Font, Color, string, int> opt = (s, x, y, f, c, id) =>
             {
+                if (Theme == 0 && s == "GAINESPHERE STUDIOS") return (int)MallLauncher.GainesphereMark(g, x + 34, y - 1, 0.5f);
                 if (id != null && id == hover) c = white;
                 using (Brush b = new SolidBrush(c)) g.DrawString(s, f, b, x, y, StringFormat.GenericTypographic);
                 SizeF z = g.MeasureString(s, f, 999, StringFormat.GenericTypographic);
@@ -478,10 +491,10 @@ public class MallVrPanel
         {
             what = host + " WANTS TO PLAY " + game;
             Text = "MallVR"; TopMost = true; FormBorderStyle = FormBorderStyle.FixedToolWindow; StartPosition = FormStartPosition.CenterScreen;
-            BackColor = Color.Black; ClientSize = new Size(420, 130); ShowInTaskbar = false;
+            BackColor = Theme == 0 ? Color.FromArgb(24, 12, 62) : Color.Black; ClientSize = new Size(420, 130); ShowInTaskbar = false;
             lab = new Label { ForeColor = Color.Yellow, Font = new Font("Times New Roman", 14f, FontStyle.Bold), Location = new Point(12, 10), Size = new Size(400, 50), Text = what };
-            Button go = new Button { Text = "GO", ForeColor = Color.Yellow, BackColor = Color.FromArgb(60, 0, 0), Location = new Point(40, 72), Size = new Size(140, 40), Font = new Font("Times New Roman", 13f, FontStyle.Bold) };
-            Button stay = new Button { Text = "STAY OUT", ForeColor = Color.White, BackColor = Color.FromArgb(60, 0, 0), Location = new Point(240, 72), Size = new Size(140, 40), Font = new Font("Times New Roman", 13f, FontStyle.Bold) };
+            Button go = new Button { Text = "GO", ForeColor = Color.Yellow, BackColor = Theme == 0 ? Color.FromArgb(16, 42, 90) : Color.FromArgb(60, 0, 0), Location = new Point(40, 72), Size = new Size(140, 40), Font = new Font("Times New Roman", 13f, FontStyle.Bold) };
+            Button stay = new Button { Text = "STAY OUT", ForeColor = Color.White, BackColor = Theme == 0 ? Color.FromArgb(16, 42, 90) : Color.FromArgb(60, 0, 0), Location = new Point(240, 72), Size = new Size(140, 40), Font = new Font("Times New Roman", 13f, FontStyle.Bold) };
             go.Click += (o, e) => Answer = "go";
             stay.Click += (o, e) => Answer = "stay";
             Controls.Add(lab); Controls.Add(go); Controls.Add(stay);

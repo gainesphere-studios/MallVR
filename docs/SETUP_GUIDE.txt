@@ -46,20 +46,11 @@ MALLVR - SETUP GUIDE
    Both are saved per game in settings\ for next time.
 
 6. UPDATES
-   When you start a game, MallVR checks online for a newer version (it takes a second
-   or two while the launch screen shows). If there is one, it asks first:
-     Yes = install it now (about a minute), then your game starts.
-     No  = play now. It won't ask about that version again.
-   Updates never touch the games, settings or logs folders. No internet? The game
-   just starts.
+   When you start MallVR or a game it checks online for a newer version (a second or
+   two) and installs it by itself, about a minute, then your game starts. Updates never
+   touch the games, settings or logs folders. No internet? The game just starts.
 
-   To check for updates yourself at any time, run Update.bat.
-
-   To turn off the check at launch:
-     1. Open the engine folder and open version.txt in Notepad.
-     2. Change the line  check_on_launch = yes  to  check_on_launch = no
-     3. Save and close. From then on, MallVR only looks for updates when you run
-        Update.bat. To turn it back on, change the no back to yes.
+   To check yourself at any time, run Update.bat.
 
 3D SIDE-BY-SIDE (a head-mounted display that takes a 1920 x 1080 SBS picture)
    In the launcher pick WINDOW, then click 3D OFF until it says 3D SBS or

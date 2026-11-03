@@ -1,7 +1,7 @@
-MallVR for Meta Quest 0.4.0 - complete source (GNU GPL v2 or later, like DOSBox-X)
+MallVR for Meta Quest 0.5.0 - complete source (GNU GPL v2 or later, like DOSBox-X)
 =================================================================================
 MallVR is a modified DOSBox-X that plays the 1990s Virtuality SU2000 / SU3000 arcade VR games. This zip is the source of
-MallVR-Quest-0.4.0.apk: everything we wrote or changed, the build scripts, and the exact versions of the stock parts.
+MallVR-Quest-0.5.0.apk: everything we wrote or changed, the build scripts, and the exact versions of the stock parts.
 
 What's here
   dosbox_src/      MallVR's DOSBox-X additions (vpix*.cpp/.h = the Virtuality hardware: PIX graphics card HLE, VR renderer,

@@ -8,6 +8,7 @@
 #   file    : File = path in the game folder. Token = n-th whitespace-separated number (0-based; the Dactyl-engine settings files are
 #             read as a stream of numbers), Dword = n-th int32 (binary), Key = 'KEYWORD value' line (GUN.DBS), Lines = the whole file
 #             is the value's lines ('|' between them) (OP.DAT). Written into a writable layer over C:, never the player's own files.
+#   env     : Env = environment variable the engine reads, set to the value (Bobby 11-03: the prototype's unused energizer frames, off = the game as it shipped; the one row that adds to a game). Default = variable not set.
 #   version : another build of the game (Bobby 11-01: "selection option in our mallvr for game version per game"). Build = table id -> its code in games.ps1 (VersionOf); ids not in it = this code.
 # Bobby 10-31: every row ships, players try them (no per-game test pass). Checked headless 10-31 in the real game: Zone language +
 # timer, Boxing time + gore, Dactyl time + billboards, Ghost Train ride time + FreeTime. The rest come from the 10-31 code sweep.
@@ -31,6 +32,7 @@ $GameOptions = [ordered]@{
         @{ Key = 'ver'; Label = 'VERSION'; Kind = 'version'; Default = 'REL'; Build = @{ 'P69' = 'PACMAN3K' }; Values = @('REL=RELEASE', 'P69=1996 PROTOTYPE') }
         @{ Key = 'time'; Label = 'TIME PER CREDIT'; Kind = 'arg'; Arg = '/time={0}'; Default = '45'; Values = @('30=0:30', '45=0:45', '60=1:00', '90=1:30', '120=2:00', '180=3:00') }
         @{ Key = 'attract'; Label = 'ATTRACT SOUND'; Kind = 'arg'; Arg = @{ '0' = '/mu' }; Default = '1'; Values = @('1=ON', '0=OFF') }
+        @{ Key = 'spin'; Label = 'PROTOTYPE ENERGIZER SPIN'; Kind = 'env'; Env = 'VPIX_PAC_SPIN'; Default = '0'; Values = @('0=OFF', '1=ON') }
     )
     'MISS' = @(
         @{ Key = 'ver'; Label = 'VERSION'; Kind = 'version'; Default = 'CUR'; Build = @{ 'V12' = 'MISS12' }; Values = @('CUR=V1.10', 'V12=V1.12 RETAIL') }
@@ -104,6 +106,15 @@ function Get-MVVersion([string]$code, [string]$settings, [string]$hostString) {
     if (-not $row) { return '' }
     $b = $row.Build[(Get-MVOptionValue $row (Read-MVOptions $code $settings $hostString))]
     $(if ($b) { $b } else { '' })
+}
+
+# the env rows: set to the value, not set at the default
+function Set-MVOptionEnv([string]$code, $saved) {
+    foreach ($row in Get-MVOptionRows $code) {
+        if ($row.Kind -ne 'env') { continue }
+        $v = Get-MVOptionValue $row $saved
+        if ($v -eq $row.Default) { Remove-Item "Env:$($row.Env)" -ErrorAction SilentlyContinue } else { Set-Item "Env:$($row.Env)" $v }
+    }
 }
 
 # the launch line with the arg rows: their switches added, Drop switches taken off

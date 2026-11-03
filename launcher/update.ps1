@@ -2,7 +2,7 @@
 # Replaces engine\, docs\, source\, the .bat launchers and README.txt. Never touches
 # games\, settings\ or logs\ (your game files, gun trim and high scores stay put).
 #   update.ps1          check and ask before installing
-#   update.ps1 -Auto    install without asking (the launcher uses this after you said yes)
+#   update.ps1 -Auto    install without asking (the launcher and play.ps1 use this)
 #   update.ps1 <zip>    install a Loader zip you downloaded yourself (drag it onto Update.bat); its .sig must be
 #                       next to it, or you type YES (security review 2026-10-26: only signed releases install by themselves)
 param([string]$Zip, [switch]$Auto)
@@ -63,6 +63,7 @@ try {
         Save-MVRelease $latest $zip      # throws unless it carries Gainesphere's signature
         $signedVer = $latest.Version
     }
+    Write-Host '  Unpacking...'
     Expand-Archive -LiteralPath $zip -DestinationPath (Join-Path $tmp 'x')
     $new = Get-ChildItem -LiteralPath (Join-Path $tmp 'x') -Directory | Select-Object -First 1 -ExpandProperty FullName
     if (-not $new -or -not (Test-Path (Join-Path $new 'engine\dosbox-x.exe'))) { throw 'download does not look like a MallVR package' }

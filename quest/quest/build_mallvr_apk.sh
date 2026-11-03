@@ -12,7 +12,7 @@
 # Work dir H:\Android\build\mallvr_apk (no apostrophe for the tools). Same no-Gradle steps as build_dosbox.sh: javac + d8 + aapt +
 # zipalign + apksigner.
 set -e
-VER=0.4.0; CODE=7; VNAME=$VER-quest   # 0.2 = online + crossplay with PC (10-26); 0.3 = Meta Alpha (release key, targetSdk 34); 0.3.1 = store build without GET GAMES; 0.3.2 = VR-failed message (old headset OS) + engine from current master; 0.3.3 = the Cyberspace Hall launcher + menu music
+VER=0.5.0; CODE=8; VNAME=$VER-quest   # 0.2 = online + crossplay with PC (10-26); 0.3 = Meta Alpha (release key, targetSdk 34); 0.3.1 = store build without GET GAMES; 0.3.2 = VR-failed message (old headset OS) + engine from current master; 0.3.3 = the Cyberspace Hall launcher + menu music
 STORE=false; SUF=""
 for a in "$@"; do case "$a" in --store) STORE=true; SUF=-store;; --engine) ;; *) echo "unknown option $a"; exit 1;; esac; done
 A=/h/Android; Q="$(cd "$(dirname "$0")" && pwd)"; P="$(dirname "$Q")"
@@ -44,6 +44,7 @@ for c in $(node -e "for (const g of require(process.argv[1]).games) if (!g.nativ
     for f in "$P/hooks/$c.hooks" "$P/hooks/$c.patch" "$P/hooks/${c}_duo.patch" "$P/hooks/$c.game"; do [ -f "$f" ] && cp "$f" "$out/assets/engine/hooks/" || true; done
 done
 cp "$P"/buggy_rebuild/assets/ball_logo_256.rgba "$P"/buggy_rebuild/assets/ball_logo2_256.rgba "$out/assets/engine/buggy/"
+mkdir -p "$out/assets/engine/music"; cp "$P"/package/engine/music/* "$out/assets/engine/music/"   # the Lost Games' music + its credits
 L=$out/assets/licenses
 cp $A/src/dosbox-x/COPYING "$L/DOSBox-X_and_MallVR_GPL-2.0.txt"
 cp $A/src/SDL2/LICENSE.txt "$L/SDL2_zlib.txt"
@@ -96,6 +97,7 @@ cmd //c "H:\\Android\\sdk\\build-tools\\34.0.0\\apksigner.bat" verify --verbose 
 S="$out/src/MallVR-Quest-$VER-source"; T=$A/src/mallvr-dbx
 mkdir -p "$S/android_tree/src/hardware/su2000" "$S/android_tree/src/gui" "$S/dosbox_src" "$S/hooks" "$S/package/engine" "$S/buggy_rebuild/assets" "$S/licenses"
 (cd "$Q/.." && git ls-files quest | while read -r f; do mkdir -p "$S/$(dirname "$f")"; cp "$f" "$S/$f"; done)
+rm -rf "$S/quest/store_metadata" "$S/quest/RELEASE_CHANNEL_PLAN.md"   # outreach drafts and store art: not source
 cp -r "$Q/mallvr_apk" "$S/quest/"                     # (also the files not committed yet when this runs)
 cp "$Q"/*.sh "$Q"/*.js "$Q"/*.ps1 "$S/quest/"
 for f in "$P"/dosbox_src/*; do [ -f "$f" ] && [ "$(basename "$f")" != vpix_testbot.h ] && cp "$f" "$S/dosbox_src/" || true; done

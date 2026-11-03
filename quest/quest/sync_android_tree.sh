@@ -40,6 +40,9 @@ function fix(f, pairs) {
 fix('vpix_hle.cpp', [['"%s\\\\TRACK%02u.WAV"', '"%s/TRACK%02u.WAV"'], ['"%s\\\\TRACK%02u.MP3"', '"%s/TRACK%02u.MP3"'],
                      ['std::string path = std::string(dir) + "\\\\" + dosname;', 'std::string path = std::string(dir) + "/" + dosname; for (char &c : path) if (c == \'\\\\\') c = \'/\';']]);
 fix('vpix_buggy.h', [['std::string p = dir + "\\\\" + rel;', 'std::string p = dir + "/" + rel; for (char &c : p) if (c == \'\\\\\') c = \'/\';']]);
+// The Lost Games' desktop keys: no keyboard on the headset, so they read as never pressed.
+fix('vpix_hle.cpp', [['#include "vpix_dactyl1k.h"', 'static inline short GetAsyncKeyState(int) { return 0; }\nenum { VK_BACK = 8, VK_TAB = 9, VK_SHIFT = 16, VK_CONTROL = 17, VK_SPACE = 32 };\n#include "vpix_dactyl1k.h"']]);
+fix('vpix_dactyl1k.h', [['r + "\\\\SOUNDS\\\\" + name', 'r + "/SOUNDS/" + name']]);
 EOF
 node "$(cygpath -w "$HERE/quest/apply_xr_hooks.js")" "$(cygpath -w "$HERE/dosbox_src/vpix_render.cpp")" "$(cygpath -w "$hw/vpix_render.cpp")"
 echo "mallvr-dbx synced"

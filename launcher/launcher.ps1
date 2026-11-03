@@ -12,6 +12,21 @@ $Root = Split-Path -Parent $Engine
 $logs = Join-Path $Root 'logs'; $settings = Join-Path $Root 'settings'
 New-Item -ItemType Directory -Force $logs, $settings | Out-Null
 
+# auto update, always on (Bobby 11-03): a newer signed release installs before the menu opens.
+if (-not $Shot -and -not $env:VPIX_NOSPLASH) {
+    try {
+        $cfg = Get-Content -LiteralPath (Join-Path $Engine 'version.txt') | ConvertFrom-StringData
+        if ((($cfg.url -and $cfg.url -ne 'none') -or ($cfg.drive -and $cfg.drive -ne 'none') -or ($cfg.repo -and $cfg.repo -ne 'none'))) {
+            . (Join-Path $Engine 'findupdate.ps1')
+            $latest = Get-MVLatest $cfg 3
+            if ($latest -and (Get-MVVersion $latest.Version) -gt (Get-MVVersion $cfg.version) -and -not (Get-Process dosbox-x -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "$Engine*" })) {
+                $u = Start-Process powershell -PassThru -Wait -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$(Join-Path $Engine 'update.ps1')`"", '-Auto'
+                if ($u.ExitCode -eq 0) { & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $Engine 'launcher.ps1'); exit $LASTEXITCODE }
+            }
+        }
+    } catch { }                                   # offline or an update problem: just open the menu
+}
+
 Add-Type -AssemblyName System.Windows.Forms, System.Drawing
 # 32-bit Windows: the 32-bit engine in engine\x86, window mode only (DevilMaster 10-22; SteamVR needs 64-bit Windows)
 $x86 = -not [Environment]::Is64BitOperatingSystem
@@ -54,6 +69,7 @@ Get-ChildItem -LiteralPath (Join-Path $Root 'games') -Recurse -Filter '*.EXE' -F
     }
 foreach ($k in @($Games.Keys)) {   # native rebuilds: their data folder
     $gi = $Games[$k]
+    if ($gi.Lost) { $exes[$k] = $Engine; continue }
     if ($gi.Native) {
         $d = Get-ChildItem -LiteralPath (Join-Path $Root 'games') -Recurse -Directory -Filter $gi.DataDir -ErrorAction SilentlyContinue |
             Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName $gi.DataFile) } | Select-Object -First 1
@@ -192,8 +208,9 @@ while ($true) {
         if ($g.VersionOf) { continue }   # another build of a game: its VERSION row (options.ps1), no block of its own
         $name = $g.Name -replace '^Virtuality ', ''
         $f.AddGame($code, $name, [bool]$g.Link, $exes.ContainsKey($code), $(if ($g.MaxPlayers) { [int]$g.MaxPlayers } else { 2 }))
+        if ($g.Lost) { [void]$f.Lost.Add($code) }
         if ($g.Sha1) { $Net.Sha1For[$code] = $g.Sha1 }   # sent on JOIN: a host refuses different game files (check.ps1 only starts this EXE)
-        if ($last.game -eq $code) { $f.Game = $i }
+        if (($env:MALLVR_GAME, $last.game | Where-Object { $_ } | Select-Object -First 1) -eq $code) { $f.Game = $i }
         # its OPTIONS tab (options.ps1: checked rows only)
         foreach ($row in Get-MVOptionRows $code) {
             $ids = [string[]]@($row.Values | ForEach-Object { ($_ -split '=', 2)[0] }); $labels = [string[]]@($row.Values | ForEach-Object { ($_ -split '=', 2)[1] })
@@ -224,13 +241,16 @@ while ($true) {
     if ($crashed) { $f.CrashGame = $crashed; $crashed = '' }
     if ($exes.Count -eq 0 -and -not $online -and -not $gotOffered -and -not $env:MALLVR_HALLSHOT) { $gotOffered = $true; $f.OpenGetGames() }   # no games yet: GET GAMES right away
 
-    if ($Shot) { $f.ShotTime = 2.0; $f.SavePng($Shot); exit 0 }
+    if ($env:MALLVR_THEMESHOT -eq 'crash') { $f.CrashGame = 'ZONE' } elseif ($env:MALLVR_THEMESHOT -eq 'games') { $f.OpenGetGames() } elseif ($env:MALLVR_THEMESHOT -eq 'report') { $f.OpenReport('', '') }   # dev: -Shot of the smaller screens
+    if ($env:MALLVR_ONLINESHOT) { $f.OnlineScreen = $true; $f.Advanced = $env:MALLVR_ONLINESHOT -eq 'full' }   # dev: -Shot of the ONLINE screen, quick or full
+    if ($Shot) { $f.ShotTime = $(if ($env:MALLVR_SHOTTIME) { [double]$env:MALLVR_SHOTTIME } else { 2.0 }); [void]$f.VrFrame(); if ($env:MALLVR_ONLINESHOT) { Start-Sleep 5 }; $f.SavePng($Shot); exit 0 }   # the online screen's pods are cut out on a worker thread
     if ($x86) { $f.Mode = 1 }   # 32-bit Windows: WINDOW only
     if (-not $vrOn -and $f.Mode -eq 0) { $vrOn = $Vr.Start($Engine) }   # headset mode only; tried again each time the screen opens
     if ($vrOn) { $f.InHeadset = $true; $Vr.Attach($f) }
     [MallIntro]::Wait()
     [void]$f.ShowDialog()
     $Vr.Detach()
+    [MallVrPanel]::Theme = $f.Style
     if ($vrOn -and ($f.Action -eq 'start' -or $f.Action -eq 'online')) { $Vr.Say('VS16A.WAV') }   # "Nice move. Let's get out of here."
 
     $code = $f.Codes[$f.Game]

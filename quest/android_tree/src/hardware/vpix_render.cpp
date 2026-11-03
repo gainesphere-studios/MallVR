@@ -701,6 +701,13 @@ static float world_scale = 1.85f;
 static bool desk_view = false;   /* set while the desktop window view (no headset) is being built */
 static bool eye_follows = true;  /* last eye_camera: the game camera followed the head (play) or the eye looked freely (attract, menus) */
 static float yaw_of(const float fw[3]) { return atan2f(-fw[0], fw[1]); }
+/* the two eye cameras, in <log>.render: when it changes, else once a minute. Identical pictures in stereo are a bug that no other log shows (DevilMaster 11-02) */
+static void stereo_note(const float *T0, const float *T1, float ipd_mm) {
+    static int was = -1; static unsigned long long next = 0; const unsigned long long now = GetTickCount64();
+    const float dx = T0[0] - T1[0], dy = T0[1] - T1[1], dz = T0[2] - T1[2], g = sqrtf(dx * dx + dy * dy + dz * dz); const int st = g > 0.01f;
+    if (st == was && now < next) return;
+    rl("stereo check: eyes %.0f units apart, world scale %.2f%s", g, world_scale, st || ipd_mm == 0.f ? "" : "  BOTH EYES IDENTICAL: no 3D"); was = st; next = now + 60000;
+}
 static void eye_camera(const VPIX_Frame &f, const VPIX_Pose &eye, const VPIX_Pose &head_now, float R[3][3], float T[3]) {
     memcpy(R, f.cam_R, sizeof(f.cam_R)); memcpy(T, f.cam_T, sizeof(f.cam_T));
     if (!eye.valid) return;
@@ -831,7 +838,12 @@ static void eye_camera(const VPIX_Frame &f, const VPIX_Pose &eye, const VPIX_Pos
     /* VPIX_DESK_ATTRACT_LOCK=1 (run_su3k.sh, window only): no mouse look while the game camera is scripted (attract, menus) -
        Bobby 10-18 'you can still look up and down in the attract mode, maybe should be locked'. Never in the headset. */
     static const bool desk_lock = getenv("VPIX_DESK_ATTRACT_LOCK") && atoi(getenv("VPIX_DESK_ATTRACT_LOCK"));
-    if (desk_lock && desk_view) return;
+    if (desk_lock && desk_view) {   /* the view stays locked, the eyes keep their offset: side-by-side Pac-Man VR had two identical pictures (DevilMaster 11-02) */
+        if (head_now.valid) { float d[3]; for (int i = 0; i < 3; i++) d[i] = eye.p[i] - head_now.p[i];
+            for (int j = 0; j < 3; j++) { const float c = d[0] * head_now.R[j][0] + d[1] * head_now.R[j][1] + d[2] * head_now.R[j][2];
+                for (int i = 0; i < 3; i++) T[i] += world_scale * c * f.cam_R[j][i]; } }
+        return;
+    }
     /* free look: eye orientation relative to the player's reference yaw, on top of the camera. The reference is taken once when free
        look starts (VPIX_FREE_REF_LATCH, Zone): re-taken every frame from the fed head it cancelled every left/right turn while InHead
        stayed 1 over a camera that ignores the head - the intro wouldn't look left/right and jittered (Bobby 10-24) */
@@ -1037,7 +1049,7 @@ static void draw_scene(const VPIX_Frame &f, const float proj[16], const float ca
     static const bool prio_layers = getenv("VPIX_PRIO_LAYERS") && atoi(getenv("VPIX_PRIO_LAYERS"));
     bool first_inst = true; int32_t last_prio = 0;
     bool any_trans = false;
-    for (int i = 0; i < 32; i++) if (matalpha[i] < 1.f) any_trans = true;
+    for (int i = 0; i < 32; i++) if (matalpha[i] < 1.f) any_trans = true; for (const auto &gi : f.inst) if (gi.glass) any_trans = true;   /* native rebuilds: a see-through instance (Flying Aces propeller) */
     /* mid bitmaps (HLE: a 3D model has a higher priority, PEARL): models up to the highest mid-bitmap priority first,
        then those bitmaps, depth cleared, then the models in front of them (PEARL's attract 'sell' messages 360 / 3D SOUND /
        VIRTUAL / FUTURE, prio 3000, fly over the black fade screen, prio 2100) */
@@ -1096,7 +1108,8 @@ static void draw_scene(const VPIX_Frame &f, const float proj[16], const float ca
            the arms) are in front of everything yet still hide their own back faces (GL_ALWAYS drew a gun's far side over its near
            side); the game's own on-top models (Missile Command's skip sign) keep GL_ALWAYS */
         if (any_top && ii == 0) { glDepthFunc(top_pass && !own_top ? GL_ALWAYS : depth_fn);
-            if (top_pass && own_top) glDepthRange(rev_z ? 0.998 : 0.0, rev_z ? 1.0 : 0.002); else glDepthRange(0.0, 1.0); }
+            if (top_pass && own_top && f.top_clear) { glDepthMask(GL_TRUE); if (pass == 0) glClear(GL_DEPTH_BUFFER_BIT); glDepthRange(0.0, 1.0); }   /* pass 1 keeps the cockpit's depth: a see-through propeller stays behind it */
+            else if (top_pass && own_top) glDepthRange(rev_z ? 0.998 : 0.0, rev_z ? 1.0 : 0.002); else glDepthRange(0.0, 1.0); }
         const auto &inst = f.inst[card_order ? card_seq[ii] : zf_rev && !prio_layers ? f.inst.size() - 1 - ii : ii];
         if ((inst.on_top != 0) != top_pass) continue;
         if (split && (inst.prio > split_prio) != (phase == 1)) continue;
@@ -1244,7 +1257,7 @@ static void draw_scene(const VPIX_Frame &f, const float proj[16], const float ca
                 const Poly &p = olist ? m.p[(*olist)[pi]] : m.p[!card_order && zf_rev ? m.p.size() - 1 - pi : pi];
                 if (!card_order && p.layer != layer) continue;
                 if (inst.poly_select && p.sel && !(p.sel & inst.select)) continue;   /* VPIX_POLY_SELECT models: only the polygons the instance picks */
-                bool trans = ((p.flags >> 24) == 0x68 || (mat28 && (p.flags >> 24) == 0x28)) && matalpha[p.flags & 31] < 1.f;
+                bool trans = (((p.flags >> 24) == 0x68 || (mat28 && (p.flags >> 24) == 0x28)) && matalpha[p.flags & 31] < 1.f) || inst.glass;
                 const bool snow_poly = (p.flags >> 24) == 0x68 && snow_slot(mattex[p.flags & 31]);
                 if (snow_poly) trans = false;   /* the game's random opacity on this material: the card's snow is solid */
                 if (!card_order && trans != (pass == 1)) continue;
@@ -1396,7 +1409,7 @@ static void draw_scene(const VPIX_Frame &f, const float proj[16], const float ca
                             lv += light_amb(li) + gl.diff * fabsf(kk * (wn[0] * Lw[li][0] + wn[1] * Lw[li][1] + wn[2] * Lw[li][2])); }
                         if (lv > 1.f) lv = 1.f;
                     }
-                    glColor4f(((c >> 16) & 255) / 255.f * lv, ((c >> 8) & 255) / 255.f * lv, (c & 255) / 255.f * lv, trans ? matalpha[p.flags & 31] : 1.f);
+                    glColor4f(((c >> 16) & 255) / 255.f * lv, ((c >> 8) & 255) / 255.f * lv, (c & 255) / 255.f * lv, inst.glass ? inst.glass / 255.f : trans ? matalpha[p.flags & 31] : 1.f);
                     const float *v = &m.v[3 * p.idx[k]];
                     if (tx && p.tex) glTexCoord2f(p.uv[k][0], p.uv[k][1]);
                     else if (tx) glTexCoord2f((v[ua] - ts->o[ua]) * ts->su / tx->w, (v[va] - ts->o[va]) * ts->sv / tx->h);
@@ -1922,7 +1935,8 @@ static GLuint draw_rtt(const VPIX_Frame &f, int w, int h) {
         glEnd();
     }
     /* keep A only where B drew: A *= B.alpha (colour and alpha). The masks grow with time, and the clock starts all white and uncovers
-       its red (the timer art AL0000-0010, Bobby 11-01 "should be all white from the start"; cut the other way it started all red) */
+       its red (the timer art AL0000-0010, Bobby 11-01 "should be all white from the start"; cut the other way it started all red).
+       Bobby 11-03, having watched the other cut run: this way is the accurate one, the other "was reverse time" */
     glLoadIdentity(); glMatrixMode(GL_PROJECTION); glLoadIdentity();
     glBindTexture(GL_TEXTURE_2D, fbm.tex); glBlendFunc(GL_ZERO, GL_SRC_ALPHA);
     glBegin(GL_QUADS);
@@ -1964,6 +1978,7 @@ static float lean_in[2] = {0, 0}, lean_off[2] = {0, 0};
    had x / y axes as well as buttons; the thumbsticks feed them (the stronger stick wins) */
 static bool joy_axes() { static const bool j = getenv("VPIX_JOYAXES") && atoi(getenv("VPIX_JOYAXES")); return j; }
 static float joy_in[2] = {0, 0};   /* stick (side, forward) -1..1; offset mm (tracker space) */
+static float joy_r_in[2] = {0, 0}, joy_l_in[2] = {0, 0};   /* each thumbstick on its own */
 static void lean_update(const VPIX_Pose &head) {
     float fx = head.R[1][0], fy = head.R[1][1], fl = sqrtf(fx * fx + fy * fy), L = lean_mm();
     lean_off[0] = lean_off[1] = 0;
@@ -2689,7 +2704,8 @@ static void desktop_input(double dt, const VPIX_Frame *f) {
         { static bool cap = true, tabw = false; bool tb = ((GetAsyncKeyState(VK_TAB) | GetAsyncKeyState(VK_MBUTTON)) & 0x8000) != 0;   /* Tab or middle click toggles mouse look */
           if (tb && !tabw) cap = !cap; tabw = tb;
           HWND fw = GetForegroundWindow(); RECT cr; POINT c = {0, 0};
-          if (cap && !(GetAsyncKeyState(VK_MENU) & 0x8000) && GetClientRect(fw, &cr) && cr.right > 0) {   /* hold Alt = mouse free */
+          static const bool no_mouse = getenv("VPIX_NOMOUSE") != NULL;   /* dev: recording runs leave the mouse alone */
+          if (cap && !no_mouse && !(GetAsyncKeyState(VK_MENU) & 0x8000) && GetClientRect(fw, &cr) && cr.right > 0) {   /* hold Alt = mouse free */
               c.x = cr.right / 2; c.y = cr.bottom / 2; ClientToScreen(fw, &c);
               POINT pt; GetCursorPos(&pt);
               desk_az -= (pt.x - c.x) * 0.0025f; desk_el = (std::max)(-1.2f, (std::min)(1.2f, desk_el - (pt.y - c.y) * 0.0025f));
@@ -2717,6 +2733,7 @@ static void desktop_input(double dt, const VPIX_Frame *f) {
         joy_in[0] = stick_side;
         if (top_btns) joy_in[1] = stick_back;
         else { joy_in[1] = (btn & VPIX_BTN_WALK) ? 1.f : stick_back; btn &= ~VPIX_BTN_WALK; }
+        joy_r_in[0] = joy_in[0]; joy_r_in[1] = joy_in[1]; joy_l_in[0] = joy_l_in[1] = 0;
     } else
     if (lean_mm() > 0) {                          /* desktop lean: W/S forward/back, A/D sides */
         lean_in[0] = stick_side; lean_in[1] = (btn & VPIX_BTN_WALK) ? 1.f : stick_back; btn &= ~VPIX_BTN_WALK;
@@ -2764,7 +2781,7 @@ static void desktop_input(double dt, const VPIX_Frame *f) {
     input.head = desk_head; input.hand = desk_hand; input.hand2 = desk_hand2; input.buttons = btn; input.coins = desk_coins; input.start = start; input.vr = false; input.crouch_mm = crouch_now;
     input.voice_mute = focused() && (GetAsyncKeyState('M') & 0x8000) != 0;   /* window: M = voice chat mute on / off */
     input.gun_pitch = 0.f;   /* the -20 default is the Vive wand's barrel tilt; a mouse-aimed gun has none (it put shots 20 deg low) */
-    input.loco[0] = loco[0] + lean_off[0]; input.loco[1] = loco[1] + lean_off[1]; input.hand_reach = hand_reach; input.hand_zr = hand_zr; input.walk_yaw = walk_yaw; input.joy[0] = joy_in[0]; input.joy[1] = joy_in[1];
+    input.loco[0] = loco[0] + lean_off[0]; input.loco[1] = loco[1] + lean_off[1]; input.hand_reach = hand_reach; input.hand_zr = hand_zr; input.walk_yaw = walk_yaw; input.joy[0] = joy_in[0]; input.joy[1] = joy_in[1]; input.joy_r[0] = joy_r_in[0]; input.joy_r[1] = joy_r_in[1]; input.joy_l[0] = joy_l_in[0]; input.joy_l[1] = joy_l_in[1];
 }
 
 /* ---- spectator camera (VPIX_SPECTATOR=1, for recording video) -------------------
@@ -3124,6 +3141,7 @@ static void thread_main() {
                 if (joy_axes()) {                          /* the sticks are the pod joystick's axes; click = top button */
                     if (a.walk) btn |= VPIX_BTN_WALK;
                     joy_in[0] = fabsf(lsx) >= fabsf(rx) || stick_turn() ? lsx : rx; joy_in[1] = fabsf(lsy) >= fabsf(ry) ? lsy : ry;
+                    joy_r_in[0] = rx; joy_r_in[1] = ry; joy_l_in[0] = lsx; joy_l_in[1] = lsy;
                     for (float &v : joy_in) v = fabsf(v) < 0.15f ? 0.f : v;
                     if (!stick_turn()) rx = 0; ry = 0;       /* no stick turning (VPIX_STICK_TURN: the right stick's left/right turns) */
                 } else
@@ -3329,7 +3347,7 @@ static void thread_main() {
             input.crouch_mm = crouch_now;
             input.voice_mute = vr_voice_mute;
             if (head_now.valid) lean_update(head_now);
-            input.loco[0] = loco[0] + lean_off[0]; input.loco[1] = loco[1] + lean_off[1]; input.walk_yaw = walk_yaw; input.joy[0] = joy_in[0]; input.joy[1] = joy_in[1];
+            input.loco[0] = loco[0] + lean_off[0]; input.loco[1] = loco[1] + lean_off[1]; input.walk_yaw = walk_yaw; input.joy[0] = joy_in[0]; input.joy[1] = joy_in[1]; input.joy_r[0] = joy_r_in[0]; input.joy_r[1] = joy_r_in[1]; input.joy_l[0] = joy_l_in[0]; input.joy_l[1] = joy_l_in[1];
             arrow_trims();
         } else {
             desktop_input(dt, have ? &cur : NULL);
@@ -3368,7 +3386,7 @@ static void thread_main() {
                 }
                 if (have) {
                     float R[3][3], T[3];
-                    eye_camera(vf, eye_pose[e], head_now, R, T);
+                    eye_camera(vf, eye_pose[e], head_now, R, T); { static float vt0[3]; if (e == 0) memcpy(vt0, T, sizeof(vt0)); else stereo_note(vt0, T, -1.f); }
                     if (hud_stereo_m() > 0.f) {   /* VPIX_HUD_STEREO: head centre = between the two eye cameras; its offset in this eye's GL coords */
                         float R2[3][3], T2[3]; eye_camera(vf, eye_pose[1 - e], head_now, R2, T2);
                         static const float C[3][3] = {{1, 0, 0}, {0, 0, 1}, {0, -1, 0}};
@@ -3475,6 +3493,7 @@ static void thread_main() {
                 for (int k = 0; k < 3; k++) ep.p[k] += o * ep.R[0][k];
                 desk_view = true; eye_camera(vf, ep, head_now, R[e], T[e]); desk_view = false;
             }
+            stereo_note(T[0], T[1], ipd);
             std::lock_guard<std::mutex> lk(mtx);
             for (int e = 0; e < 2; e++) {
                 if (hud_stereo_m() > 0.f) {             /* VPIX_HUD_STEREO: as in the headset, the 2D layer sits at a depth from the head centre */

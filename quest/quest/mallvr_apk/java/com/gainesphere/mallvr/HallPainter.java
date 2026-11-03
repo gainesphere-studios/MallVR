@@ -28,6 +28,7 @@ final class HallPainter {
     int sheetTab = 1;                                 // 0 THE MACHINE / 1 THE GAME / 2 HOW TO PLAY
     String viewPod;                                   // a pod picked on the era dials (null = the selected game's pod)
     boolean wanted;                                   // the WANTED board is open
+    boolean lostTab;                                  // the list shows the Lost Games (the rebuilds from footage)
     String hover = "";
     List<Hit> hits = new ArrayList<>();
     private List<Hit> building;
@@ -58,7 +59,7 @@ final class HallPainter {
         return p.isEmpty() ? "2000SU" : p;
     }
     boolean found(int i) { return checked && !needFiles && i >= 0 && i < items.size() && (items.get(i).state == 1 || items.get(i).state == 2); }
-    boolean anyFound() { for (int i = 0; i < items.size(); i++) if (found(i)) return true; return false; }
+    boolean anyFound() { for (int i = 0; i < items.size(); i++) if (found(i) && !items.get(i).name.endsWith("(LOST)")) return true; return false; }   // the Lost Games need no files: they don't count
 
     /* a game picked: back to its own pod and sheet */
     void select(int i) { if (i != game) { game = i; wanted = false; viewPod = null; } }
@@ -68,6 +69,7 @@ final class HallPainter {
         if (id.startsWith("tab")) { sheetTab = id.charAt(3) - '0'; return true; }
         if (id.startsWith("pod")) { viewPod = ERA_PODS[id.charAt(3) - '0']; sheetTab = 0; wanted = false; return true; }
         if (id.equals("wanted")) { wanted = !wanted; card = 0; return true; }
+        if (id.equals("lost")) { lostTab = !lostTab; wanted = false; return true; }
         if (id.startsWith("step")) { card = id.charAt(4) - '0'; wanted = false; return true; }
         if (id.equals("cardclose")) { card = 0; return true; }
         if (id.startsWith("g")) { select(Integer.parseInt(id.substring(1))); return true; }
@@ -173,13 +175,16 @@ final class HallPainter {
 
     // the games as glowing data blocks on the left
     void drawBlocks(Canvas c) {
-        int n = Math.max(1, items.size());
-        float top = 30, rowH = Math.min(13f, 200f / (n + 1)), bh = rowH - 1.6f;   // + 1 row: WANTED
+        int n = 0;
+        for (Item g : items) if (g.name.endsWith("(LOST)") == lostTab) n++;
+        float top = 30, rowH = Math.min(13f, 200f / (Math.max(1, n) + 2)), bh = rowH - 1.6f;   // + 2 rows: LOST GAMES, WANTED
+        int row = 0;
         if (items.isEmpty()) text(c, "NO GAMES YET", 10, top, hBlock, RED, null);
         for (int i = 0; i < items.size(); i++) {
             Item g = items.get(i);
+            if (g.name.endsWith("(LOST)") != lostTab) continue;
             boolean sel = i == game, hov = hover.equals("g" + i), ok = found(i);
-            float y = top + i * rowH, x = sel ? 12 : 6, w = 120;
+            float y = top + row++ * rowH, x = sel ? 12 : 6, w = 120;
             RectF r = new RectF(x, y, x + w, y + bh);
             if (sel) {
                 fill.setShader(new LinearGradient(r.left, 0, r.right, 0, CYAN, 0xFF1A6AFF, Shader.TileMode.CLAMP)); c.drawRect(r, fill); fill.setShader(null);
@@ -196,8 +201,15 @@ final class HallPainter {
             text(c, tag, x + w - measure(tag, hTiny) - 2, y + (bh - 6) / 2, hTiny, sel ? 0xFF00143C : 0xFF8CAAC8, null);
             building.add(new Hit(r, "g" + i));
         }
+        // the tab between the games and the Lost Games, in the PC launcher's amber
+        float ly = top + row * rowH;
+        RectF lr = new RectF(6, ly, 126, ly + bh);
+        c.drawRect(lr, solid(alpha(hover.equals("lost") ? 110 : 60, 0xFFFFB000)));
+        stroke(0xFFFFB000, 0.5f); c.drawRect(lr, line);
+        text(c, lostTab ? "BACK TO THE GAMES" : "LOST GAMES", 11, ly + (bh - 8.5f) / 2, hBlock, 0xFFFFE6B4, null);
+        building.add(new Hit(lr, "lost"));
         // the last block: WANTED, the games and CD audio nobody has found yet
-        float wy = top + items.size() * rowH, wx = wanted ? 12 : 6;
+        float wy = ly + rowH, wx = wanted ? 12 : 6;
         boolean wh = hover.equals("wanted");
         RectF wr = new RectF(wx, wy, wx + 120, wy + bh);
         c.drawRect(wr, solid(wanted ? PINK : alpha(wh ? 90 : 50, PINK)));
@@ -554,7 +566,7 @@ final class HallPainter {
         x = sr.right + 6;
         x += chip(c, "ONLINE", x, y, false, true, "online") + 3;
         // the Quest doesn't open GET GAMES by itself (the PC does): it flashes red while games are missing
-        if (!store) x += chip(c, "GET GAMES", x, y, false, true, "getgames", checked && !needFiles && (!anyFound() || !found(game)) ? blink : -1) + 3;
+        x += chip(c, "GET GAMES", x, y, false, true, "getgames", checked && !needFiles && (!anyFound() || !found(game)) ? blink : -1) + 3;
         x += chip(c, "PLAY NOTES " + (notesOn ? "ON" : "OFF"), x, y, false, true, "notes") + 3;
         x += chip(c, "REPORT", x, y, false, true, "report") + 3;
         x += chip(c, "ABOUT", x, y, false, true, "about") + 3;

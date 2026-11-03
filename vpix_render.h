@@ -24,6 +24,7 @@ struct VPIX_Instance {
     uint8_t one_sided = 0;    /* VPIX_ONE_SIDED models: type 0x22 polygons back-face culled (Zone's VR logo); 2 = every polygon; 3 = every polygon's back side drawn flat grey */
     uint8_t on_top = 0;       /* VPIX_ON_TOP: drawn last, depth test off (Missile Command skip sign over the gun housing); 2 = in front of everything but depth-tested among themselves (our guns, sword, arms) */
     uint8_t backdrop = 0;     /* SU3000 cloud cards: drawn first (the HLE orders them so) with depth write off, never hide what lies behind */
+    uint8_t glass = 0;        /* native rebuilds: non-zero = the whole model blended at glass / 255 (Flying Aces propeller) */
     uint8_t bright = 0;       /* lit from within: drawn full colour, the game lights ignored (Phantom Freight pumpkins) */
     float lum = 1.f;          /* HIRES meshes: light level (the museum's spotlight on the narrated piece, the rest dimmer) */
     float gloss = 0.f;        /* HIRES meshes: 0..1 specular shine on top of the texture (glossy plastic pods / cabinets, 10-29) */
@@ -65,6 +66,7 @@ struct VPIX_Blit {
 };
 
 struct VPIX_Frame {
+    bool top_clear = false;   /* on_top 2 models get a fresh depth buffer and the whole range: cockpits, whose parts lie close together, stop flickering */
     unsigned long frame = 0;
     float cam_R[3][3] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}}, cam_T[3] = {0, 0, 0};
     float fov_deg = 70.f;
@@ -123,6 +125,7 @@ struct VPIX_Input {
     float loco[2] = {0, 0};   /* stick movement (back/strafe), mm in tracker space, added to head and hand positions */
     float walk_yaw = 0;       /* VPIX_WALK_TURN games (Pac-Man): radians the fed head is turned while back/strafe is held */
     float joy[2] = {0, 0};    /* VPIX_JOYAXES games: the pod joystick's x / y (-1..1) from the thumbsticks */
+    float joy_r[2] = {0, 0}, joy_l[2] = {0, 0};   /* the same, each thumbstick on its own (dual-stick flying: right flies, left throttle). In a window joy_r = joy, joy_l = 0 */
     float crouch_mm = 0;      /* VPIX_CROUCH games: crouch button held -> head and hand fed this many mm lower */
     float gun_dx = 0, gun_dz = 0, gun_dy = 0;   /* gun_dy: mm forward (left touchpad left/right) */
     float throttle = 0, brake = 0;   /* analog triggers 0..1 (right / left, /actions/main/in/throttle + brake): Buggy Ball gas + brake */

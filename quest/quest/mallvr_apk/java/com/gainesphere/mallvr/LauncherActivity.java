@@ -41,8 +41,12 @@ public class LauncherActivity extends Activity {
         try { games = MallVR.load(this); } catch (Exception e) { setStatus("games.json missing from the APK: " + e); }
         if (games != null) {
             String last = getSharedPreferences("mallvr", 0).getString("last_game", "");
-            for (int i = 0; i < games.size(); i++) if (games.get(i).code.equals(last)) hall.game = i;
+            for (int i = 0; i < games.size(); i++) if (games.get(i).code.equals(last)) { hall.game = i; hall.lostTab = games.get(i).name.endsWith("(LOST)"); }
             showGames();
+            if (hall.store && !getSharedPreferences("mallvr", 0).getBoolean("email_asked", false)) {   // first thing after install, like the PC's GET GAMES
+                getSharedPreferences("mallvr", 0).edit().putBoolean("email_asked", true).apply();
+                askedGetGames = true; askGetGames();
+            }
         }
         MallVR.log("launcher open, " + MallVR.version(this) + ", " + MallVR.device());
     }
@@ -76,12 +80,19 @@ public class LauncherActivity extends Activity {
             }
             return;
         }
-        if (id.startsWith("step")) { voice.stop(); voice.say("tut_" + hall.stepKey(hall.card)); return; }   // a setup card opened: read it
+        if (id.startsWith("step")) {  // a setup card opened: read it
+            voice.stop(); voice.say("tut_" + hall.stepKey(hall.card));
+            if (hall.stepKey(hall.card).equals("copygames")) askGetGames();
+            return;
+        }
         if (id.equals("cardclose")) { voice.stop(); return; }
         switch (id) {
             case "start": if (games != null && hall.found(hall.game)) start(games.get(hall.game)); break;
             case "online": if (filesOk()) startActivity(new Intent(this, OnlineActivity.class)); else askFiles(); break;   // crossplay with PC players
-            case "getgames": if (!MallVR.store(this)) startActivity(new Intent(this, GetGamesActivity.class)); break;
+            case "getgames":              // the store build fetches nothing itself: askGetGames sends the player to the PC tool that does
+                if (!MallVR.store(this)) startActivity(new Intent(this, GetGamesActivity.class));
+                else askGetGames();
+                break;
             case "report": startActivity(new Intent(this, ReportActivity.class)); break;
             case "about": startActivity(new Intent(this, AboutActivity.class)); break;
             case "check": refresh(); break;
@@ -97,6 +108,46 @@ public class LauncherActivity extends Activity {
                 if (l.startsWith("https://")) try { startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(l))); } catch (Exception e) { }
                 break;
         }
+    }
+
+    /* store build's GET GAMES: the tool is on a PC, so offer to email the link there (online/sendlink.php; the address isn't kept) */
+    boolean askedGetGames;
+    static final String GET_GAMES_PAGE = "https://gainesphere.com/pages/getgames";
+    void askGetGames() {
+        final android.widget.EditText box = new android.widget.EditText(this);
+        box.setInputType(android.text.InputType.TYPE_CLASS_TEXT | android.text.InputType.TYPE_TEXT_VARIATION_EMAIL_ADDRESS);
+        box.setHint("you@example.com");
+        new android.app.AlertDialog.Builder(this).setTitle("Get your games")
+            .setMessage("Own these games? A free tool on a Windows PC gets your backups onto this headset: gainesphere.com/getgames\n\nType your email and we'll send you the instructions. We use your address only to send them and don't keep it.")
+            .setView(box)
+            .setPositiveButton("EMAIL ME THE LINK", (d, w) -> sendLink(box.getText().toString().trim()))
+            .setNeutralButton("OPEN THE PAGE", (d, w) -> { try { startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(GET_GAMES_PAGE))); } catch (Exception e) { } })
+            .setNegativeButton("CLOSE", null).show();
+    }
+
+    void sendLink(final String email) {
+        setStatus("Sending the link...");
+        new Thread(() -> {
+            String say;
+            try {
+                java.net.HttpURLConnection c = (java.net.HttpURLConnection) new java.net.URL("https://downloads.gainesphere.com/mallvr/online/sendlink.php").openConnection();
+                c.setConnectTimeout(10000); c.setReadTimeout(15000); c.setDoOutput(true); c.setRequestMethod("POST");
+                c.getOutputStream().write(("email=" + java.net.URLEncoder.encode(email, "UTF-8")).getBytes("UTF-8"));
+                int code = c.getResponseCode();
+                say = code == 200 ? "SENT"
+                    : code == 400 ? "That doesn't look like an email address. Press GET GAMES to try again."
+                    : code == 429 ? "Too many sent just now: check your inbox, or try again later."
+                    : "Couldn't send it. On a PC, go to gainesphere.com/getgames";
+            } catch (Exception e) { say = "Couldn't send it (no internet?). On a PC, go to gainesphere.com/getgames"; }
+            final String s = say;
+            runOnUiThread(() -> {
+                if (!s.equals("SENT")) { setStatus(s); return; }
+                setStatus("Sent to " + email + ". Check your email and follow the instructions.");
+                new android.app.AlertDialog.Builder(this).setTitle("Check your email")
+                    .setMessage("We sent the instructions to " + email + ". Check your email (and spam folder) and follow them on a Windows PC.")
+                    .setPositiveButton("OK", null).show();
+            });
+        }, "MallVR send link").start();
     }
 
     void setStatus(String s) { hall.status = s; if (view != null) view.invalidate(); }
@@ -140,6 +191,7 @@ public class LauncherActivity extends Activity {
             final String xrFail = xrCheck();
             runOnUiThread(() -> {
                 hall.checked = true; hall.notesOn = PlayNotes.on(); showGames(); syncSound();
+                if (hall.store && !hall.anyFound() && !askedGetGames) { askedGetGames = true; askGetGames(); }   // no games yet: the email box comes up by itself, once
                 if (!xrFail.isEmpty()) xrHelp(xrFail, null);
                 else if (PlayNotes.needsAsk() && !askShown) { askShown = true; askNotes(); }
             });
@@ -181,9 +233,9 @@ public class LauncherActivity extends Activity {
     /* the games into the hall's blocks (state = what find() saw), and the line under them */
     void showGames() {
         List<HallPainter.Item> items = new ArrayList<>();
-        int ready = 0;
+        int ready = 0, total = 0;
         for (MallVR.Game g : games) {
-            if (g.state == 1 || g.state == 2) ready++;
+            if (!g.name.endsWith("(LOST)")) { total++; if (g.state == 1 || g.state == 2) ready++; }   // the Lost Games need no files
             HallPainter.Item it = new HallPainter.Item();
             it.code = g.code; it.name = hallName(g.name); it.state = g.state; it.why = g.why;
             items.add(it);
@@ -194,7 +246,7 @@ public class LauncherActivity extends Activity {
         setStatus(ready == 0
             ? (MallVR.store(this) ? "No games found yet. Copy your own games folder (the same one the PC version uses) into " + MallVR.GAMES + " with a USB cable."
                 : "No games found yet. Press GET GAMES to download them from archive.org, or copy your games folder from the PC version into " + MallVR.GAMES + " (USB cable or SideQuest).")
-            : ready + " of " + games.size() + " games ready. START puts you in the game. Back here: hold A + B for a second.");
+            : ready + " of " + total + " games ready. START puts you in the game. Back here: hold A + B for a second.");
     }
 
     /* is the game process (":game") still running? */

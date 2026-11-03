@@ -1,15 +1,15 @@
-MallVR FOR META QUEST 0.4 - TEST BUILD - HOW TO INSTALL
+MallVR FOR META QUEST 0.5 - TEST BUILD - HOW TO INSTALL
 =========================================================
 MallVR plays the 1990s Virtuality arcade VR games (Dactyl Nightmare, Pac-Man VR, Zone Hunter, Boxing, Buggy Ball ...) on the
 headset itself: no PC needed to play. Quest 2, Quest 3, Quest 3S, Quest Pro, with UP-TO-DATE system software (Settings > System >
 Software Update). An old system can't start MallVR's VR: the game plays with sound, but you only see the DOSBox screen.
 
-THIS IS A TEST BUILD. NEW IN 0.4: ONLINE with PC players works again (PC v0.14.0 or newer) and the new menu. Voice chat: step 7. The first Quest players are the
+THIS IS A TEST BUILD. NEW IN 0.5: LOST GAMES, 12 lost Virtuality games rebuilt from footage as playable placeholders. ONLINE with PC players needs PC v0.15.0 or newer. Voice chat: step 7. The first Quest players are the
 test: if something goes wrong, that's useful too. Please press REPORT A PROBLEM afterwards (step 6), whether it worked or not.
-Already have 0.1? Install 0.2 the same way (step 2), over it: your games and settings stay.
+Already have an older MallVR? Install 0.5 the same way (step 2), over it: your games and settings stay.
 
 You need: the headset, the Meta Horizon phone app, a PC or Mac with a USB-C DATA cable (once, to install), Wi-Fi.
-Files: MallVR-Quest-0.2.apk (the app). MallVR-Quest-0.2-source.zip is its source code (GPL); you don't need it to play.
+Files: MallVR-Quest-0.5.0.apk (the app). MallVR-Quest-0.5.0-source.zip is its source code (GPL); you don't need it to play.
 
 
 1. DEVELOPER MODE (once per headset)
@@ -25,8 +25,8 @@ Files: MallVR-Quest-0.2.apk (the app). MallVR-Quest-0.2-source.zip is its source
    a) Install SideQuest (sidequestvr.com, "Advanced Installer") on the PC/Mac. Windows may also ask for Meta's ADB driver.
    b) Plug the headset in with the USB-C cable, put it on: "Allow USB debugging?" -> tick Always allow from this computer -> Allow.
       SideQuest's top left dot turns green.
-   c) Drag MallVR-Quest-0.2.apk onto the SideQuest window (or the "Install APK file from folder" button). Wait for "Success".
-   Command line instead:  adb install -r MallVR-Quest-0.2.apk
+   c) Drag MallVR-Quest-0.5.0.apk onto the SideQuest window (or the "Install APK file from folder" button). Wait for "Success".
+   Command line instead:  adb install -r MallVR-Quest-0.5.0.apk
 
 3. OPEN MALLVR
    Headset: App Library > top right filter > Unknown Sources > MallVR. It opens as a flat window (the launcher).
@@ -64,7 +64,7 @@ Files: MallVR-Quest-0.2.apk (the app). MallVR-Quest-0.2-source.zip is its source
    game. No name, account or location. A copy is saved in the headset's Download folder: if sending fails, post that zip in
    the MallVR Discord, #bug-reports.
 
-7. PLAY ONLINE (new in 0.2: with PC and Quest players)
+7. PLAY ONLINE (with PC and Quest players)
    Main screen > ONLINE. Type a name, SAVE NAME. Then:
       QUICK MATCH  finds a player and starts by itself (ANY GAME, or press the game button to pick one).
       HOST         opens a game others can join. START when someone joined.  JOIN  joins an open game in the list.
@@ -73,7 +73,8 @@ Files: MallVR-Quest-0.2.apk (the app). MallVR-Quest-0.2-source.zip is its source
    screen, VOICE turns each player up or down or mutes them (only for you). Hosting shares your internet address with the players
    who join. If joining fails, REPORT A PROBLEM: the report says why.
 
-KNOWN IN 0.2
+KNOWN IN 0.5
+   - The LOST GAMES have not been played on a headset by us yet: controls and speed are a first try. Tell us what happened.
    - Online is brand new: the first matches between Quests and PCs happen with you. Tell us what happened.
    - If the host switches games in the middle of a game, you go along (the GO / STAY OUT question isn't in the headset yet).
    - Some home networks (phone hotspots, some providers) can't connect directly yet; your report helps us fix that.

@@ -125,7 +125,7 @@ public partial class MallLauncher : Form
         timer.Tick += (o, e) =>
         {
             MusicTick();
-            if (++ticks % 8 != 0) { if (HallNow) Invalidate(); return; }
+            if (++ticks % 8 != 0) { if (HallNow || HallOnline) Invalidate(); return; }
             blink++;
             DevOnline();
             CountOnline();
@@ -173,6 +173,8 @@ public partial class MallLauncher : Form
     int Opt(Graphics g, string s, int x, int y, Font f, Color c, string id)
     {
         if (id != null && id == hover && c == Red) c = White;
+        if (themedOpt && s == "GAINESPHERE STUDIOS") return (int)GainesphereMark(g, x + 34, y - 1, 0.5f);   // the operator screen keeps its line of text
+        if (themedOpt) c = ThemeColor(c);
         using (Brush b = new SolidBrush(c)) g.DrawString(s, f, b, x, y, StringFormat.GenericTypographic);   // 1-bit glyphs (no smoothing), like the card's
         SizeF zf = g.MeasureString(s, f, 999, StringFormat.GenericTypographic);
         Size z = new Size((int)Math.Ceiling(zf.Width), (int)Math.Ceiling(zf.Height));
@@ -197,9 +199,12 @@ public partial class MallLauncher : Form
         Opt(g, "MALLVR   GAME   SELECT", 10, 4, big, Yellow, null);
         Opt(g, "GAME", 10, 26, big, Yellow, null);
         // two columns of eight, rows 12.5 px apart (16 games; a third column fell off the screen's right edge, 8 rows at 14 px ran into MODE)
-        for (int i = 0; i < Codes.Count; i++)
+        if (Lost.Count > 0) Opt(g, LostTab ? "ORIGINALS" : "LOST GAMES", 70, 28, txt, Red, LostTab ? "lst0" : "lst1");
+        if (LostTab) { string[] note = { "PLAYABLE", "PLACEHOLDERS.", "WE STILL WANT", "THE REAL ONES" }; for (int l = 0; l < 4; l++) Opt(g, note[l], 186, 95 + l * 12, txt, Red, null); }
+        List<int> rows = ShownGames();
+        for (int s = 0; s < rows.Count; s++)
         {
-            int col = i / Rows, row = i % Rows;
+            int i = rows[s], col = s / Rows, row = s % Rows;
             Color c = !Found[i] ? Dim : i == Game ? Yellow : Red;
             Opt(g, Names[i], 14 + col * 172, 42 + row * 25 / 2, txt, c, "g" + i);
         }
@@ -736,6 +741,7 @@ public partial class MallLauncher : Form
         }
         else if (id == "oqcancel") { Net.StopQuick(); }
         else if (id == "oadv") { Advanced = true; }
+        else if (id == "odiscord") { try { System.Diagnostics.Process.Start("https://discord.gg/7tDn2AAXEC"); } catch (Exception) { } }
         else if (id == "osimple") { Advanced = false; }
         else if (id == "ogame")
         {

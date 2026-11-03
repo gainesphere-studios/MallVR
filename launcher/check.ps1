@@ -21,6 +21,7 @@ foreach ($code in $Games.Keys) {
         else { Write-Host "  [  EXTRA  ] $label not got (optional: GET GAMES)" -ForegroundColor DarkGray }
         continue
     }
+    if ($info.Lost) { Write-Host "  [  READY  ] $label lost game, rebuilt by MallVR" -ForegroundColor Green; $ready++; continue }
     if ($info.Native) {
         $d = Get-ChildItem -LiteralPath $gamesDir -Recurse -Directory -Filter $info.DataDir -ErrorAction SilentlyContinue |
             Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName $info.DataFile) } | Select-Object -First 1

@@ -31,7 +31,7 @@ foreach ($code in $Games.Keys) {
     Get-ChildItem Env: | Where-Object { $_.Name -like 'VPIX_*' } | Sort-Object Name | ForEach-Object { $ev[$_.Name] = $_.Value.Replace([string][char]8, '\b') }   # play.ps1 10-25 has backspace bytes for \b in the Buggy paths
     $ev.Remove('VPIX_FFMPEG')         # no ffmpeg on the headset (SU3000 movies: pl_mpeg later, plan section 8)
     $ev.Remove('VPIX_CD_DIR')         # the app finds the CdAudio folder itself
-    $g = [ordered]@{ code = $code; name = $info.Name; exe = $(if ($info.Exe) { $info.Exe } else { $code }); args = "$($info.Args)" }
+    $g = [ordered]@{ code = $code; name = $(if ($info.Lost) { "$($info.Name) (LOST)" } else { $info.Name }); exe = $(if ($info.Exe) { $info.Exe } else { $code }); args = "$($info.Args)" }
     foreach ($k in 'Sha1', 'Cd', 'CdBin', 'CdSha1', 'Native', 'DataDir', 'DataFile', 'CdAudio', 'Mpeg', 'Su3k', 'Link', 'MaxPlayers', 'Fps') {
         if ($null -ne $info[$k] -and "$($info[$k])" -ne '') { $g[$k.Substring(0, 1).ToLower() + $k.Substring(1)] = $info[$k] }
     }

@@ -32,6 +32,24 @@ public partial class MallLauncher
     readonly DateTime born = DateTime.UtcNow;
     public double ShotTime = -1;                  // launcher.ps1 -Shot: draw the moving parts at this time (s)
 
+    // the game list's two sections: the originals, and the lost games (rebuilt from footage, games.ps1 Lost). The section is the one the selected game is in.
+    public readonly HashSet<string> Lost = new HashSet<string>();
+    bool IsLost(int i) { return i >= 0 && i < Codes.Count && Lost.Contains(Codes[i]); }
+    bool LostTab { get { return IsLost(Game); } }
+    static readonly Color Amber = Color.FromArgb(255, 170, 40);
+    List<int> ShownGames()
+    {
+        List<int> l = new List<int>();
+        bool lost = LostTab;
+        for (int i = 0; i < Codes.Count; i++) if (IsLost(i) == lost) l.Add(i);
+        return l;
+    }
+    void ShowSection(bool lost)
+    {
+        for (int i = 0; i < Codes.Count; i++) if (IsLost(i) == lost) { Game = i; break; }
+        Invalidate();
+    }
+
     public static readonly string[] EraPods = { "1000CS", "1000SD", "2000SU", "2000SD", "SU3000" };
     static readonly Color Cyan = Color.FromArgb(41, 231, 255), Pink = Color.FromArgb(255, 63, 216), Cream = Color.FromArgb(244, 241, 232);
     static Font hTitle, hBlock, hSmall, hTiny, hSheetT, hSheet, hTimes, hTimesS;
@@ -44,10 +62,18 @@ public partial class MallLauncher
     // the picture of the current screen: the hall (1056x864) or the operator screen (352x288, scaled up in whole pixels by the caller)
     Bitmap Render()
     {
-        if (HallNow)
+        bool online = HallOnline;
+        if (!online) { onOpened = -1; onKey = null; }
+        if (ThemedNow)
         {
             if (hallCanvas == null) hallCanvas = new Bitmap(W * R, H * R, PixelFormat.Format32bppRgb);
-            using (Graphics g = Graphics.FromImage(hallCanvas)) DrawHall(g);
+            using (Graphics g = Graphics.FromImage(hallCanvas)) DrawThemed(g);
+            return hallCanvas;
+        }
+        if (HallNow || online)
+        {
+            if (hallCanvas == null) hallCanvas = new Bitmap(W * R, H * R, PixelFormat.Format32bppRgb);
+            using (Graphics g = Graphics.FromImage(hallCanvas)) { if (online) DrawHallOnline(g); else DrawHall(g); }
             return hallCanvas;
         }
         using (Graphics g = Graphics.FromImage(canvas)) DrawScreen(g);
@@ -70,7 +96,7 @@ public partial class MallLauncher
     Bitmap hallSky, hallUi;
     string uiKey;
 
-    void DrawHall(Graphics g)
+    void HallFonts()
     {
         HallData.Load(Path.Combine(Path.Combine(Root, "engine"), "hall"), Path.Combine(Root, "settings"));
         if (hTitle == null)
@@ -84,6 +110,11 @@ public partial class MallLauncher
             hTimes = new Font("Times New Roman", 10f, FontStyle.Bold, GraphicsUnit.Pixel);
             hTimesS = new Font("Times New Roman", 7.5f, FontStyle.Bold, GraphicsUnit.Pixel);
         }
+    }
+
+    void DrawHall(Graphics g)
+    {
+        HallFonts();
         if (Game >= Codes.Count) Game = 0;
         if (Game != lastGame) { if (lastGame >= 0) Wanted = false; lastGame = Game; viewPod = null; }
         bool link = Codes.Count > 0 && Links[Game];
@@ -203,25 +234,46 @@ public partial class MallLauncher
     // the games as glowing data blocks on the left
     void DrawBlocks(Graphics g)
     {
-        int n = Math.Max(1, Codes.Count);
-        float top = 30, rowH = Math.Min(13f, 200f / (n + 1)), bh = rowH - 1.6f;   // + 1 row: WANTED
-        if (Codes.Count == 0) HText(g, "NO GAMES YET", 10, top, hBlock, Red, null);
-        for (int i = 0; i < Codes.Count; i++)
+        List<int> shown = ShownGames();
+        bool lostNow = LostTab;
+        if (Lost.Count > 0)
         {
+            // the two sections, like folder tabs on top of the list
+            float tx = 6;
+            for (int k = 0; k < 2; k++)
+            {
+                bool on = (k == 1) == lostNow;
+                string id = "lst" + k, label = k == 0 ? "ORIGINALS" : "LOST GAMES";
+                Color col = k == 0 ? Cyan : Amber;
+                RectangleF tr = new RectangleF(tx, 28, 59, 11);
+                using (SolidBrush b = new SolidBrush(on ? col : Color.FromArgb(hover == id ? 90 : 40, col))) g.FillRectangle(b, tr);
+                using (Pen p = new Pen(col, 0.5f)) g.DrawRectangle(p, tr.X, tr.Y, tr.Width, tr.Height);
+                SizeF ls = g.MeasureString(label, hSmall);
+                HText(g, label, tr.X + (tr.Width - ls.Width) / 2, tr.Y + (tr.Height - ls.Height) / 2, hSmall, on ? Color.FromArgb(10, 6, 20) : Color.FromArgb(225, 235, 245), null);
+                hits.Add(new KeyValuePair<Rectangle, string>(Rectangle.Round(tr), id));
+                tx += 61;
+            }
+        }
+        int n = Math.Max(1, shown.Count);
+        float top = Lost.Count > 0 ? 42 : 30, room = 230 - top - (lostNow ? 16 : 0), rowH = Math.Min(13f, room / (n + 1)), bh = rowH - 1.6f;   // + 1 row: WANTED
+        if (Codes.Count == 0) HText(g, "NO GAMES YET", 10, top, hBlock, Red, null);
+        for (int s = 0; s < shown.Count; s++)
+        {
+            int i = shown[s];
             bool sel = i == Game, hov = hover == "g" + i;
-            float y = top + i * rowH, x = sel ? 12 : 6, w = 120;
+            float y = top + s * rowH, x = sel ? 12 : 6, w = 120;
             RectangleF r = new RectangleF(x, y, w, bh);
             if (sel)
             {
-                using (LinearGradientBrush b = new LinearGradientBrush(r, Cyan, Color.FromArgb(26, 106, 255), 0f)) g.FillRectangle(b, r);
-                using (SolidBrush b = new SolidBrush(Color.FromArgb(70, Cyan))) g.FillRectangle(b, x - 1.5f, y - 1.5f, w + 3, bh + 3);
+                using (LinearGradientBrush b = new LinearGradientBrush(r, lostNow ? Amber : Cyan, lostNow ? Color.FromArgb(200, 60, 30) : Color.FromArgb(26, 106, 255), 0f)) g.FillRectangle(b, r);
+                using (SolidBrush b = new SolidBrush(Color.FromArgb(70, lostNow ? Amber : Cyan))) g.FillRectangle(b, x - 1.5f, y - 1.5f, w + 3, bh + 3);
                 g.FillRectangle(Brushes.White, x, y, 2, bh);
             }
             else
             {
                 using (LinearGradientBrush b = new LinearGradientBrush(r, Color.FromArgb(hov ? 34 : 15, hov ? 70 : 42, hov ? 120 : 74), Color.FromArgb(10, 20, 48), 0f)) g.FillRectangle(b, r);
                 using (Pen p = new Pen(Color.FromArgb(hov ? 200 : 90, 40, 110, 170), 0.4f)) g.DrawRectangle(p, x, y, w, bh);
-                using (SolidBrush b = new SolidBrush(Found[i] ? Cyan : Color.FromArgb(60, 80, 100))) g.FillRectangle(b, x, y, 1.5f, bh);
+                using (SolidBrush b = new SolidBrush(!Found[i] ? Color.FromArgb(60, 80, 100) : lostNow ? Amber : Cyan)) g.FillRectangle(b, x, y, 1.5f, bh);
             }
             Color tc = sel ? Color.FromArgb(0, 0, 20) : !Found[i] ? Color.FromArgb(90, 110, 130) : Color.FromArgb(220, 245, 255);
             float fy = y + (bh - 8.5f) / 2;
@@ -232,7 +284,13 @@ public partial class MallLauncher
             hits.Add(new KeyValuePair<Rectangle, string>(new Rectangle((int)x, (int)y, (int)w, (int)Math.Ceiling(bh)), "g" + i));
         }
         // the last block: WANTED, the games and CD audio nobody has found yet
-        float wy = top + Codes.Count * rowH, wx = Wanted ? 12 : 6;
+        float wy = top + shown.Count * rowH, wx = Wanted ? 12 : 6;
+        if (lostNow)
+        {
+            using (SolidBrush b = new SolidBrush(Color.FromArgb(255, 205, 130)))
+                g.DrawString("PLAYABLE PLACEHOLDERS, REBUILT FROM FOOTAGE. WE STILL WANT TO FIND THE REAL ONES.", hTiny, b, new RectangleF(6, wy, 124, 14));
+            wy += 15;
+        }
         bool wh = hover == "wanted";
         RectangleF wr = new RectangleF(wx, wy, 120, bh);
         using (SolidBrush b = new SolidBrush(Wanted ? Pink : Color.FromArgb(wh ? 90 : 50, Pink))) g.FillRectangle(b, wr);
@@ -587,6 +645,21 @@ public partial class MallLauncher
         }
     }
 
+    // our name the same way: GAIN white on black, SPHERE black on the logo's blue. Returns its width.
+    public static float GainesphereMark(Graphics g, float x, float y, float sc)
+    {
+        using (Font f = new Font("Arial Black", 14f * sc, FontStyle.Bold, GraphicsUnit.Pixel))
+        {
+            float w1 = g.MeasureString("GAIN", f).Width, w2 = g.MeasureString("SPHERE", f).Width, h = 20 * sc, p = 3 * sc;
+            g.FillRectangle(Brushes.Black, x, y, w1 + w2 + p * 2, h);
+            using (Pen pn = new Pen(Color.FromArgb(150, 150, 150), Math.Max(0.5f, sc))) g.DrawRectangle(pn, x, y, w1 + w2 + p * 2, h);
+            using (SolidBrush b = new SolidBrush(Color.FromArgb(92, 172, 238))) g.FillRectangle(b, x + w1 + p, y + sc, w2 + p - sc, h - 2 * sc);
+            g.DrawString("GAIN", f, Brushes.White, x + p * 0.3f, y - sc * 0.5f);
+            g.DrawString("SPHERE", f, Brushes.Black, x + w1 + p * 1.3f, y - sc * 0.5f);
+            return w1 + w2 + p * 2;
+        }
+    }
+
     // era dials: walk the hall from the 1991 pods to the SU3000
     void DrawEra(Graphics g, string pod)
     {
@@ -790,10 +863,649 @@ public partial class MallLauncher
         p.CloseFigure(); return p;
     }
 
+    // ---- the smaller screens (first-run question, GET GAMES, REPORT, after a crash) in the default theme: the operator screen's own layout and Opt
+    // calls, drawn sharp in the theme's colours on the theme's background. One place to hang more themes on later (Bobby 11-02: one for each age of VR).
+    bool ThemedNow { get { return Style == 0 && (MallNotes.NeedsAsk || ReportScreen || CrashGame != "" || GetGamesScreen); } }
+    bool themedOpt;
+    static Color ThemeColor(Color c)
+    {
+        if (c == White) return Cyan;
+        if (c == Red) return Color.FromArgb(220, 245, 255);
+        if (c == Dim) return Color.FromArgb(140, 170, 200);
+        return c;
+    }
+    void DrawBackdrop(Graphics g)
+    {
+        if (hallSky == null)
+        {
+            hallSky = new Bitmap(W * R, H * R, PixelFormat.Format32bppPArgb);
+            using (Graphics k = Graphics.FromImage(hallSky)) { Setup(k); DrawSky(k); }
+        }
+        g.ResetTransform();
+        g.CompositingMode = CompositingMode.SourceCopy;
+        g.DrawImageUnscaled(hallSky, 0, 0);
+        g.CompositingMode = CompositingMode.SourceOver;
+    }
+    void DrawThemed(Graphics g)
+    {
+        HallData.Load(Path.Combine(Path.Combine(Root, "engine"), "hall"), Path.Combine(Root, "settings"));
+        HallFonts();
+        hits.Clear();
+        uiKey = null;
+        DrawBackdrop(g);
+        g.SmoothingMode = SmoothingMode.None;
+        g.PixelOffsetMode = PixelOffsetMode.Default;
+        using (Pen p = new Pen(Color.FromArgb(62, 58, 58), 1f))
+        {
+            for (int x = 6 * R; x < W * R; x += 10 * R) g.DrawLine(p, x, 0, x, H * R);
+            for (int y = 0; y < H * R; y += 10 * R) g.DrawLine(p, 0, y, W * R, y);
+        }
+        Setup(g);
+        themedOpt = true;
+        if (Game >= Codes.Count) Game = 0;
+        if (MallNotes.NeedsAsk) DrawConsent(g);
+        else if (ReportScreen) DrawReport(g);
+        else if (CrashGame != "") DrawCrash(g);
+        else DrawGetGames(g);
+        themedOpt = false;
+    }
+
+    // ---- the ONLINE screen in the hall style (Bobby 11-02): the hall's sky and data blocks over the grey grid of the SU3000 loader,
+    // drawing down from the top as the loader's picture does, the pods taking turns turning on it behind the menu, its Loading box and
+    // CyberMind wordmark bottom right. Top right, a Lawnmower Man wall of octagon panels with a phone in each: one lit per player online,
+    // and every phone rings while a game is open or QUICK MATCH is searching (the film ends with every phone in the world ringing). All drawn, no game files. Same ids as the operator screen's DrawOnline (OnlineDo, VrPoint work the same).
+    bool HallOnline
+    {
+        get { return Style == 0 && OnlineScreen && Net != null && !MallNotes.NeedsAsk && !ReportScreen && CrashGame == "" && !GetGamesScreen; }
+    }
+    string onKey; double onOpened = -1;
+    static Font hOnTitle, hOnBig, hOnBox;
+    List<OnlineEntry> OnlinePeople()
+    {
+        string d = Environment.GetEnvironmentVariable("MALLVR_ONLINESHOT");   // dev: -Shot with people in the lists
+        if (string.IsNullOrEmpty(d)) return Net.Everyone();
+        List<OnlineEntry> l = new List<OnlineEntry>();
+        string[] who = { "DEVILMASTER:ZONE:QUEST", "SKATEKID:DN2:PC", "RAVEN:BOX:QUEST", "IGOR::PC" };
+        foreach (string w in who)
+        {
+            string[] p = w.Split(':');
+            OnlineEntry e = new OnlineEntry(); e.Name = p[0]; e.Game = p[1]; e.Plat = p[2]; e.N = 1; e.Max = 4;
+            if (p[1] != "") e.Status = "HOST";
+            l.Add(e);
+        }
+        return l;
+    }
+
+    void DrawHallOnline(Graphics g)
+    {
+        HallFonts();
+        if (hOnTitle == null)
+        {
+            hOnTitle = new Font("Times New Roman", 25f, FontStyle.Bold, GraphicsUnit.Pixel);
+            hOnBig = new Font("Times New Roman", 15f, FontStyle.Bold, GraphicsUnit.Pixel);
+            hOnBox = new Font("Consolas", 7.5f, FontStyle.Regular, GraphicsUnit.Pixel);
+        }
+        double t = Now;
+        if (onOpened < 0) onOpened = t;
+        if (hallSky == null)
+        {
+            hallSky = new Bitmap(W * R, H * R, PixelFormat.Format32bppPArgb);
+            using (Graphics k = Graphics.FromImage(hallSky)) { Setup(k); DrawSky(k); }
+        }
+        if (hallUi == null) hallUi = new Bitmap(W * R, H * R, PixelFormat.Format32bppPArgb);
+        string key = string.Join("|", new string[] { blink.ToString(), hover, PlayerName, editName.ToString(), Mode.ToString(), Advanced.ToString(), status, quickPick.ToString(), hostPick.ToString(), Net.Quick.ToString() });
+        if (key != onKey)
+        {
+            onKey = key;
+            List<OnlineEntry> who = OnlinePeople();
+            onLit = who.FindAll(e => !e.FromLan).Count;
+            bool wasRinging = onRinging;
+            onRinging = Net.Quick || who.Exists(e => (e.IsHost || (OnlineShot && e.Game != "")) && e.Name != PlayerName);
+            if (onRinging && !wasRinging && !Net.Quick && !Focused && !ContainsFocus && IsHandleCreated) FlashWindow(Handle, true);
+            uiKey = null;            // the hall's layer and its click areas are redrawn when the hall comes back
+            hits.Clear();
+            using (Graphics u = Graphics.FromImage(hallUi))
+            {
+                u.Clear(Color.Transparent);
+                Setup(u);
+                DrawOnlineUi(u);
+            }
+        }
+
+        g.ResetTransform();
+        g.CompositingMode = CompositingMode.SourceCopy;
+        g.DrawImageUnscaled(hallSky, 0, 0);
+        g.CompositingMode = CompositingMode.SourceOver;
+        Setup(g);
+        // drawing down from the top when the screen opens
+        double a = ShotTime >= 0 ? 1 : Math.Min(1, (t - onOpened) / 1.2);
+        int sweep = (int)((H + 1) * R * a);
+        g.ResetTransform();
+        g.SmoothingMode = SmoothingMode.None;
+        g.PixelOffsetMode = PixelOffsetMode.Default;
+        g.SetClip(new Rectangle(0, 0, W * R, sweep));
+        // the pods take turns on the grid behind the menu, one at a time: one full turn each, 8 bars at the menu songs' common tempo
+        // (110 bpm; they run 95 to 118, measured 11-02), fading into the next
+        const float Turn = 8 * 4 * 60f / 110, Fade = 1f;
+        double tp = t / Turn;
+        int which = (int)tp;
+        float into = (float)(tp - which) * Turn;
+        DrawOnlinePod(g, which, (float)(tp - which) * 60, into < Fade ? into / Fade : into > Turn - Fade ? (Turn - into) / Fade : 1f);
+        // the loader's grey grid over them, gliding up slowly (whole pixels, no smoothing: it's redrawn every frame)
+        using (Pen p = new Pen(Color.FromArgb(78, 74, 70), 1f))
+        {
+            for (int x = 6 * R; x < W * R; x += 10 * R) g.DrawLine(p, x, 0, x, H * R);
+            for (int y = (int)((10 - t * 2 % 10) * R); y < H * R; y += 10 * R) g.DrawLine(p, 0, y, W * R, y);
+        }
+        DrawPhoneWall(g, t);
+        g.ResetClip();
+        if (a < 1) using (Pen p = new Pen(Color.FromArgb(200, Cyan), 2f)) g.DrawLine(p, 0, sweep, W * R, sweep);
+        g.ResetTransform();
+        g.DrawImageUnscaled(hallUi, 0, 0);
+    }
+
+    // the slow spin is blended between two sheet frames at the sheet's size, then scaled up, about ten times a second; the frames between just blit it
+    Bitmap onPod, onPodTile; int onPodAt = -1;
+    [DllImport("user32.dll")] static extern bool FlashWindow(IntPtr h, bool invert);
+    void DrawOnlinePod(Graphics g, int which, float frame, float alpha)
+    {
+        Bitmap sheet = HallData.PodCut(EraPods[which % EraPods.Length]);
+        if (sheet == null) return;
+        const int X = 92, Y = 18, Size = 226;
+        int tw = sheet.Width / 10, th = sheet.Height / 6;
+        if (onPod == null) { onPod = new Bitmap(Size * R, Size * R, PixelFormat.Format32bppPArgb); onPodTile = new Bitmap(tw, th, PixelFormat.Format32bppPArgb); }
+        int at = (int)(frame * 3) + which * 1000 + (int)(alpha * 8) * 100000;
+        if (at != onPodAt)
+        {
+            onPodAt = at;
+            int f0 = (int)frame % 60, f1 = (f0 + 1) % 60;
+            float bl = frame - (int)frame;
+            using (Graphics k = Graphics.FromImage(onPodTile))
+            using (ImageAttributes ia = new ImageAttributes())
+            {
+                Rectangle to = new Rectangle(0, 0, tw, th);
+                k.Clear(Color.Transparent);
+                k.InterpolationMode = InterpolationMode.NearestNeighbor;
+                ColorMatrix m = new ColorMatrix(); m.Matrix33 = alpha;
+                ia.SetColorMatrix(m);
+                k.DrawImage(sheet, to, (f0 % 10) * tw, (f0 / 10) * th, tw, th, GraphicsUnit.Pixel, ia);
+                m.Matrix33 = alpha * bl;
+                ia.SetColorMatrix(m);
+                k.DrawImage(sheet, to, (f1 % 10) * tw, (f1 / 10) * th, tw, th, GraphicsUnit.Pixel, ia);
+            }
+            Anaglyph(onPodTile, 2);
+            using (Graphics k = Graphics.FromImage(onPod))
+            {
+                k.Clear(Color.Transparent);
+                Setup(k);
+                DrawRing(k, Size / 2f, Size * 0.9f, 136, 24, Cyan, (int)(110 * alpha));
+                DrawRing(k, Size / 2f, Size * 0.91f, 102, 17, Pink, (int)(90 * alpha));
+                k.DrawImage(onPodTile, new RectangleF(0, 0, Size, Size));
+            }
+        }
+        g.DrawImageUnscaled(onPod, X * R, Y * R);
+    }
+
+    // the 3D-glasses look: the red channel from one eye, green and blue from the other, side by side by `gap` pixels each way
+    static void Anaglyph(Bitmap b, int gap)
+    {
+        BitmapData d = b.LockBits(new Rectangle(0, 0, b.Width, b.Height), ImageLockMode.ReadWrite, PixelFormat.Format32bppPArgb);
+        byte[] px = new byte[d.Stride * b.Height], o = new byte[px.Length];
+        Marshal.Copy(d.Scan0, px, 0, px.Length);
+        int w = b.Width;
+        for (int y = 0; y < b.Height; y++)
+            for (int x = 0; x < w; x++)
+            {
+                int q = y * d.Stride + x * 4;
+                int lf = x + gap < w ? q + gap * 4 : q, rt = x >= gap ? q - gap * 4 : q;      // the eye with red sees it shifted left, the other right
+                o[q] = px[rt]; o[q + 1] = px[rt + 1]; o[q + 2] = px[lf + 2];
+                o[q + 3] = Math.Max(Math.Max(px[lf + 3], px[rt + 3]), Math.Max(o[q], Math.Max(o[q + 1], o[q + 2])));
+            }
+        Marshal.Copy(o, 0, d.Scan0, o.Length);
+        b.UnlockBits(d);
+    }
+
+    // the wall of octagons, top right: drawn once per kind of panel, then only blitted
+    Bitmap[] onTile;
+    bool onRinging; int onLit;
+    const int OnCell = 34;
+    Bitmap OctTile(Color c0, Color c1, Color edge, int alpha)
+    {
+        int n = OnCell * R;
+        Bitmap b = new Bitmap(n, n, PixelFormat.Format32bppPArgb);
+        using (Graphics k = Graphics.FromImage(b))
+        {
+            k.SmoothingMode = SmoothingMode.AntiAlias;
+            float f = n, c = n * 0.293f, i = 2.5f;
+            PointF[] oct = { new PointF(c, i), new PointF(f - c, i), new PointF(f - i, c), new PointF(f - i, f - c), new PointF(f - c, f - i), new PointF(c, f - i), new PointF(i, f - c), new PointF(i, c) };
+            using (LinearGradientBrush g = new LinearGradientBrush(new RectangleF(0, 0, f, f), Color.FromArgb(alpha, c0), Color.FromArgb(alpha, c1), 60f)) k.FillPolygon(g, oct);
+            using (Pen p = new Pen(edge, 2.2f)) k.DrawPolygon(p, oct);
+            PointF[] inner = new PointF[8];
+            for (int j = 0; j < 8; j++) inner[j] = new PointF(f / 2 + (oct[j].X - f / 2) * 0.82f, f / 2 + (oct[j].Y - f / 2) * 0.82f);
+            using (Pen p = new Pen(Color.FromArgb(90, edge), 1f)) k.DrawPolygon(p, inner);
+            // the little squares where four octagons meet
+            using (SolidBrush g = new SolidBrush(Color.FromArgb(120, Pink)))
+            {
+                float d = c - 7;
+                k.FillPolygon(g, new PointF[] { new PointF(0, 0), new PointF(d, 0), new PointF(0, d) });
+                k.FillPolygon(g, new PointF[] { new PointF(f, 0), new PointF(f - d, 0), new PointF(f, d) });
+                k.FillPolygon(g, new PointF[] { new PointF(0, f), new PointF(d, f), new PointF(0, f - d) });
+                k.FillPolygon(g, new PointF[] { new PointF(f, f), new PointF(f - d, f), new PointF(f, f - d) });
+            }
+        }
+        return b;
+    }
+
+    // the logos beside the wall take turns with long fades (a wait for a match is long): 8 bars each at the songs' tempo, the last 6 s fading into the next
+    Bitmap onSlotA, onSlotB;
+    const int SlotX = 106, SlotW = 72, SlotH = 74;
+    void DrawLogoSlot(Graphics g, double t)
+    {
+        const float Each = 8 * 4 * 60f / 110, FadeS = 6f;
+        if (onSlotA == null)
+        {
+            onSlotA = new Bitmap(SlotW * R, SlotH * R, PixelFormat.Format32bppPArgb);
+            onSlotB = new Bitmap(SlotW * R, SlotH * R, PixelFormat.Format32bppPArgb);
+        }
+        double c = t / Each;
+        int which = (int)c;
+        float into = (float)(c - which) * Each, mix = into > Each - FadeS ? (into - (Each - FadeS)) / FadeS : 0f;
+        DrawSlotLogo(onSlotA, which, t);
+        g.ResetTransform();
+        if (mix <= 0f) { g.DrawImageUnscaled(onSlotA, SlotX * R, 0); return; }
+        DrawSlotLogo(onSlotB, which + 1, t);
+        BlitAlpha(g, onSlotA, 1f - mix);
+        BlitAlpha(g, onSlotB, mix);
+    }
+    static void BlitAlpha(Graphics g, Bitmap b, float a)
+    {
+        using (ImageAttributes ia = new ImageAttributes())
+        {
+            ColorMatrix m = new ColorMatrix(); m.Matrix33 = a;
+            ia.SetColorMatrix(m);
+            g.DrawImage(b, new Rectangle(SlotX * R, 0, b.Width, b.Height), 0, 0, b.Width, b.Height, GraphicsUnit.Pixel, ia);
+        }
+    }
+    void DrawSlotLogo(Bitmap to, int which, double t)
+    {
+        using (Graphics k = Graphics.FromImage(to))
+        {
+            k.Clear(Color.Transparent);
+            Setup(k);
+            k.TranslateTransform(-SlotX, 0);
+            switch (which % 4)
+            {
+                case 0: DrawVrDisc(k, t); break;
+                case 1: { Bitmap m = HallData.Mark; if (m != null) k.DrawImage(m, new RectangleF(SlotX + 4, 24, SlotW - 8, (SlotW - 8f) * m.Height / m.Width)); break; }
+                case 2: CyberMind(k, SlotX + 5, 29, 0.56f); break;
+                case 3: { Bitmap m = HallData.Logo; if (m != null) k.DrawImage(m, new RectangleF(SlotX + 6, 20, SlotW - 12, (SlotW - 12f) * m.Height / m.Width)); break; }
+            }
+        }
+    }
+
+    // the Virtuality coin from the games' openings (rebuilt, as seen on Zone Hunter's): a thick blue disc turning about its upright axis, the white
+    // VR mark on its face, the name under it
+    void DrawVrDisc(Graphics g, double t)
+    {
+        const float cx = 142, cy = 29, rad = 25, thick = 5;
+        double ang = t * 2 * Math.PI / (4 * 60.0 / 110 * 4);               // one turn every 4 bars, at the songs' tempo
+        float c = (float)Math.Cos(ang), sn = (float)Math.Sin(ang), w = Math.Abs(c) * rad, d = thick * sn;
+        using (LinearGradientBrush glow = new LinearGradientBrush(new RectangleF(cx - 34, cy - 34, 68, 68), Color.FromArgb(70, Pink), Color.FromArgb(70, Cyan), 45f))
+        using (Pen p = new Pen(glow, 1.4f))
+            g.DrawEllipse(p, cx - 31, cy - 31, 62, 62);
+        // the rim: the sheet of the coin's edge, then the face on top, nearest side last
+        using (LinearGradientBrush rim = new LinearGradientBrush(new RectangleF(cx - rad - 8, cy - rad, 2 * rad + 16, 2 * rad), Color.FromArgb(10, 16, 90), Color.FromArgb(60, 90, 230), 90f))
+            g.FillRectangle(rim, cx - Math.Abs(d) - 0.2f, cy - rad, 2 * Math.Abs(d) + 0.4f, 2 * rad);
+        using (SolidBrush b = new SolidBrush(Color.FromArgb(14, 22, 110)))
+            g.FillEllipse(b, cx - d - w, cy - rad, 2 * w, 2 * rad);
+        if (w < 0.5f) { DrawVrName(g, cx, cy); return; }
+        float fx = cx + d;
+        using (GraphicsPath face = new GraphicsPath())
+        {
+            face.AddEllipse(fx - w, cy - rad, 2 * w, 2 * rad);
+            using (PathGradientBrush b = new PathGradientBrush(face))
+            {
+                b.CenterPoint = new PointF(fx - w * 0.3f, cy - rad * 0.35f);
+                b.CenterColor = Color.FromArgb(70, 110, 255);
+                b.SurroundColors = new Color[] { Color.FromArgb(10, 18, 110) };
+                g.FillPath(b, face);
+            }
+        }
+        // the white mark: a slanted V and an R-like stroke, squeezed with the turn
+        float sx = c;                                                     // mirrored seen from behind, like the real one
+        Func<float, float, PointF> P = (x, y) => new PointF(fx + x * sx, cy + y);
+        PointF[] v = { P(-15, -11), P(-9, -11), P(-3, 5), P(-1, 0), P(-1, 11), P(-5, 11) };
+        PointF[] r1 = { P(1, -11), P(13, -11), P(16, -6), P(11, -1), P(15, 11), P(9, 11), P(6, 2), P(5, 2), P(5, 8), P(1, 8) };
+        using (SolidBrush b = new SolidBrush(Color.FromArgb(245, 250, 255))) { g.FillPolygon(b, v); g.FillPolygon(b, r1); }
+        DrawVrName(g, cx, cy);
+    }
+
+    void DrawVrName(Graphics g, float cx, float cy)
+    {
+        using (Font f = new Font("Arial Black", 6.6f, FontStyle.Italic, GraphicsUnit.Pixel))
+        using (SolidBrush b = new SolidBrush(Color.FromArgb(240, 245, 255)))
+        {
+            SizeF z = g.MeasureString("VIRTUALITY", f);
+            g.DrawString("VIRTUALITY", f, b, cx - z.Width / 2, cy + 33);
+        }
+    }
+
+    // a desk phone like the ones ringing at the end of the film, as a real model: flat-shaded polygons like the games' own, hovering off its case and
+    // turning slowly. When it rings the handset hops on its cradle, the way a bell does it; the phone itself stays put.
+    class PhoneFace { public float[][] P; public int Kind; public bool Handset; }   // Kind 0 body, 1 dial, 2 dial centre
+    static List<PhoneFace> phoneModel;
+    static void PhoneBox(List<PhoneFace> m, float x0, float x1, float y0, float y1, float z0, float z1, float topIn, float topBack, int kind, bool hs)
+    {
+        // y0 = bottom, y1 = top; the top is drawn in by topIn at the sides and topBack front to back
+        float[] a = { x0, y0, z1 }, b = { x1, y0, z1 }, c = { x1 + -topIn, y1, z1 - topBack }, d = { x0 + topIn, y1, z1 - topBack };
+        float[] e = { x0, y0, z0 }, f = { x1, y0, z0 }, g = { x1 - topIn, y1, z0 + topBack }, h = { x0 + topIn, y1, z0 + topBack };
+        float[][][] q = { new[] { a, b, c, d }, new[] { f, e, h, g }, new[] { b, f, g, c }, new[] { e, a, d, h }, new[] { d, c, g, h }, new[] { e, f, b, a } };
+        foreach (float[][] p in q) m.Add(new PhoneFace { P = p, Kind = kind, Handset = hs });
+    }
+    static List<PhoneFace> PhoneModel()
+    {
+        if (phoneModel != null) return phoneModel;
+        List<PhoneFace> m = new List<PhoneFace>();
+        PhoneBox(m, -1f, 1f, -0.8f, 0.02f, -0.72f, 0.72f, 0.3f, 0.32f, 0, false);    // base, sloped
+        PhoneBox(m, -0.74f, -0.5f, 0.02f, 0.2f, -0.12f, 0.12f, 0f, 0f, 0, false);    // the cradle's two posts
+        PhoneBox(m, 0.5f, 0.74f, 0.02f, 0.2f, -0.12f, 0.12f, 0f, 0f, 0, false);
+        PhoneBox(m, -0.9f, 0.9f, 0.36f, 0.5f, -0.13f, 0.13f, 0f, 0f, 0, true);     // handset: the bar and its two cups
+        PhoneBox(m, -1.14f, -0.6f, 0.14f, 0.46f, -0.28f, 0.28f, 0f, 0f, 0, true);
+        PhoneBox(m, 0.6f, 1.14f, 0.14f, 0.46f, -0.28f, 0.28f, 0f, 0f, 0, true);
+        // the dial on the front slope
+        float sy = 0.82f, sz = 0.32f, n = (float)Math.Sqrt(sy * sy + sz * sz), vy = sy / n, vz = -sz / n, cy0 = -0.4f, cz0 = 0.56f;
+        for (int kind = 1; kind <= 2; kind++)
+        {
+            float r = kind == 1 ? 0.33f : 0.13f, lift = kind == 1 ? 0.012f : 0.03f;
+            float[][] d = new float[12][];
+            for (int i = 0; i < 12; i++)
+            {
+                double a = i * Math.PI / 6;
+                float u = (float)Math.Cos(a) * r, v = (float)Math.Sin(a) * r;
+                d[i] = new float[] { u, cy0 + v * vy + lift * sz / n, cz0 + v * vz + lift * sy / n };
+            }
+            m.Add(new PhoneFace { P = d, Kind = kind });
+        }
+        return phoneModel = m;
+    }
+
+    static void DrawPhone3D(Graphics g, List<PhoneFace> m, float cx, float cy, float scale, double yaw, float lift, float tilt, Color bright)
+    {
+        float cyw = (float)Math.Cos(yaw), syw = (float)Math.Sin(yaw), cp = 0.9f, sp = 0.44f;    // seen from a little above
+        float ct = (float)Math.Cos(tilt), st = (float)Math.Sin(tilt);
+        const float lx = -0.45f, ly = 0.75f, lz = 0.48f;
+        List<KeyValuePair<float, KeyValuePair<PointF[], Color>>> draw = new List<KeyValuePair<float, KeyValuePair<PointF[], Color>>>(m.Count);
+        foreach (PhoneFace f in m)
+        {
+            int n = f.P.Length;
+            float[][] w = new float[n][];
+            PointF[] sc = new PointF[n];
+            float depth = 0;
+            for (int i = 0; i < n; i++)
+            {
+                float x = f.P[i][0], y = f.P[i][1], z = f.P[i][2];
+                if (f.Handset) { float hx = x * ct - (y - 0.3f) * st, hy = x * st + (y - 0.3f) * ct + 0.3f + lift; x = hx; y = hy; }
+                float x1 = x * cyw + z * syw, z1 = -x * syw + z * cyw;
+                float y2 = y * cp - z1 * sp, z2 = y * sp + z1 * cp;
+                w[i] = new float[] { x1, y2, z2 };
+                float persp = 4.5f / (4.5f - z2);
+                sc[i] = new PointF(cx + x1 * scale * persp, cy - y2 * scale * persp);
+                depth += z2;
+            }
+            float ax = w[1][0] - w[0][0], ay = w[1][1] - w[0][1], az = w[1][2] - w[0][2], bx = w[2][0] - w[0][0], by = w[2][1] - w[0][1], bz = w[2][2] - w[0][2];
+            float nx = ay * bz - az * by, ny = az * bx - ax * bz, nz = ax * by - ay * bx, nl = (float)Math.Sqrt(nx * nx + ny * ny + nz * nz);
+            if (nl < 1e-5f || nz <= 0) continue;                                                // facing away
+            float lit = 0.34f + 0.72f * Math.Max(0f, (nx * lx + ny * ly + nz * lz) / nl);
+            Color c = f.Kind == 1 ? Color.FromArgb(24, 26, 40) : f.Kind == 2 ? Color.FromArgb(205, 205, 195)
+                : Color.FromArgb(Math.Min(255, (int)(bright.R * lit)), Math.Min(255, (int)(bright.G * lit)), Math.Min(255, (int)(bright.B * lit)));
+            draw.Add(new KeyValuePair<float, KeyValuePair<PointF[], Color>>(depth / n + (f.Kind > 0 ? 0.5f : 0f), new KeyValuePair<PointF[], Color>(sc, c)));
+        }
+        draw.Sort((a, b) => a.Key.CompareTo(b.Key));
+        foreach (var d in draw)
+            using (SolidBrush b = new SolidBrush(d.Value.Value)) g.FillPolygon(b, d.Value.Key);
+    }
+
+    Bitmap onWall; int onWallAt = -1;
+    void DrawPhoneWall(Graphics g, double t)
+    {
+        if (onTile == null)
+        {
+            onTile = new Bitmap[] {
+                OctTile(Color.FromArgb(14, 10, 46), Color.FromArgb(46, 22, 110), Color.FromArgb(110, 70, 200), 215),    // nobody
+                OctTile(Cyan, Color.FromArgb(26, 106, 255), Color.White, 235),                                          // a player online
+                OctTile(Pink, Color.FromArgb(70, 30, 190), Color.White, 235) };                                         // the light running over the wall
+        }
+        DrawLogoSlot(g, t);
+        g.ResetTransform();
+        g.SmoothingMode = SmoothingMode.None;
+        const int cols = 5, rows = 2, x0 = 178, y0 = 3;
+        int beat = (int)(t * 110 / 60), run = beat % (cols * rows);     // one panel per beat, at the songs' tempo
+        for (int i = 0; i < cols * rows; i++)
+            g.DrawImageUnscaled(onTile[i == run ? 2 : i < onLit ? 1 : 0], (x0 + (i % cols) * OnCell) * R, (y0 + (i / cols) * OnCell) * R);
+        // the phones are their own layer, redrawn 15 times a second
+        if (onWall == null) onWall = new Bitmap(cols * OnCell * R, rows * OnCell * R + 6 * R, PixelFormat.Format32bppPArgb);
+        int at = (int)(t * 15);
+        if (at != onWallAt)
+        {
+            onWallAt = at;
+            using (Graphics k = Graphics.FromImage(onWall))
+            {
+                k.Clear(Color.Transparent);
+                k.SmoothingMode = SmoothingMode.AntiAlias;
+                List<PhoneFace> model = PhoneModel();
+                                for (int i = 0; i < cols * rows; i++)
+                {
+                    float cx = ((i % cols) + 0.5f) * OnCell * R, cy = ((i / cols) + 0.5f) * OnCell * R;
+                    bool lit = i < onLit || i == run;
+                    // a bell's cadence, each phone a moment after the one before: 2 s ringing, 1 s quiet
+                    double rt = (t - i * 0.13) % 3;
+                    bool rings = onRinging && rt >= 0 && rt < 1.7;
+                    float bob = (float)Math.Sin(t * 1.15 + i * 0.9) * 0.9f * R;
+                    float lift = 0, tilt = 0;
+                    if (rings) { double h = rt * 24; lift = (float)Math.Abs(Math.Sin(h)) * 0.3f; tilt = (float)Math.Sin(h * 0.5) * 0.13f; }
+                    // its shadow on the case, the gap shows it hovering
+                    using (SolidBrush b = new SolidBrush(Color.FromArgb(lit ? 90 : 70, 0, 0, 25))) k.FillEllipse(b, cx - 11 * R, cy + 7.5f * R, 22 * R, 5 * R);
+                    if (rings)      // the sound leaves in octagons
+                    {
+                        float pr = (float)(rt * 1.4 % 1);
+                        float rr = (9 + pr * 12) * R;
+                        PointF[] oct = new PointF[8];
+                        for (int j = 0; j < 8; j++) oct[j] = new PointF(cx + (float)Math.Cos(j * Math.PI / 4 + Math.PI / 8) * rr, cy + (float)Math.Sin(j * Math.PI / 4 + Math.PI / 8) * rr);
+                        using (Pen p = new Pen(Color.FromArgb((int)(170 * (1 - pr)), 255, 255, 255), 1.6f)) k.DrawPolygon(p, oct);
+                    }
+                    Color body = lit ? Color.FromArgb(240, 236, 222) : Color.FromArgb(120, 100, 200);
+                    double swing = 0.62 * Math.Sin(t * 2 * Math.PI / (4 * 4 * 60.0 / 110) + i * 0.8);      // to and fro facing you, 4 bars each way
+                    DrawPhone3D(k, model, cx, cy - 0.5f * R + bob, 10.5f * R, swing, lift, tilt, body);
+                }
+            }
+        }
+        g.DrawImageUnscaled(onWall, x0 * R, y0 * R);
+    }
+
+    // one row like the hall's game blocks
+    void OnBlock(Graphics g, RectangleF r, string text, string tag, string id)
+    {
+        bool hov = id != null && hover == id;
+        using (LinearGradientBrush b = new LinearGradientBrush(r, Color.FromArgb(hov ? 34 : 15, hov ? 70 : 42, hov ? 120 : 74), Color.FromArgb(10, 20, 48), 0f)) g.FillRectangle(b, r);
+        using (Pen p = new Pen(Color.FromArgb(hov ? 220 : 110, 40, 110, 170), 0.4f)) g.DrawRectangle(p, r.X, r.Y, r.Width, r.Height);
+        using (SolidBrush b = new SolidBrush(id != null ? Cyan : Color.FromArgb(60, 80, 100))) g.FillRectangle(b, r.X, r.Y, 1.5f, r.Height);
+        HText(g, text, r.X + 5, r.Y + (r.Height - 9.5f) / 2, hBlock, Color.FromArgb(220, 245, 255), null);
+        if (tag != "")
+        {
+            SizeF ts = g.MeasureString(tag, hTiny);
+            HText(g, tag, r.Right - ts.Width - 2, r.Y + (r.Height - 7) / 2, hTiny, Color.FromArgb(140, 170, 200), null);
+        }
+        if (id != null) hits.Add(new KeyValuePair<Rectangle, string>(Rectangle.Round(r), id));
+    }
+
+    void OnPanel(Graphics g, RectangleF r, string title)
+    {
+        using (SolidBrush b = new SolidBrush(Color.FromArgb(110, 4, 8, 24))) g.FillRectangle(b, r);
+        using (Pen p = new Pen(Color.FromArgb(130, Cyan), 0.4f)) g.DrawRectangle(p, r.X, r.Y, r.Width, r.Height);
+        HText(g, title, r.X + 4, r.Y + 1.5f, hSmall, Cyan, null);
+    }
+
+    // the big yellow button, START's colours
+    void OnBig(Graphics g, RectangleF r, string s, bool can, string id)
+    {
+        bool hov = can && hover == id;
+        Color c = !can ? Color.FromArgb(70, 70, 60) : blink % 2 == 0 || hov ? Yellow : Color.FromArgb(230, 210, 0);
+        using (SolidBrush b = new SolidBrush(c)) g.FillRectangle(b, r);
+        SizeF z = g.MeasureString(s, hOnBig);
+        HText(g, s, r.X + (r.Width - z.Width) / 2, r.Y + (r.Height - z.Height) / 2, hOnBig, Color.Black, null);
+        if (can) hits.Add(new KeyValuePair<Rectangle, string>(Rectangle.Round(r), id));
+    }
+
+    void DrawOnlineUi(Graphics g)
+    {
+        Bitmap logo = HallData.Logo;
+        if (logo != null) g.DrawImage(logo, new RectangleF(5, 3, 40, 40f * logo.Height / logo.Width));
+        HText(g, "MALLVR  ·  lo-fi VR", 48, 6, hSmall, Color.FromArgb(255, 143, 240), null);
+        HText(g, "ONLINE", 4, 23, hOnTitle, Yellow, null);
+        HText(g, "PC AND QUEST PLAY TOGETHER", 6, 55, hTiny, Color.FromArgb(180, 225, 240), null);
+        if (Advanced) DrawOnlineFull(g); else DrawOnlineQuick(g);
+
+        using (LinearGradientBrush b = new LinearGradientBrush(new RectangleF(0, 262, W, 26), Color.FromArgb(0, 0, 0, 0), Color.FromArgb(220, 0, 0, 0), 90f))
+            g.FillRectangle(b, 0, 262, W, 26);
+        Chip(g, "BACK", 6, 270, false, true, "oback");
+        string note = status != "" ? status : Net.Note != "" ? Net.Note : !Net.ListOk && PlayerName != "" ? "CAN'T REACH THE GAME LIST: HOME NETWORK ONLY" : "";
+        if (note != "")
+            using (SolidBrush b = new SolidBrush(Yellow)) g.DrawString(note, hTiny, b, new RectangleF(36, 266, 158, 20));
+        // the loader's box and wordmark
+        int people = OnlinePeople().FindAll(e => !e.FromLan).Count;
+        RectangleF box = new RectangleF(198, 265, 76, 14);
+        using (SolidBrush b = new SolidBrush(Color.FromArgb(18, 18, 18))) g.FillRectangle(b, box);
+        using (Pen p = new Pen(Color.FromArgb(205, 205, 205), 0.5f)) g.DrawRectangle(p, box.X, box.Y, box.Width, box.Height);
+        string bt = Net.Quick ? "Searching" + new string('.', blink % 4) : Net.ListOk || OnlineShot ? people + " online" : "No list";
+        using (StringFormat sf = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center })
+        using (SolidBrush b = new SolidBrush(Color.FromArgb(235, 235, 235))) g.DrawString(bt, hOnBox, b, box, sf);
+        CyberMind(g, 279, 262, 0.52f);
+    }
+    static bool OnlineShot { get { return !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("MALLVR_ONLINESHOT")); } }
+
+    string OnlineNameText() { return (PlayerName.Length > 0 ? PlayerName : editName ? "" : "TYPE YOUR NAME") + (editName && blink % 2 == 0 ? "_" : ""); }
+
+    // who is online, one row each
+    void DrawOnlinePeople(Graphics g, RectangleF r, int max)
+    {
+        List<OnlineEntry> all = OnlinePeople().FindAll(e => !e.FromLan);
+        OnPanel(g, r, "ONLINE NOW   " + all.Count);
+        float y = r.Y + 11;
+        if (all.Count == 0)
+            using (SolidBrush b = new SolidBrush(Color.FromArgb(140, 170, 200)))
+                g.DrawString(Net.ListOk || OnlineShot ? "NOBODY YET. PRESS QUICK MATCH AND THE NEXT PLAYER FINDS YOU" : "...", hSmall, b, new RectangleF(r.X + 4, y, r.Width - 8, 24));
+        for (int i = 0; i < all.Count && i < max; i++, y += 11.5f)
+        {
+            OnlineEntry e = all[i];
+            HText(g, e.Name, r.X + 5, y, hBlock, Color.FromArgb(220, 245, 255), null);
+            string right = e.Status == "PLAYING" ? "PLAYING" : e.IsHost || (OnlineShot && e.Game != "") ? GameName(e.Game) : "";
+            if (right != "")
+            {
+                SizeF z = g.MeasureString(right, hTiny);
+                HText(g, right, r.Right - z.Width - 3, y + 2, hTiny, Color.FromArgb(140, 170, 200), null);
+            }
+            HText(g, e.Plat == "QUEST" ? "QUEST" : "PC", r.X + 62, y + 2, hTiny, e.Plat == "QUEST" ? Pink : Cyan, null);
+        }
+    }
+
+    void DrawOnlineQuick(Graphics g)
+    {
+        float x = 6, w = 168, y = 82;
+        OnBlock(g, new RectangleF(x, y, w, 18), "NAME   " + OnlineNameText(), Net.Quick ? "" : "CHANGE", Net.Quick ? null : "oname");
+        y += 22;
+        float cx = x + Chip(g, "HEADSET", x, y, Mode == 0, true, "m0") + 3;
+        Chip(g, "WINDOW", cx, y, Mode == 1, true, "m1");
+        y += 15;
+        int hg = HostGame();
+        string qn = Net.Quick ? (Net.QuickGame == "" ? "ANY GAME" : GameName(Net.QuickGame)) : quickPick < 0 ? "ANY GAME" : Names[quickPick];
+        if (hg >= 0) OnBlock(g, new RectangleF(x, y, w, 18), "GAME   " + qn, Net.Quick ? "" : "CHANGE", Net.Quick ? null : "oqgame");
+        else OnBlock(g, new RectangleF(x, y, w, 18), "NO ONLINE GAME FOUND", "", null);
+        y += 24;
+        RectangleF big = new RectangleF(x, y, w, 46);
+        if (!Net.Quick)
+        {
+            OnBig(g, big, "QUICK  MATCH", hg >= 0, "oquick");
+            HText(g, "FINDS A PLAYER AND STARTS BY ITSELF", x + 1, y + 48, hTiny, Color.FromArgb(180, 225, 240), null);
+        }
+        else
+        {
+            using (SolidBrush b = new SolidBrush(Color.FromArgb(200, 10, 10, 20))) g.FillRectangle(b, big);
+            using (Pen p = new Pen(Yellow, 0.8f)) g.DrawRectangle(p, big.X, big.Y, big.Width, big.Height);
+            string s = Net.Countdown > 0 ? "STARTING IN " + Net.Countdown : "SEARCHING" + new string('.', blink % 4);
+            SizeF z = g.MeasureString(s, hOnBig);
+            HText(g, s, x + (w - z.Width) / 2, y + (46 - z.Height) / 2, hOnBig, Yellow, null);
+            Chip(g, "CANCEL", x, y + 49, false, true, "oqcancel");
+        }
+        Chip(g, "MORE OPTIONS", x, 246, false, !Net.Quick, Net.Quick ? null : "oadv");
+        Chip(g, "FIND PLAYERS ON DISCORD", x + 60, 246, false, true, "odiscord");
+        DrawOnlinePeople(g, new RectangleF(182, 82, 164, 174), 13);
+    }
+
+    void DrawOnlineFull(Graphics g)
+    {
+        string st = Net.Status;
+        OnBlock(g, new RectangleF(6, 82, 168, 12), "NAME   " + OnlineNameText(), st == "LOBBY" ? "CHANGE" : "", st == "LOBBY" ? "oname" : null);
+        float cx = 182 + Chip(g, "HEADSET", 182, 83.5f, Mode == 0, true, "m0") + 3;
+        Chip(g, "WINDOW", cx, 83.5f, Mode == 1, true, "m1");
+
+        List<OnlineEntry> hosts = OnlinePeople().FindAll(e => (e.IsHost || (OnlineShot && e.Game != "")) && e.Name != PlayerName);
+        RectangleF list = new RectangleF(6, 98, 340, 76);
+        OnPanel(g, list, "OPEN GAMES");
+        if (hosts.Count == 0) HText(g, "NONE RIGHT NOW: HOST ONE BELOW", 12, 112, hBlock, Color.FromArgb(140, 170, 200), null);
+        for (int i = 0; i < hosts.Count && i < 5; i++)
+        {
+            OnlineEntry h = hosts[i];
+            bool full = h.Max > 0 && h.N >= h.Max;
+            int gi = Codes.IndexOf(h.Game);
+            bool have = gi >= 0 && Found[gi];
+            float ry = 109 + i * 12.5f;
+            HText(g, GameName(h.Game), 11, ry, hBlock, Color.FromArgb(220, 245, 255), null);
+            HText(g, h.Name, 142, ry, hBlock, Color.FromArgb(220, 245, 255), null);
+            if (h.Plat == "QUEST") HText(g, "QUEST", 208, ry + 2, hTiny, Pink, null);     // crossplay: Quest hosts get a tag
+            HText(g, h.N + "/" + h.Max, 238, ry, hBlock, Color.FromArgb(140, 170, 200), null);
+            if (h.Ver != "") HText(g, "v" + h.Ver, 262, ry + 2, hTiny, Color.FromArgb(140, 170, 200), null);
+            if (st == "LOBBY")
+            {
+                bool can = !full && have;
+                Chip(g, full ? "FULL" : !have ? "MISSING" : "JOIN", 300, ry, false, can, can ? "oj" + i : null);
+            }
+        }
+
+        DrawOnlinePeople(g, new RectangleF(182, 178, 164, 68), 4);
+
+        if (st == "LOBBY")
+        {
+            int hg = HostGame();
+            bool can = hg >= 0 && PlayerName != "";
+            OnBig(g, new RectangleF(6, 178, 168, 20), "HOST A GAME", can, "ohost");
+            if (hg >= 0) OnBlock(g, new RectangleF(6, 201, 168, 12), Names[hg], "CHANGE", "ogame");
+            else OnBlock(g, new RectangleF(6, 201, 168, 12), "NO LINKABLE GAME FOUND", "", null);
+            HText(g, "HOSTING SHARES YOUR INTERNET ADDRESS WITH WHO JOINS", 7, 215, hTiny, Color.FromArgb(180, 225, 240), null);
+            Chip(g, "QUICK MATCH", 6, 246, false, true, "osimple");
+            Chip(g, "FIND PLAYERS ON DISCORD", 66, 246, false, true, "odiscord");
+        }
+        else
+        {
+            List<string> r = Net.Roster(), rp = Net.RosterPlat();
+            for (int i = 0; i < r.Count && i < rp.Count; i++) if (rp[i] == "QUEST") r[i] += " (QUEST)";
+            bool group = Net.InGroup;
+            OnPanel(g, new RectangleF(6, 178, 168, 40), st == "HOST" ? (group ? "YOUR GROUP" : "YOUR GAME") : st == "GROUP" ? "YOUR GROUP" : "JOINED");
+            // between games the host picks the group's next game: only games everyone has (click = the next one)
+            List<string> common = st == "HOST" && group ? Net.CommonGames() : new List<string>();
+            HText(g, GameName(Net.Game), 11, 189, hBlock, common.Count > 1 ? Cyan : Yellow, common.Count > 1 ? "onext" : null);
+            using (SolidBrush b = new SolidBrush(Color.FromArgb(220, 245, 255))) g.DrawString(string.Join(", ", r.ToArray()), hSmall, b, new RectangleF(11, 200, 158, 17));
+            if (st == "HOST") OnBig(g, new RectangleF(6, 221, 90, 20), "START", r.Count >= 2, "ostart");
+            Chip(g, st == "HOST" ? "CANCEL" : "LEAVE", st == "HOST" ? 102 : 6, 226, false, true, "oleave");
+            if (st == "HOST" && Net.RouterNote != "")
+                using (SolidBrush b = new SolidBrush(Color.FromArgb(180, 225, 240))) g.DrawString(Net.RouterNote, hTiny, b, new RectangleF(6, 244, 170, 16));
+        }
+    }
+
     // hall clicks; true = handled
     bool HallDo(string id)
     {
         if (id == "style") { Style = 1 - Style; MusicSync(); Invalidate(); return true; }
+        if (id == "lst0" || id == "lst1") { ShowSection(id == "lst1"); return true; }
         if (id == "music") { Music = !Music; MusicSync(); Invalidate(); return true; }
         if (id.StartsWith("tab")) { sheetTab = id[3] - '0'; Invalidate(); return true; }
         if (id.StartsWith("opt")) return OptDo(id);
@@ -893,6 +1605,16 @@ public static class HallData
     }
 
     // a pod's turnaround: 60 frames, 10 x 6, white studio; each frame's edge fades out so it melts into the spotlight
+    static Bitmap mark; static bool markTried;
+    public static Bitmap Mark
+    {
+        get
+        {
+            if (!markTried) { markTried = true; try { mark = new Bitmap(Path.Combine(dir ?? "", "mallvr_mark.png")); } catch (Exception) { mark = null; } }
+            return mark;
+        }
+    }
+
     public static Bitmap Pod(string code)
     {
         Bitmap b;
@@ -914,6 +1636,149 @@ public static class HallData
         catch (Exception) { b = null; }
         pods[code] = b;
         return b;
+    }
+
+    // the sheet cut out of its white studio background, for the ONLINE screen (the hall stands its pods on a white spotlight). Each frame: the
+    // near-white or pale-grey areas that reach the frame's edge (background, floor shadow) and big pure-white holes (windows) go, the edge is
+    // softened and the white taken back out of its colours, so no halo is left. Made on a worker thread: null until it's ready.
+    static readonly Dictionary<string, Bitmap> podCuts = new Dictionary<string, Bitmap>();
+    static bool podCutsStarted;
+    public static Bitmap PodCut(string code)
+    {
+        lock (podCuts)
+        {
+            if (!podCutsStarted)
+            {
+                podCutsStarted = true;
+                string folder = dir ?? "";
+                System.Threading.ThreadPool.QueueUserWorkItem(delegate
+                {
+                    foreach (string c in MallLauncher.EraPods)
+                    {
+                        Bitmap b = null;
+                        try { b = CutSheet(Path.Combine(folder, "pod_" + c + ".jpg")); } catch (Exception) { }
+                        lock (podCuts) podCuts[c] = b;
+                    }
+                });
+            }
+            Bitmap r;
+            return podCuts.TryGetValue(code, out r) ? r : null;
+        }
+    }
+
+    static Bitmap CutSheet(string file)
+    {
+        if (!File.Exists(file)) return null;
+        Bitmap b;
+        using (Bitmap src = new Bitmap(file))
+        {
+            b = new Bitmap(src.Width, src.Height, PixelFormat.Format32bppArgb);
+            using (Graphics g = Graphics.FromImage(b)) g.DrawImage(src, 0, 0, src.Width, src.Height);
+        }
+        BitmapData d = b.LockBits(new Rectangle(0, 0, b.Width, b.Height), ImageLockMode.ReadWrite, PixelFormat.Format32bppArgb);
+        byte[] px = new byte[d.Stride * b.Height];
+        Marshal.Copy(d.Scan0, px, 0, px.Length);
+        int tw = b.Width / 10, th = b.Height / 6;
+        for (int ty = 0; ty < 6; ty++)
+            for (int tx = 0; tx < 10; tx++)
+                CutFrame(px, d.Stride, tx * tw, ty * th, tw, th);
+        Marshal.Copy(px, 0, d.Scan0, px.Length);
+        b.UnlockBits(d);
+        return b;
+    }
+
+    static void CutFrame(byte[] px, int stride, int ox, int oy, int w, int h)
+    {
+        // background candidates: pale and colourless (low in the frame the floor shadow is darker too)
+        byte[] cand = new byte[w * h];      // 1 = could be background, 2 = is background
+        byte[] low = new byte[w * h];
+        for (int y = 0; y < h; y++)
+            for (int x = 0; x < w; x++)
+            {
+                int o = (oy + y) * stride + (ox + x) * 4;
+                int lo = Math.Min(px[o], Math.Min(px[o + 1], px[o + 2])), hi = Math.Max(px[o], Math.Max(px[o + 1], px[o + 2]));
+                low[y * w + x] = (byte)lo;
+                if (lo >= (y * 10 > h * 7 ? 88 : 165) && hi - lo < 22) cand[y * w + x] = 1;
+            }
+        // spread through soft changes only: background and shadow fade gently, while a shiny part on a pod meets the background at a hard edge and stays.
+        // What reaches the frame's edge goes; so does any enclosed area of nearly pure white (the studio showing through a window or a gap)
+        const int Step = 13;
+        int[] stack = new int[w * h]; int[] region = new int[w * h];
+        for (int start = 0; start < w * h; start++)
+        {
+            if (cand[start] != 1) continue;
+            bool edge = false; int n = 0, sp = 0, white = 0; long sum = 0;
+            stack[sp++] = start; cand[start] = 3;
+            while (sp > 0)
+            {
+                int k = stack[--sp]; region[n++] = k;
+                int x = k % w, y = k / w, v0 = low[k];
+                if (x == 0 || y == 0 || x == w - 1 || y == h - 1) edge = true;
+                if (v0 >= 240) white++; sum += v0;
+                if (x > 0 && cand[k - 1] == 1 && Math.Abs(low[k - 1] - v0) <= Step) { cand[k - 1] = 3; stack[sp++] = k - 1; }
+                if (x < w - 1 && cand[k + 1] == 1 && Math.Abs(low[k + 1] - v0) <= Step) { cand[k + 1] = 3; stack[sp++] = k + 1; }
+                if (y > 0 && cand[k - w] == 1 && Math.Abs(low[k - w] - v0) <= Step) { cand[k - w] = 3; stack[sp++] = k - w; }
+                if (y < h - 1 && cand[k + w] == 1 && Math.Abs(low[k + w] - v0) <= Step) { cand[k + w] = 3; stack[sp++] = k + w; }
+            }
+            byte v = edge || (n >= 18 && white * 10 >= n * 6) || (n >= 300 && sum / n >= 212) ? (byte)2 : (byte)4;   // the second: a big pale pane, a window
+            for (int i = 0; i < n; i++) cand[region[i]] = v;
+        }
+        // keep only the biggest piece: the sheet's frames bleed a little into each other
+        int bestAt = -1, bestN = 0;
+        byte[] seen = new byte[w * h];
+        for (int start = 0; start < w * h; start++)
+        {
+            if (cand[start] == 2 || seen[start] != 0) continue;
+            int n = 0, sp = 0;
+            stack[sp++] = start; seen[start] = 1;
+            while (sp > 0)
+            {
+                int k = stack[--sp]; n++;
+                int x = k % w, y = k / w;
+                if (x > 0 && cand[k - 1] != 2 && seen[k - 1] == 0) { seen[k - 1] = 1; stack[sp++] = k - 1; }
+                if (x < w - 1 && cand[k + 1] != 2 && seen[k + 1] == 0) { seen[k + 1] = 1; stack[sp++] = k + 1; }
+                if (y > 0 && cand[k - w] != 2 && seen[k - w] == 0) { seen[k - w] = 1; stack[sp++] = k - w; }
+                if (y < h - 1 && cand[k + w] != 2 && seen[k + w] == 0) { seen[k + w] = 1; stack[sp++] = k + w; }
+            }
+            if (n > bestN) { bestN = n; bestAt = start; }
+        }
+        Array.Clear(seen, 0, seen.Length);
+        if (bestAt >= 0)
+        {
+            int sp = 0;
+            stack[sp++] = bestAt; seen[bestAt] = 1;
+            while (sp > 0)
+            {
+                int k = stack[--sp];
+                int x = k % w, y = k / w;
+                if (x > 0 && cand[k - 1] != 2 && seen[k - 1] == 0) { seen[k - 1] = 1; stack[sp++] = k - 1; }
+                if (x < w - 1 && cand[k + 1] != 2 && seen[k + 1] == 0) { seen[k + 1] = 1; stack[sp++] = k + 1; }
+                if (y > 0 && cand[k - w] != 2 && seen[k - w] == 0) { seen[k - w] = 1; stack[sp++] = k - w; }
+                if (y < h - 1 && cand[k + w] != 2 && seen[k + w] == 0) { seen[k + w] = 1; stack[sp++] = k + w; }
+            }
+            for (int k = 0; k < w * h; k++) if (seen[k] == 0) cand[k] = 2;
+        }
+        // alpha: pull the edge in a pixel, soften it, take the white back out of the colours left in the soft edge
+        for (int y = 0; y < h; y++)
+            for (int x = 0; x < w; x++)
+            {
+                int o = (oy + y) * stride + (ox + x) * 4, bg = 0, all = 0;
+                for (int j = -2; j <= 2; j++)
+                    for (int i = -2; i <= 2; i++)
+                    {
+                        int xx = x + i, yy = y + j;
+                        all++;
+                        if (xx < 0 || yy < 0 || xx >= w || yy >= h || cand[yy * w + xx] == 2) bg++;
+                    }
+                float a = Math.Max(0f, Math.Min(1f, 1f - bg / (all * 0.55f)));
+                if (a < 1f && a > 0f)
+                    for (int c = 0; c < 3; c++)
+                    {
+                        float v = (px[o + c] - (1f - a) * 255f) / a;
+                        px[o + c] = (byte)Math.Max(0f, Math.Min(255f, v));
+                    }
+                px[o + 3] = (byte)(a * 255f);
+            }
     }
 
     static void Feather(Bitmap b, int tw, int th)

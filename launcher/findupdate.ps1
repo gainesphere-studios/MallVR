@@ -12,15 +12,46 @@ function Get-MVHead([string]$Path) {
     finally { $fs.Close() }
 }
 
+# Fetch a URL to $Out by streaming it. $Show prints a live percent counter on one line (Bobby 11-03: a long update looked frozen).
+function Get-MVFile([string]$Url, [string]$Out, [long]$Size = 0, [int]$TimeoutSec = 60, [switch]$Show) {
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    $r = [Net.HttpWebRequest][Net.WebRequest]::Create($Url)
+    $r.UserAgent = 'MallVR-updater'; $r.Timeout = $TimeoutSec * 1000; $r.ReadWriteTimeout = $TimeoutSec * 1000; $r.AllowAutoRedirect = $true
+    $w = $r.GetResponse()
+    $s = $null; $o = $null; $shown = $false
+    try {
+        $total = if ($w.ContentLength -gt 0) { $w.ContentLength } else { $Size }
+        $s = $w.GetResponseStream(); $o = [IO.File]::Create($Out)
+        $b = New-Object byte[] 65536; [long]$have = 0
+        $clock = [Diagnostics.Stopwatch]::StartNew(); $last = -1000
+        while (($n = $s.Read($b, 0, $b.Length)) -gt 0) {
+            $o.Write($b, 0, $n); $have += $n
+            if ($Show -and $clock.ElapsedMilliseconds - $last -ge 500) {
+                $last = $clock.ElapsedMilliseconds; $shown = $true
+                Write-Host -NoNewline ("`r  " + (Format-MVProgress $have $total ($clock.Elapsed.TotalSeconds)) + '    ')
+            }
+        }
+        if ($shown) { Write-Host ("`r  " + (Format-MVProgress $have $total ($clock.Elapsed.TotalSeconds)) + '    ') }
+        if ($w.ContentLength -gt 0 -and $have -lt $w.ContentLength) { throw "the connection closed at $([math]::Floor($have / 1MB)) MB - try again" }
+    }
+    finally { if ($o) { $o.Close() }; if ($s) { $s.Close() }; $w.Close() }
+}
+function Format-MVProgress([long]$Have, [long]$Total, [double]$Secs) {
+    $rate = if ($Secs -gt 0) { $Have / 1MB / $Secs } else { 0 }
+    $c = [Globalization.CultureInfo]::InvariantCulture
+    if ($Total -gt 0) { return [string]::Format($c, '{0,3}%  {1} of {2} MB  ({3:0.0} MB/s)', [math]::Min(100, [math]::Floor($Have * 100 / $Total)), [math]::Floor($Have / 1MB), [math]::Floor($Total / 1MB), $rate) }
+    return [string]::Format($c, '{0} MB  ({1:0.0} MB/s)', [math]::Floor($Have / 1MB), $rate)
+}
+
 # Download a shared Drive file to $Out. Files Drive can't virus-scan (over ~100 MB) come back as a
 # warning page first; follow its download form once.
-function Save-MVDriveFile([string]$Id, [string]$Out, [int]$TimeoutSec) {
+function Save-MVDriveFile([string]$Id, [string]$Out, [int]$TimeoutSec, [long]$Size = 0, [switch]$Show) {
     $ProgressPreference = 'SilentlyContinue'      # the PS 5.1 progress bar slows downloads 10x
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
     if ($env:MALLVR_DRIVE_URL) { $url = $env:MALLVR_DRIVE_URL -f $Id }
     else { $url = "https://drive.usercontent.google.com/download?id=$Id&export=download" }
     for ($i = 0; $i -lt 2; $i++) {
-        Invoke-WebRequest -UseBasicParsing -TimeoutSec $TimeoutSec -Uri $url -OutFile $Out -UserAgent 'MallVR-updater'
+        Get-MVFile $url $Out $Size $TimeoutSec -Show:$Show
         if ((Get-MVHead $Out) -notmatch '^\s*<(!DOCTYPE|html)') { return }
         $html = Get-Content -LiteralPath $Out -Raw
         $form = [regex]::Match($html, '<form[^>]*id="download-form"[^>]*action="([^"]+)"')
@@ -97,8 +128,9 @@ function Get-MVLatest($Cfg, [int]$TimeoutSec = 10) {
 # Download a release found by Get-MVLatest to $Out and check its SHA1 when one is published, then its signature.
 function Save-MVRelease($Latest, [string]$Out) {
     $ProgressPreference = 'SilentlyContinue'
-    if ($Latest.DriveId) { Save-MVDriveFile $Latest.DriveId $Out 60 }
-    else { Invoke-WebRequest -UseBasicParsing -Uri $Latest.Url -OutFile $Out -UserAgent 'MallVR-updater' }
+    if ($Latest.DriveId) { Save-MVDriveFile $Latest.DriveId $Out 60 $Latest.Size -Show }
+    else { Get-MVFile $Latest.Url $Out $Latest.Size 60 -Show }
+    Write-Host '  Checking the download...'
     if ((Get-MVHead $Out) -notmatch '^PK') { throw 'the download is not a zip file' }
     if ($Latest.Sha1 -and (Get-FileHash -LiteralPath $Out -Algorithm SHA1).Hash -ne $Latest.Sha1.Trim().ToUpper()) {
         throw 'the download is damaged (SHA1 does not match) - try again'

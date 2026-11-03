@@ -48,7 +48,8 @@ $family = $(if ($info.CloneOf) { $info.CloneOf } else { $base })   # a clone (ga
 $optCode = $(if ($info.CloneOf) { $info.CloneOf } else { $code })
 $exeName = $(if ($info.Exe) { $info.Exe } else { $code })
 # native rebuild (Buggy Ball): no DOS EXE, the engine runs the game from its data folder (games\...\BALL\RUNFILES\CARS.DBS)
-if ($info.Native) {
+if ($info.Lost) { $dataDir = $Engine; $Game = $code }   # a lost game: nothing in the games folder
+elseif ($info.Native) {
     $dataDir = Get-ChildItem -LiteralPath (Join-Path $Root 'games') -Recurse -Directory -Filter $info.DataDir -ErrorAction SilentlyContinue |
         Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName $info.DataFile) } | Select-Object -First 1 -ExpandProperty FullName
     if (-not $dataDir) { Fail "$($info.Name) was not found.`n`nPut its $($info.DataDir) folder (the one holding $($info.DataFile)) inside the 'games' folder." }
@@ -211,6 +212,8 @@ if ($info.Overlay) {
 }
 $conf = Join-Path $logs "$tag.conf"
 $gameArgs = $(if ($Pod -gt 0 -and $info.PodArgs) { $info.PodArgs[$Pod - 1] } else { $info.Args })   # linked pods: their own launch line (Ghost Train car + master/slave)
+if ($info.VersionOf) { Set-MVOptionEnv $info.VersionOf (Read-MVOptions $info.VersionOf $settings $Options) }   # the build's rows sit on the game (Pac-Man's prototype: on PAC)
+else { Set-MVOptionEnv $optCode $optSaved }
 $gameArgs = Add-MVOptionArgs $optCode $gameArgs $optSaved   # the OPTIONS' own switches (Boxing /t /S /G /l, Zone /J ...)
 # music from the player's CD image (games.ps1 CdRip): the tracks CdMap names, to WAVs once. The game's /cd+ only with music to play
 $ripDir = ''
@@ -431,6 +434,7 @@ if ($info.Mpeg) {   # its MPEG movies through ffmpeg (engine\ffmpeg.exe if shipp
 } else { Remove-Item Env:VPIX_MPEG_DIR -ErrorAction SilentlyContinue }
 if ($info.Native) {
     $env:VPIX_NATIVE = $info.Native
+    $env:VPIX_MUSIC_DIR = Join-Path $Engine 'music'
     $env:VPIX_BUGGY_DIR = $dataDir
     $env:VPIX_BUGGY_LOGO = Join-Path $Engine 'buggy\ball_logo_256.rgba'     # Gainesphere / MallVR badges on the ball
     # $env:VPIX_BUGGY_LOGO = 'none'                                          # plain ball (no badges): use this line instead of the one above
@@ -508,8 +512,8 @@ if ((Test-Path $splash) -and -not $env:VPIX_NOSPLASH) {
         $form.SetStatus("Starting $($info.Name)...", $grey); [System.Windows.Forms.Application]::DoEvents()
         $t0 = Get-Date
         $cfg = Get-Content -LiteralPath (Join-Path $Engine 'version.txt') -ErrorAction SilentlyContinue | ConvertFrom-StringData
-        $hasSource = ($cfg.drive -and $cfg.drive -ne 'none') -or ($cfg.repo -and $cfg.repo -ne 'none')
-        if ($hasSource -and $cfg.check_on_launch -ne 'no') {
+        $hasSource = ($cfg.url -and $cfg.url -ne 'none') -or ($cfg.drive -and $cfg.drive -ne 'none') -or ($cfg.repo -and $cfg.repo -ne 'none')
+        if ($hasSource) {
             $form.SetStatus('Checking for updates...', $grey); [System.Windows.Forms.Application]::DoEvents()
             try {
                 . (Join-Path $Engine 'findupdate.ps1')
@@ -525,29 +529,17 @@ if ((Test-Path $splash) -and -not $env:VPIX_NOSPLASH) {
     } catch { }                                   # a launch screen problem never stops the game
 }
 
-# a newer version: ask once per version. Yes = install it, then start the game on the new engine.
+# a newer version: installs by itself, then starts the game on the new engine (Bobby 11-03).
 if ($offer) {
     try {
-        $skipFile = Join-Path $settings 'update_skipped.txt'
-        $skipped = if (Test-Path $skipFile) { (Get-Content -LiteralPath $skipFile -Raw).Trim() } else { '' }
-        if ($skipped -ne $offer.Version) {
-            $notes = if ($offer.Notes) { "`n`n$($offer.Notes)" } else { '' }
-            $msg = "MallVR $($offer.Version) is out (you have $($cfg.version)).$notes`n`n" +
-                "Install it now? It takes about a minute. Your games, settings and high scores are kept.`n`n" +
-                "No = play now. You won't be asked about $($offer.Version) again; Update.bat installs it any time."
-            $owner = New-Object System.Windows.Forms.Form -Property @{ TopMost = $true }
-            $ans = [System.Windows.Forms.MessageBox]::Show($owner, $msg, 'MallVR update', 'YesNo', 'Question')
-            $owner.Dispose()
-            if ($ans -eq 'Yes') {
-                $u = Start-Process powershell -PassThru -Wait -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass',
-                    '-File', "`"$(Join-Path $Engine 'update.ps1')`"", '-Auto'
-                if ($u.ExitCode -eq 0) {
-                    $env:VPIX_NOSPLASH = '1'
-                    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $Engine 'play.ps1') $Game
-                    exit $LASTEXITCODE
-                }
+        if (-not (Get-Process dosbox-x -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "$Engine*" })) {
+            $u = Start-Process powershell -PassThru -Wait -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass',
+                '-File', "`"$(Join-Path $Engine 'update.ps1')`"", '-Auto'
+            if ($u.ExitCode -eq 0) {
+                $env:VPIX_NOSPLASH = '1'
+                & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $Engine 'play.ps1') $Game
+                exit $LASTEXITCODE
             }
-            else { Set-Content -LiteralPath $skipFile -Value $offer.Version }
         }
     } catch { }                                   # an update problem never stops the game
 }

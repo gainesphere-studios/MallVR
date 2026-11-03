@@ -1,6 +1,16 @@
 MALLVR - WHAT'S NEW
 ===================
 
+v0.15.0 (November 2026) - THE LOST GAMES
+
+  - LOST GAMES: a new tab with 12 Virtuality games nobody has found: Dactyl Nightmare (1000 series),
+    Hero, Grid Busters, Legend Quest, Grid Warriors, Battlesphere, VTOL, Total Destruction, Exorex,
+    Flying Aces, Sphere and X-Treme Strike. Playable placeholders rebuilt from footage, with music.
+    We still want to find the real ones.
+  - The Lost Games have multiplayer: LAN and ONLINE. Tested by us with 2 players on one PC only.
+  - Updates are now always automatic.
+  - Meta Quest 0.5: the Lost Games are on the headset too. Online with PC needs v0.15.0.
+
 v0.14.0 (November 2026) - THE LOST PAC-MAN LEVEL
 
   - PAC-MAN VR 1996 PROTOTYPE: pick it on the OPTIONS tab, VERSION row. It has the temple level

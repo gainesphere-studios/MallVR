@@ -39,6 +39,20 @@ $Games = [ordered]@{
     # folder name in the games folder, DataFile = a file inside it that proves it's the right one. MaxPlayers = linked pods (2-4) online.
     'BALL'  = @{ Name = 'Buggy Ball';         Native = 'buggy'; DataDir = 'BALL'; DataFile = 'RUNFILES\CARS.DBS'; Link = $true; MaxPlayers = 4; Fps = 0; JoyAxes = $true; DepthFix = $true; FlicCentre = $true; Sha1 = '' }
     'PEARL' = @{ Name = 'Sea Diving (Pearl)'; Args = '/vcc';                Fps = 0;  GlyphColour = $true; SpriteTop = 'targ'; Link = $true; MaxPlayers = 2; ScreenH = 248; Haptic = 'dactwep=g:50:0.8,ouch=b:160:1,femouch=b:160:1,bodyhit=b:120:0.9'; Sha1 = '8899b1988af04002188526acc6e3381ff133b23b' }
+    # Lost games: no copy is known, so these are rebuilt from the footage that survives. They need nothing in the games folder, and every one stays
+    # on the WANTED board until the real game turns up. Their own section in the game list (Lost = $true).
+    'LDAC' = @{ Name = 'Dactyl Nightmare'; Native = 'dactyl1k'; Lost = $true; DataFile = 'play.ps1'; Link = $true; MaxPlayers = 4; Fps = 0; JoyAxes = $true; DepthFix = $true; Sha1 = '' }
+    'LHERO' = @{ Name = 'Hero'; Native = 'hero'; Lost = $true; DataFile = 'play.ps1'; Link = $true; MaxPlayers = 4; Fps = 0; JoyAxes = $true; DepthFix = $true; Sha1 = '' }
+    'LGRIDB' = @{ Name = 'Grid Busters'; Native = 'gridbust'; Lost = $true; DataFile = 'play.ps1'; Link = $true; MaxPlayers = 4; Fps = 0; JoyAxes = $true; DepthFix = $true; Sha1 = '' }
+    'LLEGEND' = @{ Name = 'Legend Quest'; Native = 'legend'; Lost = $true; DataFile = 'play.ps1'; Link = $true; MaxPlayers = 4; Fps = 0; JoyAxes = $true; DepthFix = $true; Sha1 = '' }
+    'LGRIDW' = @{ Name = 'Grid Warriors'; Native = 'gridwar'; Lost = $true; DataFile = 'play.ps1'; Link = $true; MaxPlayers = 2; Fps = 0; JoyAxes = $true; DepthFix = $true; Sha1 = '' }
+    'LSPHERE' = @{ Name = 'Battlesphere'; Native = 'sphere'; Lost = $true; DataFile = 'play.ps1'; Link = $true; MaxPlayers = 4; Fps = 0; JoyAxes = $true; DepthFix = $true; Sha1 = '' }
+    'LVTOL' = @{ Name = 'VTOL'; Native = 'vtol'; Lost = $true; DataFile = 'play.ps1'; Link = $true; MaxPlayers = 4; Fps = 0; JoyAxes = $true; DepthFix = $true; Sha1 = '' }
+    'LTOTALD' = @{ Name = 'Total Destruction'; Native = 'totald'; Lost = $true; DataFile = 'play.ps1'; Link = $true; MaxPlayers = 4; Fps = 0; JoyAxes = $true; DepthFix = $true; Sha1 = '' }
+    'LEXOREX' = @{ Name = 'Exorex'; Native = 'exorex'; Lost = $true; DataFile = 'play.ps1'; Link = $true; MaxPlayers = 4; Fps = 0; JoyAxes = $true; DepthFix = $true; Sha1 = '' }
+    'LACES' = @{ Name = 'Flying Aces'; Native = 'aces'; Lost = $true; DataFile = 'play.ps1'; Link = $true; MaxPlayers = 4; Fps = 0; JoyAxes = $true; DepthFix = $true; Sha1 = '' }
+    'LSPHERE2' = @{ Name = 'Sphere'; Native = 'sphere2k'; Lost = $true; DataFile = 'play.ps1'; Link = $true; MaxPlayers = 4; Fps = 0; JoyAxes = $true; DepthFix = $true; Sha1 = '' }
+    'LXTREME' = @{ Name = 'X-Treme Strike'; Native = 'xtreme'; Lost = $true; DataFile = 'play.ps1'; Link = $true; MaxPlayers = 4; Fps = 0; JoyAxes = $true; DepthFix = $true; Sha1 = '' }
 }
 # clones: the base game's settings under their own Name, Exe, Sha1, GetHint
 foreach ($k in @($Games.Keys)) { $g = $Games[$k]; if ($g.CloneOf -and $Games[$g.CloneOf]) { foreach ($p in @($Games[$g.CloneOf].Keys)) { if (-not $g.ContainsKey($p)) { $g[$p] = $Games[$g.CloneOf][$p] } } } }

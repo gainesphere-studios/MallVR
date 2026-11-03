@@ -131,6 +131,59 @@ static void lg(const char *fmt, ...) {
     if (++log_lines == CALL_LOG_MAX) fprintf(flog, "... call log capped\n");
 }
 
+/* Flight recorder, <log>.pace, on in every run (Bobby 11-02, after DevilMaster's logs couldn't show his Zone Hunter hitches: the call log
+   fills in the first seconds). Every drawn frame goes in a ring. On a problem (a stalled frame, the camera's speed dipping and coming back,
+   or the player pressing Scroll Lock) the 10 s before and 10 s after are written, 50 rows a second. A summary line every 10 s. */
+static double pace_hook = 0;   /* host ms in our hooks since the last frame */
+struct PaceSample { double t; float gap, hook, x, y, z; uint32_t frame; };
+static std::vector<PaceSample> pace_ring; static size_t pace_at = 0, pace_count = 0;
+static FILE *pace_f = NULL; static int pace_events = 0, pace_lines = 0;
+static double pace_ev_t = -1, pace_next_ok = 10.0; static std::string pace_ev_why;
+static void pace_dump() {
+    if (pace_ev_t < 0 || !pace_f || !pace_count) return;
+    const size_t N = pace_ring.size(), first = (pace_at + N - pace_count) % N;
+    fprintf(pace_f, "=== PROBLEM %d: %s at %.2f s. 10 s before and after, 20 ms rows: seconds from it, frames, slowest frame ms, ms in hooks, camera units/s, x y z\n", pace_events, pace_ev_why.c_str(), pace_ev_t);
+    double row_t = pace_ev_t - 10.0; float gap = 0, hook = 0; int fr = 0; float px = 0, py = 0; double pt = 0; bool have = false; PaceSample last = {};
+    for (size_t k = 0; k < pace_count; k++) { const PaceSample &s = pace_ring[(first + k) % N];
+        if (s.t < pace_ev_t - 10.0) { px = s.x; py = s.y; pt = s.t; have = true; continue; }
+        while (s.t >= row_t + 0.02) {
+            if (fr) { const float sp = have && last.t > pt ? sqrtf((last.x - px) * (last.x - px) + (last.y - py) * (last.y - py)) / (float)(last.t - pt) : 0.f;
+                fprintf(pace_f, "%+.2f %d %.1f %.1f %.0f %.0f %.0f %.0f\n", row_t - pace_ev_t, fr, gap, hook, sp, last.x, last.y, last.z); px = last.x; py = last.y; pt = last.t; have = true; }
+            row_t += 0.02; gap = 0; hook = 0; fr = 0; }
+        fr++; if (s.gap > gap) gap = s.gap; hook += s.hook; last = s; }
+    fprintf(pace_f, "=== end of problem %d\n", pace_events); fflush(pace_f);
+    pace_ev_t = -1;
+}
+static void pace_problem(double t, const char *why) {
+    if (pace_ev_t >= 0 || t < pace_next_ok || pace_events >= 8) return;
+    pace_ev_t = t; pace_ev_why = why; pace_events++;
+}
+static void pace_frame(const float T[3]) {
+    static auto t0 = std::chrono::steady_clock::now(); static double prev = 0;
+    const double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    if (pace_ring.empty()) { pace_ring.resize(1u << 15); if (!log_base.empty()) pace_f = fopen((log_base + ".pace").c_str(), "w"); std::atexit(pace_dump);
+        if (pace_f) { fprintf(pace_f, "flight recorder: stalls, speed hitches and Scroll Lock marks, 10 s before and after\n"); fflush(pace_f); } }
+    const float gap = (float)((t - prev) * 1000.0); prev = t;
+    PaceSample &s = pace_ring[pace_at]; s.t = t; s.gap = gap; s.hook = (float)pace_hook; s.x = T[0]; s.y = T[1]; s.z = T[2]; s.frame = (uint32_t)frame; pace_hook = 0;
+    pace_at = (pace_at + 1) % pace_ring.size(); if (pace_count < pace_ring.size()) pace_count++;
+    if (gap >= 50.f) { char w[64]; snprintf(w, sizeof(w), "a frame took %.0f ms", gap); pace_problem(t, w); }
+#ifdef _WIN32
+    { static bool down = false; const bool now = (GetAsyncKeyState(VK_SCROLL) & 0x8000) != 0; if (now && !down) { pace_next_ok = 0; pace_problem(t, "the player pressed Scroll Lock"); } down = now; }
+#endif
+    /* camera speed every 50 ms: a dip under half that comes back = a hitch; the summary counts them */
+    static double b_t = 0, sum_t = 0; static float bx = 0, by = 0, s1 = 0, s2 = 0; static unsigned dips = 0, jumps = 0, moving = 0, nb = 0, nf = 0, over33 = 0, over80 = 0; static float worst = 0; static double hk = 0, hk_worst = 0, sp_sum = 0;
+    nf++; if (gap > worst) worst = gap; if (gap > 33.4f) over33++; if (gap >= 50.f) over80++; hk += s.hook; if (s.hook > hk_worst) hk_worst = s.hook;
+    if (t - b_t >= 0.05) { const float sp = sqrtf((T[0] - bx) * (T[0] - bx) + (T[1] - by) * (T[1] - by)) / (float)(t - b_t); b_t = t; bx = T[0]; by = T[1]; nb++;
+        if (sp < 20000.f) { if (sp > 200.f) { moving++; sp_sum += sp; }
+            if (s1 > 200.f && sp > 200.f && (sp > 1.3f * s1 || s1 > 1.3f * sp)) jumps++;
+            if (s2 > 300.f && s1 < 0.5f * s2 && sp > 0.7f * s2) { dips++; pace_problem(t, "the camera speed dipped and came back"); } }
+        s2 = s1; s1 = sp; }
+    if (pace_ev_t >= 0 && t >= pace_ev_t + 10.0) { pace_dump(); pace_next_ok = t + 5.0; }
+    if (t - sum_t >= 10.0) { if (pace_f && pace_lines++ < 1000) { fprintf(pace_f, "t=%.0f s: %.0f fps, slowest %.0f ms, over 33 ms %u, over 50 ms %u; hooks %.1f ms a frame, worst %.1f; moving %u%% of the time at %.0f units/s, speed jumps %u, dips %u\n",
+            t, nf / (t - sum_t), worst, over33, over80, nf ? hk / nf : 0.0, hk_worst, nb ? moving * 100u / nb : 0u, moving ? sp_sum / moving : 0.0, jumps, dips); fflush(pace_f); }
+        sum_t = t; nf = nb = moving = dips = jumps = over33 = over80 = 0; worst = 0; hk = hk_worst = sp_sum = 0; }
+}
+
 static bool parse_hex(const char *s, uint8_t *out, size_t n) {
     for (size_t i = 0; i < n; i++) { unsigned v; if (sscanf(s + 2 * i, "%2x", &v) != 1) return false; out[i] = (uint8_t)v; }
     return true;
@@ -811,7 +864,9 @@ static uint32_t hle_awe32(const std::string &n) {
     if (n == "AWE32NOTEON" || n == "AWE32NOTEOFF") {      /* (ch, note, velocity) */
         int c = arg(0, 3) & 15, note = arg(1, 3) & 127, vel = arg(2, 3) & 127;
         const uint32_t tag = (0xE0u | c) << 8 | note;
-        for (VVoice &vo : voices) if (vo.on && (vo.sound & 0xFFFF) == tag) vo.on = false;   /* the same key again restarts it */
+        /* NOTEOFF stops the key. A new note does not: the SDK's note-on takes a free voice for it and only stops voices of the same exclusive class. Every one-shot shares ch 15 note 60, so
+           stopping them here let the next pellet's pop cut the ghost's EAT.WAV off (Bobby 11-03: "a sound effect missing when we eat a ghost"). Loops still restart, or a second energizer stacks them */
+        for (VVoice &vo : voices) if (vo.on && (vo.sound & 0xFFFF) == tag && (vo.loop || n == "AWE32NOTEOFF" || !vel)) vo.on = false;
         if (n == "AWE32NOTEOFF" || !vel) return 0;
         auto it = sounds.find(0xA0000u | ch[c].bank);
         if (it == sounds.end()) return 0;
@@ -840,12 +895,15 @@ static struct {
     int level = 1, pending = 0;        /* pending: 1 = stage cleared, -1 = game over (seen in GAME_is_over) */
     bool snapped = false, temple = false, jump = false, booted = false, dress = false, keep_score = false;
     uint32_t score = 0;
+    bool e5_on = false, e5_ate = false; float e5[3] = {0.f, 0.f, 0.f};   /* the temple's fifth energizer, in pill slot PAC_E5_SLOT */
     std::vector<uint8_t> junc, link, eyes, recs, ener;
     std::vector<uint32_t> bufs;
     std::vector<std::vector<uint8_t>> paths;
     struct Pill { float x, y; uint32_t slot; bool on; };
     std::vector<Pill> pills;
     std::vector<int> show;
+    std::vector<std::vector<uint8_t>> spin_tga;   /* VPIX_PAC_SPIN: EMERAL01-29.TGA; the renderer's bitmaps, built at the first draw */
+    std::vector<uint32_t> spin_h;
 } pac;
 static uint32_t hle_cd(const std::string &n);
 static std::set<uint32_t> pac_water3k;   /* WATERFAL: its textures (WH1sides, 4sand) never shipped, PIX_LoadLWOModel makes those faces white */
@@ -863,6 +921,7 @@ static void pac_rd(std::vector<uint8_t> &v, uint32_t a, uint32_t n) { v.resize(n
 static void pac_wr(const std::vector<uint8_t> &v, uint32_t a) { for (uint32_t i = 0; i < v.size(); i++) mem_writeb(a + i, v[i]); }
 
 /* a slot in / out of the game's views: what PIX_Add / RemoveModelFromView do to iview */
+static const uint32_t PAC_E5_SLOT = 0x19F;   /* the last pill slot: the game fills it at stage start, no level has that many pills */
 static void pac_view(uint32_t slot, uint32_t views, bool on) {
     for (uint32_t v = 0; v < 32; v++) if (views >> v & 1) {
         const uint32_t iv = 0x172A00 + data_delta + v * 0xBC, w = iv + 0x40 + (slot >> 5) * 4, b = 1u << (slot & 31);
@@ -907,6 +966,8 @@ static void pac_restore_maze1() {
     for (uint32_t s = PAC_RECS_FIRST; s < PAC_RECS_FIRST + PAC_RECS_N; s++) pac_set_model(s);
     for (uint32_t s = 0x1A0; s < 0x1A4; s++) pac_set_model(s);
     pac.temple = false; pac.pills.clear(); pac.show.clear();
+    if (pac.e5_on) pac_view(PAC_E5_SLOT, 0xFFFFFFFFu, false);
+    pac.e5_on = false;
 }
 
 static void pac_build_temple() {
@@ -982,9 +1043,12 @@ static void pac_build_temple() {
         mem_writed(q + 8 + k * 4, 0xFFFFFFFFu);
     }
     for (uint32_t i = nroute; i < 120; i++) { mem_writed(EYES + i * 0x34, 0xFFFFFFFFu); mem_writed(EYES + i * 0x34 + 4, 0xFFFFFFFFu); }
-    /* energizers: on the ring below the outer one, in 4 of its corners (GAME_eat_energizers reads the models' x y) */
+    /* energizers: on the ring below the outer one, one per corner (GAME_eat_energizers reads the models' x y). The game has 4; corner 2 gets a fifth,
+       or the ring has a gap (Bobby 11-03), set up in pac_fade_in and eaten in pac_eat_pills */
     static const int ecorn[4] = {0, 1, 3, 4};
-    V en[4];
+    V en[5];
+    en[4] = corner(2, 2);
+    { uint32_t uz; memcpy(&uz, pac.ener.data() + 0x3C, 4); float z0; memcpy(&z0, &uz, 4); pac.e5[0] = en[4].x; pac.e5[1] = en[4].y; pac.e5[2] = en[4].z + z0; }
     for (int i = 0; i < 4; i++) {
         const uint32_t m = MODEL + (0x1A0 + i) * 0x168; uint32_t uz; memcpy(&uz, pac.ener.data() + i * 0x168 + 0x3C, 4); float z0; memcpy(&z0, &uz, 4);
         en[i] = corner(2, ecorn[i]);
@@ -1078,6 +1142,15 @@ static void pac_wd(Bitu) {
 static bool pac_hook(const std::string &n) {
     const uint32_t G = 0x13FB90 + data_delta;
     pac_wd_calls++;
+    /* OPTIONS row ENERGIZER SPIN, off by default (Discord tester and Bobby 11-03). BITMAPS/STAGE1/ENERGIZE holds 29 frames of the gem turning and the exe reserves
+       BMP_S1_ENERGIZER_1..29, but its bitmap_table only loads EMERAL01 and nothing changes the 4 models' bitmap: the game shows one still frame. Read here, drawn by pac_spin_frame */
+    {   static bool spin_read = false;
+        if (!spin_read) { spin_read = true;
+            if (getenv("VPIX_PAC_SPIN") && atoi(getenv("VPIX_PAC_SPIN"))) {
+                for (int i = 1; i <= 29; i++) { char fn[64]; snprintf(fn, sizeof(fn), "BITMAPS\\STAGE1\\ENERGIZE\\EMERAL%02d.TGA", i); std::vector<uint8_t> t;
+                    if (!read_dos_file(fn, t) || t.size() < 18 + 128 * 128 * 3) { lg("Pac-Man energizer spin: can't read %s, still frame", fn); pac.spin_tga.clear(); break; }
+                    pac.spin_tga.push_back(std::move(t)); }
+                lg("Pac-Man energizer spin: %u frames", (unsigned)pac.spin_tga.size()); } } }
     {   static bool wd = false; if (!wd) { wd = true; if (getenv("VPIX_PAC_WD")) PIC_AddEvent(pac_wd, 1000.f); } }
     if (n == "pac_is_over") {          /* the last pill or the clock ran out; GAME_init clears stage_clear before we would see it */
         if (!pac.pending) { pac.pending = mem_readd(0x1659C4 + data_delta) ? 1 : -1; pac.score = mem_readd(G + 0x2DC) + mem_readd(G + 0x2E0);
@@ -1122,6 +1195,13 @@ static bool pac_hook(const std::string &n) {
                 pac_lg("temple slot %X handle %08X T (%.0f %.0f %.0f) S (%.2f %.2f %.2f) view4 %d", s, mem_readd(m), pac_rd_f(m + 0x34), pac_rd_f(m + 0x38), pac_rd_f(m + 0x3C), pac_rd_f(m + 0x84), pac_rd_f(m + 0x88), pac_rd_f(m + 0x8C), (int)(mem_readd(iv + 0x40 + (s >> 5) * 4) >> (s & 31) & 1));
             }
             for (uint32_t s = 0x56 + (uint32_t)pac.pills.size(); s < 0x1A0; s++) pac_view(s, 0xFFFFFFFFu, false);
+            {   /* the fifth energizer: energizer 1's imodel (bitmap block included) at corner 2 */
+                const uint32_t a = 0x176FFC + data_delta + 0x1A0 * 0x20C, b = 0x176FFC + data_delta + PAC_E5_SLOT * 0x20C;
+                for (uint32_t o = 0; o < 0x20C; o += 4) mem_writed(b + o, mem_readd(a + o));
+                for (uint32_t q = 0; q < 3; q++) pac_wr_f(b + 0x34 + q * 4, pac.e5[q]);
+                for (uint32_t q = 0; q < 8; q++) mem_writed(b + 0x1EC + q * 4, mem_readd(b + 0x1EC + q * 4) | 7);
+                pac_view(PAC_E5_SLOT, 0x18, true);
+                pac.e5_on = true; }
         }
         return false;
     }
@@ -1132,6 +1212,23 @@ static bool pac_hook(const std::string &n) {
             if (now != in_pit) { in_pit = now; if (now) pac_lg("Pac-Man temple: player on the pit floor at (%.0f %.0f)", pac_rd_f(G + 0x5A4), pac_rd_f(G + 0x5A8)); } }
         if (mem_readd(G + 0x23C) == 3) return true;
         const float x = pac_rd_f(G + 0x5A4), y = pac_rd_f(G + 0x5A8);
+        /* the fifth energizer, as GAME_eat_energizers does the 4: its range, 50 points, bank 5 on channel 15. The game's eat_energizer flag has it call
+           GAME_start_blue_time once; nothing in the game clears the flag */
+        if (pac.e5_ate) { pac.e5_ate = false; mem_writed(0x1659A4 + data_delta, 0); }
+        if (pac.e5_on) {
+            uint64_t rb = (uint64_t)mem_readd(0x9618E + data_delta) << 32 | mem_readd(0x9618A + data_delta); double range; memcpy(&range, &rb, 8);
+            const float dx = pac.e5[0] - pac_rd_f(G + 0x2FC), dy = pac.e5[1] - pac_rd_f(G + 0x300);
+            if (sqrt(dx * dx + dy * dy) < range) {
+                pac.e5_on = false; pac.e5_ate = true;
+                pac_view(PAC_E5_SLOT, 0xFFFFFFFFu, false);
+                mem_writed(G + 0x2DC, mem_readd(G + 0x2DC) + 50);
+                mem_writed(0x1659A4 + data_delta, 1);
+                const uint32_t sp = SegPhys(ss) + reg_esp;
+                mem_writed(sp - 16, 5); mem_writed(sp - 12, 0); mem_writed(sp - 8, 15); reg_esp -= 20; hle_awe32("AWE32CONTROLLER"); reg_esp += 20;
+                mem_writed(sp - 16, 127); mem_writed(sp - 12, 60); mem_writed(sp - 8, 15); reg_esp -= 20; hle_awe32("AWE32NOTEON"); reg_esp += 20;
+                pac_lg("Pac-Man temple: fifth energizer eaten, range %.0f", range);
+            }
+        }
         for (auto &p : pac.pills) if (p.on && fabsf(p.x - x) < 350.f && fabsf(p.y - y) < 350.f) {
             p.on = false;
             pac_view(p.slot, 0xFFFFFFFFu, false);
@@ -2113,6 +2210,27 @@ static uint32_t build_bmp3k(uint32_t d, int key) {   /* key = raw 16-bit texel v
 /* imodel slot with handle 0x10000000 = a screen bitmap. PIX_SetModel copies the game's PIXBITMAP (0x31 bytes) into imodel:
    +1A0 bmp+0, +1A4 texture descriptor (bmp+4), +1A8/+1AC source x/y, +1B0/+1B4 width/height, +1B8/+1BC screen x/y,
    +1C0/+1C4 drawn width/height (floats bmp+14/+18 rounded), +1D8 bmp+24 flags, +1DC RGB bmp+28, +1E0 RGB bmp+2C, +1E4 bmp+30. */
+/* the energizer's frame now, made like the game's own EMERAL01 (texel format and colour key of its descriptor d). 25 frames a second at the game's 50 */
+static uint32_t pac_spin_frame(uint32_t d, int key) {
+    if (pac.spin_tga.empty()) return 0;
+    if (pac.spin_h.empty()) {
+        const uint32_t fmt = d && d < 0x2000000 ? ppc_rd(d) >> 24 : 1;
+        for (size_t f = 0; f < pac.spin_tga.size(); f++) {
+            std::vector<uint32_t> rgba(128 * 128); const uint8_t *q = pac.spin_tga[f].data() + 18;
+            for (size_t i = 0; i < rgba.size(); i++, q += 3) {
+                uint32_t b = q[0], g = q[1], r = q[2];
+                if (key >= 0 && (r >> 3 << 10 | g >> 3 << 5 | b >> 3) == (uint32_t)key) { rgba[i] = 0; continue; }
+                if (fmt == 1) { r = (r >> 3) * 255 / 31; g = (g >> 3) * 255 / 31; b = (b >> 3) * 255 / 31; }
+                else if (fmt == 2) { r = (r >> 4) * 17; g = (g >> 4) * 17; b = (b >> 4) * 17; }
+                rgba[i] = 0xFF000000u | b << 16 | g << 8 | r;
+            }
+            const uint32_t h = 0xAF000000u + (uint32_t)f;
+            if (!VPIX_Render_AddBitmapRGBA(h, 128, 128, rgba.data())) { pac.spin_tga.clear(); pac.spin_h.clear(); return 0; }
+            pac.spin_h.push_back(h);
+        }
+    }
+    return pac.spin_h[frame / 2 % pac.spin_h.size()];
+}
 static int64_t prio3k_key(int32_t p) { return p >= 0 ? -(int64_t)p : (int64_t)1000000000 + p; }   /* draw order key, low first */
 /* direct = ZENECA PIX_DrawBitmap: ma = the PIXBITMAP record - 0x1A0 (the same 0x31 bytes PIX_SetModel copies to imodel +1A0);
    no slot priority, drawn on top */
@@ -2130,6 +2248,7 @@ static void blit3k(VPIX_Frame &f, uint32_t ma, uint32_t slot, bool direct = fals
         }
         uint32_t fl = mem_readd(ma + 0x1A0);
         uint32_t hnd = build_bmp3k(d, fl & 0x1000 ? (int)(mem_readd(ma + 0x1D8) & 0x7FFF) : -1);
+        if (((slot >= 0x1A0 && slot < 0x1A4) || (slot == PAC_E5_SLOT && pac.temple)) && hnd) if (uint32_t sp = pac_spin_frame(d, fl & 0x1000 ? (int)(mem_readd(ma + 0x1D8) & 0x7FFF) : -1)) hnd = sp;   /* Pac-Man VR's energizers */
         if (!hnd) return;
         VPIX_Blit b; b.handle = hnd; b.world = true; b.key = -1; b.alpha = 1.f;
         b.sx = (int)mem_readd(ma + 0x1A8); b.sy = (int)mem_readd(ma + 0x1AC); b.sw = (int)mem_readd(ma + 0x1B0); b.sh = (int)mem_readd(ma + 0x1B4);
@@ -2427,6 +2546,7 @@ static void submit_frame_su3k(uint32_t iv, uint32_t im) {
     if (v < 0) { zeneca_sound(f); VPIX_Render_Submit(f); return; }
     uint32_t va = iv + v * 0xBC;
     rd_mat(va, f.cam_R, f.cam_T);
+    pace_frame(f.cam_T);
     for (int c = 0; c < 3; c++) f.clear[c] = clear_col[c];
     /* window 0 (iwindow, stride ?): +0xC background colour 0x00BBGGRR (Total Recoil's sky 0x947B6B), +0x20/+0x24 screen
        width/height - 1 (319, 239), +0x50 focal length in pixels (343.1 = 50 deg across 320) */
@@ -2685,6 +2805,7 @@ static void submit_frame() {
     uint32_t va = vw + v * 0x88;
     if (!own_glove_by_view.empty()) { own_glove_slots = own_glove_by_view[va]; own_arm_slots = own_arm_by_view[va]; }   /* this view's own gloves only */
     rd_mat(va, f.cam_R, f.cam_T);
+    pace_frame(f.cam_T);
     for (int c = 0; c < 3; c++) f.clear[c] = clear_col[c];
     if (wn) { float fov = rd_f(wn + 0xC); if (fov > 5 && fov < 170) f.fov_deg = fov; }
     {   static const bool cue_on = !getenv("VPIX_DEPTH_CUE") || atoi(getenv("VPIX_DEPTH_CUE"));   /* card depth cue: linear to black */
@@ -8105,7 +8226,7 @@ static void hle_log(VHook &h) {
 static Bitu vpix_hle_cb_in(void);
 static Bitu vpix_hle_cb(void) {
     auto t0 = std::chrono::steady_clock::now(); Bitu r = vpix_hle_cb_in();
-    hook_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() - cap_ms; cap_ms = 0; return r;
+    { const double hd = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() - cap_ms; hook_ms += hd; pace_hook += hd; } cap_ms = 0; return r;
 }
 static Bitu vpix_hle_cb_in(void) {
     uint32_t at = (uint32_t)(SegPhys(cs) + reg_eip - 4);
@@ -8531,11 +8652,43 @@ static void keys_init() {
 #include "vpix_seat.h"
 #include "vpix_voice.h"
 #include "vpix_buggy.h"
+static inline short GetAsyncKeyState(int) { return 0; }
+enum { VK_BACK = 8, VK_TAB = 9, VK_SHIFT = 16, VK_CONTROL = 17, VK_SPACE = 32 };
+#include "vpix_dactyl1k.h"
+#include "vpix_1k_games.h"
+/* Music for the rebuilds (Bobby 11-03): engine\music\<native>.mp3, CC0 picks in MUSIC_CREDITS.txt there. The originals had none. Decoded whole at start, loops on voice 31, which no rebuild uses. V1K_MUSIC=0 = none, V1K_MUSIC_VOL = 0-127 */
+static void v1k_music() {
+    const char *dir = getenv("VPIX_MUSIC_DIR"), *nat = getenv("VPIX_NATIVE"), *off = getenv("V1K_MUSIC"), *ve = getenv("V1K_MUSIC_VOL");
+    if (!dir || !*dir || !nat || (off && *off == '0')) return;
+    std::string name = nat;
+    if (name == "hero") { const char *m = getenv("HERO_MODE"); name = m && !strcmp(m, "glider") ? "hero_glider" : "hero_puzzle"; }
+    const std::string fn = std::string(dir) + "/" + name + ".mp3";
+    drmp3_config cfg; drmp3_uint64 nf = 0;
+    drmp3_int16 *s16 = drmp3_open_file_and_read_pcm_frames_s16(fn.c_str(), &cfg, &nf, NULL);
+    if (!s16) { d1k::dl("music: %s not found", fn.c_str()); return; }
+    VSound snd; snd.rate = cfg.sampleRate; snd.loop = true; snd.pcm.resize((size_t)nf);
+    for (size_t i = 0; i < (size_t)nf; i++) snd.pcm[i] = cfg.channels == 2 ? (int16_t)((s16[i * 2] + s16[i * 2 + 1]) / 2) : s16[i];
+    drmp3_free(s16, NULL);
+    const uint32_t key = 0x62FF0u; sounds[key] = std::move(snd); sound_names[key] = fn;
+    buggy::play(31, (int)key, ve && *ve ? atoi(ve) : 72);
+    d1k::dl("music: %s, %.0f s", fn.c_str(), (double)nf / cfg.sampleRate);
+}
+
 
 void VPIX_HLE_Init(const char *logbase) {
     if (getenv("VPIX_NATIVE") && !strcmp(getenv("VPIX_NATIVE"), "buggy")) {
         if (!(getenv("VPIX_WINDOW") && atoi(getenv("VPIX_WINDOW")) == 0)) VPIX_Render_Start();
         buggy::start(logbase);
+        return;
+    }
+    if (void (*v1k_start)(const char *) = v1k::find(getenv("VPIX_NATIVE"))) {   /* the other 1000-series rebuilds, dev only */
+        if (!(getenv("VPIX_WINDOW") && atoi(getenv("VPIX_WINDOW")) == 0)) VPIX_Render_Start();
+        v1k_start(logbase); v1k_music();
+        return;
+    }
+    if (getenv("VPIX_NATIVE") && !strcmp(getenv("VPIX_NATIVE"), "dactyl1k")) {   /* Dactyl Nightmare 1000CS rebuild, dev only */
+        if (!(getenv("VPIX_WINDOW") && atoi(getenv("VPIX_WINDOW")) == 0)) VPIX_Render_Start();
+        d1k::start(logbase); v1k_music();
         return;
     }
     if (!getenv("VPIX_HOOKS")) return;

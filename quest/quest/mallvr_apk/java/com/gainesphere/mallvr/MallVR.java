@@ -137,6 +137,7 @@ public class MallVR {
         Set<String> known = new HashSet<>(); for (Game g : games) if (!g.sha1.isEmpty()) known.add(g.sha1);
         for (Game g : games) {
             g.state = 0; g.exeFile = g.dataPath = g.cue = g.cdAudioDir = null; g.why = "";
+            if (g.nativ != null && g.dataDir == null) { g.state = 1; continue; }   // the Lost Games: built into the engine, no files
             if (g.nativ != null) {
                 List<File> ds = dirs.get(g.dataDir.toUpperCase(Locale.US));
                 if (ds != null) for (File d : ds) if (resolve(d, g.dataFile) != null) { g.dataPath = d; g.state = 1; break; }
@@ -205,6 +206,8 @@ public class MallVR {
             p.env.put(e.getKey(), v);
         }
         if (g.cdAudioDir != null) p.env.put("VPIX_CD_DIR", g.cdAudioDir.getPath());
+        p.env.put("VPIX_HS_FILE", new File(SETTINGS, "rebuild_scores.txt").getPath());
+        if (g.nativ != null) p.env.put("VPIX_MUSIC_DIR", new File(ENGINE, "music").getPath());
         p.env.put("VPIX_XR", "1");
         p.env.put("MALLVR_DIR", ROOT.getPath());
         p.env.put("MALLVR_PLATFORM", "quest");
